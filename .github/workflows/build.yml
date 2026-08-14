@@ -18,7 +18,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
-      - name: Build observation launcher and DLL
+      - name: Build observation and no-TAP connection tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -37,6 +37,16 @@ jobs:
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             '/LD', 'native/welnpt_trace.c', "/Fe:$output/welnpttrace.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
           )
+          Invoke-Compiler 'virtual socket DLL' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
+          )
+          Invoke-Compiler 'UDP relay' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib'
+          )
+          & "$output/welnptrelay.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'relay self-test failed' }
           Invoke-Compiler 'console launcher' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             'native/welnpt_launcher.c', "/Fe:$output/welnptgame.exe"
@@ -48,10 +58,15 @@ jobs:
             '/D_WIN32_WINNT=0x0601', 'native/welnpt_gui.c', "/Fe:$output/WEL无网卡观测工具.exe",
             '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
           )
+          Invoke-Compiler 'connection GUI' @(
+            '/nologo', '/W4', '/O2', '/MT', '/utf-8', '/D_CRT_SECURE_NO_WARNINGS', '/DUNICODE', '/D_UNICODE',
+            '/D_WIN32_WINNT=0x0601', 'native/welnpt_connect_gui.c', "/Fe:$output/WEL无网卡联机测试.exe",
+            '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
+          )
       - name: Upload prototype binaries
         uses: actions/upload-artifact@v4
         with:
-          name: WEL无网卡观测工具-x86
+          name: WEL无网卡联机测试-P1-x86
           path: build/x86/*
           if-no-files-found: error
           retention-days: 14
