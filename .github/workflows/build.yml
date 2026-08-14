@@ -1,0 +1,43 @@
+name: Build WEL no-TAP prototype
+
+on:
+  push:
+    paths:
+      - '**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x86:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build observation launcher and DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = 'build/x86'
+          New-Item $output -ItemType Directory -Force | Out-Null
+          & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
+            /LD native/welnpt_trace.c `
+            /Fe:"$output/welnpttrace.dll" /link Ws2_32.lib Psapi.lib
+          if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll build failed' }
+          & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
+            native/welnpt_launcher.c `
+            /Fe:"$output/welnptgame.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'welnptgame.exe build failed' }
+          & "$output/welnptgame.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'launcher self-test failed' }
+      - name: Upload prototype binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: wel-no-tap-prototype-x86
+          path: build/x86/*
+          if-no-files-found: error
+          retention-days: 14
