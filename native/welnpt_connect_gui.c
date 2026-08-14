@@ -12,7 +12,6 @@
 
 #define ID_GAME_PATH 1101
 #define ID_ROOM 1103
-#define ID_ROLE 1105
 #define ID_CHOOSE_GAME 1107
 #define ID_START 1108
 #define ID_STATUS 1109
@@ -34,7 +33,6 @@ typedef struct launch_context {
     int room_id;
     wchar_t status[1024];
     DWORD process_id;
-    int is_host;
     int success;
 } launch_context;
 
@@ -44,7 +42,6 @@ static HWND g_room;
 static HWND g_api_url;
 static HWND g_username;
 static HWND g_password;
-static HWND g_role;
 static HWND g_start;
 static HWND g_status;
 
@@ -297,7 +294,7 @@ static int desktop_directory(wchar_t *result, size_t count) {
     return wcsncpy_s(result, count, desktop, _TRUNCATE) == 0;
 }
 
-static int make_log_path(const wchar_t *role, wchar_t *result, size_t count) {
+static int make_log_path(wchar_t *result, size_t count) {
     wchar_t desktop[MAX_PATH];
     wchar_t computer[64] = L"PC";
     DWORD computer_length = ARRAYSIZE(computer);
@@ -306,8 +303,8 @@ static int make_log_path(const wchar_t *role, wchar_t *result, size_t count) {
     GetComputerNameW(computer, &computer_length);
     GetLocalTime(&now);
     return _snwprintf_s(result, count, _TRUNCATE,
-        L"%ls\\WEL-NoTap-%ls-%ls-%04u%02u%02u-%02u%02u%02u.jsonl",
-        desktop, role, computer, now.wYear, now.wMonth, now.wDay,
+        L"%ls\\WEL-NoTap-Session-%ls-%04u%02u%02u-%02u%02u%02u.jsonl",
+        desktop, computer, now.wYear, now.wMonth, now.wDay,
         now.wHour, now.wMinute, now.wSecond) > 0;
 }
 
@@ -451,12 +448,11 @@ static DWORD WINAPI launch_thread(LPVOID parameter) {
     context->process_id = process.dwProcessId;
     context->success = 1;
     _snwprintf_s(context->status, ARRAYSIZE(context->status), _TRUNCATE,
-        L"无网卡测试已启动，WE8 PID %lu。\r\n\r\n"
-        L"角色：%ls\r\n逻辑 IP：%ls\r\n中继：%ls\r\n房间：%ls\r\n\r\n"
-        L"请按正常流程完成建主、搜索、加入和比赛。日志：\r\n%ls\r\n\r\n"
-        L"云端模式可直接测试；使用本机中继模式时请保持本窗口打开。",
+        L"无网卡联机已启动，WE8 PID %lu。\r\n\r\n"
+        L"逻辑 IP：%ls\r\n中继：%ls\r\n房间：%ls\r\n\r\n"
+        L"请在游戏内建主或搜索主机完成联机。日志：\r\n%ls\r\n\r\n"
+        L"请保持本窗口打开，退出游戏后可关闭本窗口。",
         (unsigned long)context->process_id,
-        context->is_host ? L"主机" : L"客机",
         context->logical_ip, context->relay, context->room, context->log_path);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
@@ -514,15 +510,13 @@ static void choose_game(void) {
     if (GetOpenFileNameW(&dialog)) SetWindowTextW(g_game_path, path);
 }
 
-static void start_test(void) {
+static void start_session(void) {
     launch_context *context;
-    wchar_t role[64];
     wchar_t api_url[ARRAYSIZE(context->api_url)];
     wchar_t username[ARRAYSIZE(context->username)];
     wchar_t password[ARRAYSIZE(context->password)];
     LRESULT room_id;
     HANDLE thread;
-    int is_host;
 
     context = (launch_context *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*context));
     if (context == NULL) return;
@@ -531,9 +525,6 @@ static void start_test(void) {
     GetWindowTextW(g_api_url, api_url, ARRAYSIZE(api_url));
     GetWindowTextW(g_username, username, ARRAYSIZE(username));
     GetWindowTextW(g_password, password, ARRAYSIZE(password));
-    GetWindowTextW(g_role, role, ARRAYSIZE(role));
-    is_host = wcsstr(role, L"主机") != NULL;
-    context->is_host = is_host;
     room_id = SendMessageW(g_room, CB_GETITEMDATA, SendMessageW(g_room, CB_GETCURSEL, 0, 0), 0);
     if (!file_exists(context->game_path)) {
         show_status(L"请先选择有效的 WE8.exe。 ");
@@ -541,7 +532,7 @@ static void start_test(void) {
         return;
     }
     if (!sibling_path(L"welnpt.dll", context->hook_path, ARRAYSIZE(context->hook_path))) {
-        show_status(L"没有找到 welnpt.dll。请完整解压无网卡测试包。 ");
+        show_status(L"没有找到 welnpt.dll。请完整解压无网卡联机包。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
@@ -554,7 +545,7 @@ static void start_test(void) {
     wcsncpy_s(context->username, ARRAYSIZE(context->username), username, _TRUNCATE);
     wcsncpy_s(context->password, ARRAYSIZE(context->password), password, _TRUNCATE);
     context->room_id = (int)room_id;
-    if (!make_log_path(is_host ? L"Host-A" : L"Client-B", context->log_path, ARRAYSIZE(context->log_path))) {
+    if (!make_log_path(context->log_path, ARRAYSIZE(context->log_path))) {
         show_status(L"无法创建桌面日志路径。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
@@ -574,7 +565,7 @@ static void start_test(void) {
 static void create_controls(HWND window) {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     HWND control;
-    control = CreateWindowExW(0, L"STATIC", L"WEL 无虚拟网卡联机测试", WS_CHILD | WS_VISIBLE,
+    control = CreateWindowExW(0, L"STATIC", L"WEL 无虚拟网卡联机", WS_CHILD | WS_VISIBLE,
         24, 18, 620, 30, window, NULL, NULL, NULL);
     set_font(control, font);
     control = CreateWindowExW(0, L"STATIC", L"WE8.exe", WS_CHILD | WS_VISIBLE,
@@ -604,20 +595,11 @@ static void create_controls(HWND window) {
     g_password = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD, 366, 186, 210, 27, window, NULL, NULL, NULL);
     set_font(g_password, font);
-    control = CreateWindowExW(0, L"STATIC", L"本机角色", WS_CHILD | WS_VISIBLE,
+    control = CreateWindowExW(0, L"STATIC", L"无网卡房间", WS_CHILD | WS_VISIBLE,
         24, 232, 110, 22, window, NULL, NULL, NULL);
     set_font(control, font);
-    g_role = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-        24, 256, 220, 100, window, (HMENU)ID_ROLE, NULL, NULL);
-    set_font(g_role, font);
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机");
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"客机");
-    SendMessageW(g_role, CB_SETCURSEL, 0, 0);
-    control = CreateWindowExW(0, L"STATIC", L"无网卡房间", WS_CHILD | WS_VISIBLE,
-        280, 232, 110, 22, window, NULL, NULL, NULL);
-    set_font(control, font);
     g_room = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-        280, 256, 300, 110, window, (HMENU)ID_ROOM, NULL, NULL);
+        24, 256, 300, 110, window, (HMENU)ID_ROOM, NULL, NULL);
     set_font(g_room, font);
     SendMessageW(g_room, CB_ADDSTRING, 0, (LPARAM)L"01 - 10.122.1.0/24");
     SendMessageW(g_room, CB_SETITEMDATA, 0, 1);
@@ -627,14 +609,14 @@ static void create_controls(HWND window) {
     SendMessageW(g_room, CB_SETITEMDATA, 2, 3);
     SendMessageW(g_room, CB_SETCURSEL, 0, 0);
     g_start = CreateWindowExW(0, L"BUTTON", L"登录并启动 WE8", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        24, 386, 220, 34, window, (HMENU)ID_START, NULL, NULL);
+        24, 310, 220, 34, window, (HMENU)ID_START, NULL, NULL);
     set_font(g_start, font);
     g_status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
-        L"登录后选择同一个无网卡房间。服务端会为主机和客机分别分配 10.122.x.x 逻辑地址。\r\n"
+        L"登录后选择同一个无网卡房间。服务端会为房间成员分别分配 10.122.x.x 逻辑地址。\r\n"
         L"此版本不安装 TAP/n2n，不修改系统 IP 或路由；中继参数由 Go 后端下发。\r\n"
-        L"请在两台电脑上分别使用自己的 Laravel 账号登录。",
+        L"进入游戏后按正常流程建主或搜索主机。两台电脑分别使用自己的 Laravel 账号登录。",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        24, 440, 724, 145, window, (HMENU)ID_STATUS, NULL, NULL);
+        24, 365, 724, 145, window, (HMENU)ID_STATUS, NULL, NULL);
     set_font(g_status, font);
 }
 
@@ -650,7 +632,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, L
                 return 0;
             }
             if (LOWORD(w_param) == ID_START) {
-                start_test();
+                start_session();
                 return 0;
             }
             break;
@@ -686,9 +668,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_lin
     window_class.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     window_class.lpszClassName = L"WELNoTapConnectWindow";
     if (!RegisterClassExW(&window_class)) return 1;
-    window = CreateWindowExW(0, window_class.lpszClassName, L"WEL 无虚拟网卡联机测试",
+    window = CreateWindowExW(0, window_class.lpszClassName, L"WEL 无虚拟网卡联机",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 650, NULL, NULL, instance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 570, NULL, NULL, instance, NULL);
     if (window == NULL) return 2;
     ShowWindow(window, show_command);
     UpdateWindow(window);

@@ -7,8 +7,8 @@ system routes. It does not modify the current production client in
 
 ## Current Status
 
-`P2 - authenticated cloud relay validation` is implemented. P1 completed a
-real two-computer WE8 match without a virtual adapter: all overlapping packets
+`P2 - authenticated cloud relay` is implemented. P1 completed a real
+two-computer WE8 match without a virtual adapter: all overlapping packets
 and bytes matched in both directions, and the Hook reported zero queue drops.
 The current connection GUI authenticates through the shared Go API and receives
 its room address, logical IP, community, and relay credential from the separate
@@ -16,8 +16,8 @@ No-TAP controller.
 
 The build contains two independent tools:
 
-- `WEL无网卡联机测试.exe`: injects the virtual Socket Hook and performs a real
-  two-computer search/join/match test through a UDP room relay.
+- `WEL无网卡联机.exe`: injects the virtual Socket Hook and connects WE8 through
+  a UDP room relay.
 - `WEL无网卡观测工具.exe`: retains the P0 observation workflow and does not
   alter network traffic.
 
@@ -52,7 +52,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 Outputs are written to `build\x86`:
 
 ```text
-WEL无网卡联机测试.exe
+WEL无网卡联机.exe
 welnpt.dll
 welnptrelay.exe
 WEL无网卡观测工具.exe
@@ -68,10 +68,10 @@ Keep the complete artifact extracted on both computers.
 
 On both computers:
 
-1. Open `WEL无网卡联机测试.exe`.
+1. Open `WEL无网卡联机.exe`.
 2. Enter the Go API address, Laravel account, and password.
 3. Select the same No-TAP room, for example `01 - 10.122.1.0/24`.
-4. Select `主机` or `客机`, select `WE8.exe`, and click `登录并启动 WE8`.
+4. Select `WE8.exe` and click `登录并启动 WE8`.
 
 The Go API assigns a different logical address to each active account. The
 host then creates a room inside WE8; the client searches and joins normally.
