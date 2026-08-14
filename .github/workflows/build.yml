@@ -79,6 +79,33 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.11.0
+
+      - name: Build Electron client
+        shell: pwsh
+        working-directory: frontend
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --no-frozen-lockfile
+          pnpm build
+          pnpm exec electron-builder --win nsis
+
+      - name: Upload Electron installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: WEL无网卡对战平台-安装包
+          path: frontend/release/*
+          if-no-files-found: error
+          retention-days: 14
+
   build-linux-relay:
     runs-on: ubuntu-24.04
     steps:

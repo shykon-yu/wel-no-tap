@@ -1,0 +1,89 @@
+{
+  "name": "wel-no-tap-client",
+  "private": true,
+  "version": "0.0.2",
+  "packageManager": "pnpm@11.11.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc --noEmit && vite build",
+    "test:config": "node --test electron/config.test.cjs",
+    "electron:dev": "npm run build && electron electron/main.cjs",
+    "electron:build": "npm run build && electron-builder --win nsis",
+    "electron": "electron"
+  },
+  "dependencies": {
+    "lucide-vue-next": "^0.468.0",
+    "pinia": "^2.2.8",
+    "vue": "^3.5.13"
+  },
+  "build": {
+    "appId": "com.wel.notap.client",
+    "productName": "WEL无网卡对战平台",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "!electron/*.test.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "frontend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../build/x86/welnpt.dll",
+        "to": "welhelper/welnpt.dll"
+      },
+      {
+        "from": "../build/x86/welnptgame.exe",
+        "to": "welhelper/welnptgame.exe"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "welhelper/wel.ico"
+      },
+      {
+        "from": "wel-no-tap.env.example",
+        "to": "wel-no-tap.env"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "executableName": "WEL无网卡对战平台",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "WEL无网卡对战平台 v0.0.2",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "22.3.27",
+    "electron-builder": "24.13.3",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.5",
+    "vue-tsc": "~2.2.0"
+  }
+}

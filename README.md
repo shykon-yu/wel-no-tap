@@ -62,6 +62,38 @@ welnptgame.exe
 
 All injected DLLs are x86 because the tested `WE8.exe` is x86.
 
+## External Client Configuration
+
+The packaged client includes `resources\wel-no-tap.env`. Copy it beside the
+platform executable as `wel-no-tap.env` when using a green copy; that file has
+priority over the packaged default. The platform name, displayed game name,
+API base URL, and all login/room API paths are read from this file at startup.
+Changing the server only requires editing this file and restarting the
+platform; no rebuild is needed. The API paths are kept separate so the No-TAP
+client cannot accidentally enter the TAP/n2n room endpoints.
+
+Example:
+
+```env
+WEL_PLATFORM_NAME=WEL对战平台
+WEL_PLATFORM_SHORT_NAME=WEL
+WEL_GAME_NAME=WE8
+WEL_API_BASE_URL=http://8.155.145.132:8082/api/v1
+WEL_API_LOGIN_PATH=/auth/login
+WEL_API_LOGOUT_PATH=/auth/logout
+WEL_API_ME_PATH=/me
+WEL_API_ROOM_SESSION_PATH=/notap/me/room-session
+WEL_API_ROOMS_PATH=/notap/rooms
+WEL_API_ROOM_MEMBERS_PATH=/notap/rooms/{roomId}/members
+WEL_API_ROOM_JOIN_PATH=/notap/rooms/{roomId}/join
+WEL_API_ROOM_HEARTBEAT_PATH=/notap/rooms/{roomId}/heartbeat
+WEL_API_ROOM_LEAVE_PATH=/notap/rooms/{roomId}/leave
+```
+
+The No-TAP UI reuses the platform room workflow: login, game selection, room
+list, room membership, logical IP, member details, and diagnostics. It does
+not install or inspect TAP/n2n, create routes, or show virtual-adapter status.
+
 ## Two-Computer Cloud Test
 
 Keep the complete artifact extracted on both computers.

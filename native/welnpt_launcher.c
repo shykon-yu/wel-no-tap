@@ -9,7 +9,11 @@
 typedef struct {
     const wchar_t *game_path;
     const wchar_t *hook_path;
-    const wchar_t *trace_path;
+    const wchar_t *relay;
+    const wchar_t *room;
+    const wchar_t *logical_ip;
+    const wchar_t *token;
+    const wchar_t *log_path;
     int self_test;
 } launch_options;
 
@@ -19,12 +23,15 @@ static int parse_options(int argc, wchar_t **argv, launch_options *options) {
     for (index = 1; index < argc; ++index) {
         if (wcscmp(argv[index], L"--game") == 0 && index + 1 < argc) options->game_path = argv[++index];
         else if (wcscmp(argv[index], L"--hook") == 0 && index + 1 < argc) options->hook_path = argv[++index];
-        else if (wcscmp(argv[index], L"--trace") == 0 && index + 1 < argc) options->trace_path = argv[++index];
+        else if (wcscmp(argv[index], L"--relay") == 0 && index + 1 < argc) options->relay = argv[++index];
+        else if (wcscmp(argv[index], L"--room") == 0 && index + 1 < argc) options->room = argv[++index];
+        else if (wcscmp(argv[index], L"--logical-ip") == 0 && index + 1 < argc) options->logical_ip = argv[++index];
+        else if (wcscmp(argv[index], L"--token") == 0 && index + 1 < argc) options->token = argv[++index];
+        else if (wcscmp(argv[index], L"--log") == 0 && index + 1 < argc) options->log_path = argv[++index];
         else if (wcscmp(argv[index], L"--self-test") == 0) options->self_test = 1;
         else return 0;
     }
-    return options->self_test ||
-        (options->game_path != NULL && options->hook_path != NULL && options->trace_path != NULL);
+    return options->self_test || (options->game_path != NULL && options->hook_path != NULL);
 }
 
 static wchar_t *quoted_command_line(const wchar_t *application) {
@@ -82,6 +89,11 @@ int wmain(int argc, wchar_t **argv) {
     launch_options options;
     wchar_t game[MAX_PATH];
     wchar_t hook[MAX_PATH];
+    wchar_t relay[256];
+    wchar_t room[64];
+    wchar_t logical_ip[64];
+    wchar_t token[256];
+    wchar_t log_path[MAX_PATH];
     wchar_t ready_name[96];
     wchar_t *command_line;
     wchar_t *working_directory;
@@ -90,7 +102,7 @@ int wmain(int argc, wchar_t **argv) {
     HANDLE ready_event;
 
     if (!parse_options(argc, argv, &options)) {
-        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpttrace.dll> --trace <trace.jsonl>\n", stderr);
+        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> --log <file>\n", stderr);
         return 2;
     }
     if (options.self_test) {
@@ -104,15 +116,29 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (GetFullPathNameW(options.hook_path, ARRAYSIZE(hook), hook, NULL) == 0 ||
         GetFileAttributesW(hook) == INVALID_FILE_ATTRIBUTES) {
-        fwprintf(stderr, L"Trace module not found: %ls\n", options.hook_path);
+        fwprintf(stderr, L"Hook module not found: %ls\n", options.hook_path);
         return 4;
     }
+    if (options.relay != NULL) wcsncpy_s(relay, ARRAYSIZE(relay), options.relay, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_RELAY", relay, ARRAYSIZE(relay)) == 0) return 2;
+    if (options.room != NULL) wcsncpy_s(room, ARRAYSIZE(room), options.room, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room, ARRAYSIZE(room)) == 0) return 2;
+    if (options.logical_ip != NULL) wcsncpy_s(logical_ip, ARRAYSIZE(logical_ip), options.logical_ip, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip, ARRAYSIZE(logical_ip)) == 0) return 2;
+    if (options.token != NULL) wcsncpy_s(token, ARRAYSIZE(token), options.token, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token, ARRAYSIZE(token)) == 0) return 2;
+    if (options.log_path != NULL) wcsncpy_s(log_path, ARRAYSIZE(log_path), options.log_path, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path, ARRAYSIZE(log_path)) == 0) return 2;
 
     _snwprintf_s(ready_name, ARRAYSIZE(ready_name), _TRUNCATE, L"Local\\WELNoTapReady-%lu-%lu",
         (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
     ready_event = CreateEventW(NULL, TRUE, FALSE, ready_name);
     if (ready_event == NULL) return 5;
-    SetEnvironmentVariableW(L"WEL_NOTAP_TRACE_PATH", options.trace_path);
+    SetEnvironmentVariableW(L"WEL_NOTAP_RELAY", relay);
+    SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room);
+    SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip);
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
+    SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path);
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
 
     command_line = quoted_command_line(game);
@@ -138,7 +164,7 @@ int wmain(int argc, wchar_t **argv) {
     free(working_directory);
 
     if (!inject_hook(process.hProcess, hook)) {
-        fprintf(stderr, "Trace module injection failed: Windows error %lu\n", GetLastError());
+        fprintf(stderr, "Hook module injection failed: Windows error %lu\n", GetLastError());
         TerminateProcess(process.hProcess, 7);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
@@ -146,7 +172,7 @@ int wmain(int argc, wchar_t **argv) {
         return 7;
     }
     if (WaitForSingleObject(ready_event, 5000) != WAIT_OBJECT_0) {
-        fputs("Trace module did not initialize\n", stderr);
+        fputs("Hook module did not initialize\n", stderr);
         TerminateProcess(process.hProcess, 8);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
