@@ -24,20 +24,30 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = 'build/x86'
           New-Item $output -ItemType Directory -Force | Out-Null
-          & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
-            /LD native/welnpt_trace.c `
-            /Fe:"$output/welnpttrace.dll" /link Ws2_32.lib Psapi.lib
-          if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll build failed' }
-          & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
-            native/welnpt_launcher.c `
-            /Fe:"$output/welnptgame.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'welnptgame.exe build failed' }
+          function Invoke-Compiler([string]$label, [string[]]$arguments) {
+            $compilerOutput = & cl.exe @arguments 2>&1
+            $compilerExit = $LASTEXITCODE
+            $compilerOutput | ForEach-Object { Write-Host $_ }
+            if ($compilerExit -ne 0) {
+              $compilerOutput | ForEach-Object { Write-Host "::error title=MSVC ${label}::$_" }
+              throw "$label build failed"
+            }
+          }
+          Invoke-Compiler 'trace DLL' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            '/LD', 'native/welnpt_trace.c', "/Fe:$output/welnpttrace.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
+          )
+          Invoke-Compiler 'console launcher' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            'native/welnpt_launcher.c', "/Fe:$output/welnptgame.exe"
+          )
           & "$output/welnptgame.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'launcher self-test failed' }
-          & cl.exe /nologo /W4 /O2 /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0601 `
-            native/welnpt_gui.c `
-            /Fe:"$output/WEL无网卡观测工具.exe" /link Comdlg32.lib Shell32.lib /SUBSYSTEM:WINDOWS
-          if ($LASTEXITCODE -ne 0) { throw 'WEL GUI build failed' }
+          Invoke-Compiler 'GUI launcher' @(
+            '/nologo', '/W4', '/O2', '/MT', '/utf-8', '/D_CRT_SECURE_NO_WARNINGS', '/DUNICODE', '/D_UNICODE',
+            '/D_WIN32_WINNT=0x0601', 'native/welnpt_gui.c', "/Fe:$output/WEL无网卡观测工具.exe",
+            '/link', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
+          )
       - name: Upload prototype binaries
         uses: actions/upload-artifact@v4
         with:
