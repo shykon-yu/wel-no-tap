@@ -39,11 +39,11 @@ jobs:
           )
           Invoke-Compiler 'virtual socket DLL' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
+            '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib', 'Bcrypt.lib'
           )
           Invoke-Compiler 'UDP relay' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib'
+            'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib', 'Bcrypt.lib'
           )
           & "$output/welnptrelay.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'relay self-test failed' }
@@ -66,7 +66,21 @@ jobs:
       - name: Upload prototype binaries
         uses: actions/upload-artifact@v4
         with:
-          name: WEL无网卡联机测试-P1-x86
+          name: WEL无网卡云中继测试-P2-x86
           path: build/x86/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux-relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and self-test authenticated Linux relay
+        run: ./scripts/build-linux-relay.sh
+      - name: Upload Linux relay
+        uses: actions/upload-artifact@v4
+        with:
+          name: WEL无网卡云中继-P2-linux-x64
+          path: build/linux-x64/welnpt-relay
           if-no-files-found: error
           retention-days: 14

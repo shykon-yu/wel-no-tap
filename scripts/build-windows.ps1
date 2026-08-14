@@ -17,12 +17,12 @@ if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
   /LD (Join-Path $source 'welnpt_hook.c') /Fe:(Join-Path $output 'welnpt.dll') `
-  /link Ws2_32.lib Psapi.lib
+  /link Ws2_32.lib Psapi.lib Bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw 'welnpt.dll 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
   (Join-Path $source 'welnpt_relay.c') /Fe:(Join-Path $output 'welnptrelay.exe') `
-  /link Ws2_32.lib
+  /link Ws2_32.lib Bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw 'welnptrelay.exe 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `

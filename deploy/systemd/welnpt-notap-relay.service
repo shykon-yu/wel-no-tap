@@ -1,0 +1,21 @@
+[Unit]
+Description=WEL no-TAP authenticated UDP relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=welnpt
+Group=welnpt
+EnvironmentFile=/etc/welnpt-notap.env
+ExecStart=/opt/welnpt-notap/welnpt-relay
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

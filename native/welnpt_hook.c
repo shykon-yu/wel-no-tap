@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "welnpt_protocol.h"
+#include "welnpt_auth_windows.h"
 
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
@@ -57,6 +58,7 @@ static SOCKET g_transport = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
+static welnpt_auth_context g_auth;
 static wchar_t g_log_path[MAX_PATH];
 static wel_socket_fn g_real_socket;
 static wel_wsasocketa_fn g_real_wsa_socket_a;
@@ -224,6 +226,7 @@ static int send_register_packet(void) {
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
     CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
     header.source_ip = g_logical_ip;
+    if (!welnpt_auth_sign(&g_auth, (char *)&header, sizeof(header))) return SOCKET_ERROR;
     return g_real_sendto(g_transport, (const char *)&header, sizeof(header), 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
@@ -256,6 +259,10 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) header->flags |= WELNPT_FLAG_BROADCAST;
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
+    if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) {
+        WSASetLastError(WSAEACCES);
+        return SOCKET_ERROR;
+    }
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
     if (sent == SOCKET_ERROR) return SOCKET_ERROR;
@@ -589,7 +596,8 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
                 memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) == 0 &&
                 (((header->flags & WELNPT_FLAG_BROADCAST) != 0) || header->target_ip == g_logical_ip) &&
                 payload_length <= WELNPT_MAX_PAYLOAD &&
-                received == (int)sizeof(*header) + payload_length) {
+                received == (int)sizeof(*header) + payload_length &&
+                welnpt_auth_verify(&g_auth, packet, received)) {
                 if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
                     log_line("\"api\":\"relay-drop\",\"targetPort\":%u,\"length\":%d",
                         (unsigned)ntohs(header->target_port), payload_length);
@@ -615,6 +623,7 @@ static void signal_ready(void) {
 static int load_configuration(void) {
     char relay[256];
     char logical_ip[64];
+    char token[WELNPT_AUTH_SECRET_MAX];
     char *separator;
     char port[16];
     struct addrinfo hints;
@@ -622,7 +631,8 @@ static int load_configuration(void) {
     DWORD room_length;
 
     if (GetEnvironmentVariableA("WEL_NOTAP_RELAY", relay, sizeof(relay)) == 0 ||
-        GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0) return 0;
+        GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0 ||
+        GetEnvironmentVariableA("WEL_NOTAP_TOKEN", token, sizeof(token)) == 0) return 0;
     room_length = GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room));
     if (room_length == 0 || room_length >= sizeof(g_room)) return 0;
     separator = strrchr(relay, ':');
@@ -630,6 +640,8 @@ static int load_configuration(void) {
     strcpy_s(port, sizeof(port), separator + 1);
     *separator = '\0';
     if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
+    if (!welnpt_auth_initialize(&g_auth, token)) return 0;
+    SecureZeroMemory(token, sizeof(token));
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
@@ -686,7 +698,7 @@ static int initialize_hook(void) {
     CloseHandle(worker);
     worker = CreateThread(NULL, 0, module_watch_thread, NULL, 0, NULL);
     if (worker != NULL) CloseHandle(worker);
-    log_line("\"api\":\"hook-ready\",\"mode\":\"virtual-socket\"");
+    log_line("\"api\":\"hook-ready\",\"mode\":\"virtual-socket\",\"protocol\":2");
     return 1;
 }
 

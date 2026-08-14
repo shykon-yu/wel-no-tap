@@ -14,9 +14,10 @@
 #define ID_ROOM 1103
 #define ID_LOGICAL_IP 1104
 #define ID_ROLE 1105
-#define ID_CHOOSE_GAME 1106
-#define ID_START 1107
-#define ID_STATUS 1108
+#define ID_TOKEN 1106
+#define ID_CHOOSE_GAME 1107
+#define ID_START 1108
+#define ID_STATUS 1109
 #define WM_LAUNCH_COMPLETE (WM_APP + 1)
 
 typedef struct launch_context {
@@ -27,6 +28,7 @@ typedef struct launch_context {
     wchar_t relay[MAX_PATH];
     wchar_t room[64];
     wchar_t logical_ip[64];
+    wchar_t token[128];
     wchar_t status[1024];
     DWORD process_id;
     int is_host;
@@ -38,6 +40,7 @@ static HWND g_game_path;
 static HWND g_relay;
 static HWND g_room;
 static HWND g_logical_ip;
+static HWND g_token;
 static HWND g_role;
 static HWND g_start;
 static HWND g_status;
@@ -129,6 +132,16 @@ static int valid_room(const wchar_t *value) {
         if (!((character >= L'a' && character <= L'z') ||
             (character >= L'A' && character <= L'Z') ||
             (character >= L'0' && character <= L'9') || character == L'-' || character == L'_')) return 0;
+    }
+    return 1;
+}
+
+static int valid_token(const wchar_t *value) {
+    size_t index;
+    size_t length = wcslen(value);
+    if (length < 8 || length >= 128) return 0;
+    for (index = 0; index < length; ++index) {
+        if (value[index] < 33 || value[index] > 126) return 0;
     }
     return 1;
 }
@@ -245,6 +258,7 @@ static DWORD WINAPI launch_thread(LPVOID parameter) {
     SetEnvironmentVariableW(L"WEL_NOTAP_RELAY", context->relay);
     SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", context->room);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", context->logical_ip);
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", context->token);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", context->log_path);
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
     command_line = quoted(context->game_path);
@@ -261,6 +275,7 @@ static DWORD WINAPI launch_thread(LPVOID parameter) {
         error = GetLastError();
         goto failed;
     }
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
     child_started = 1;
     if (!inject_hook(process.hProcess, context->hook_path, &error)) goto failed_process;
     if (WaitForSingleObject(ready_event, 10000) != WAIT_OBJECT_0) {
@@ -277,7 +292,7 @@ static DWORD WINAPI launch_thread(LPVOID parameter) {
         L"无网卡测试已启动，WE8 PID %lu。\r\n\r\n"
         L"角色：%ls\r\n逻辑 IP：%ls\r\n中继：%ls\r\n房间：%ls\r\n\r\n"
         L"请按正常流程完成建主、搜索、加入和比赛。日志：\r\n%ls\r\n\r\n"
-        L"主机窗口请保持打开；客机的中继地址填写主机局域网 IP。",
+        L"云端模式可直接测试；使用本机中继模式时请保持本窗口打开。",
         (unsigned long)context->process_id,
         context->is_host ? L"主机" : L"客机",
         context->logical_ip, context->relay, context->room, context->log_path);
@@ -296,6 +311,7 @@ failed:
         L"请确认 WE8.exe、welnpt.dll、房间地址和逻辑 IP 正确，并确认两端使用同一个房间名。",
         (unsigned long)error);
 done:
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
     if (ready_event != NULL) CloseHandle(ready_event);
     if (command_line != NULL) HeapFree(GetProcessHeap(), 0, command_line);
     if (working_directory != NULL) free(working_directory);
@@ -328,9 +344,11 @@ static void start_test(void) {
     wchar_t relay[ARRAYSIZE(context->relay)];
     wchar_t room[ARRAYSIZE(context->room)];
     wchar_t logical_ip[ARRAYSIZE(context->logical_ip)];
+    wchar_t token[ARRAYSIZE(context->token)];
     wchar_t error_text[256];
     HANDLE thread;
     int is_host;
+    int use_local_relay;
 
     context = (launch_context *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*context));
     if (context == NULL) return;
@@ -339,8 +357,10 @@ static void start_test(void) {
     GetWindowTextW(g_relay, relay, ARRAYSIZE(relay));
     GetWindowTextW(g_room, room, ARRAYSIZE(room));
     GetWindowTextW(g_logical_ip, logical_ip, ARRAYSIZE(logical_ip));
+    GetWindowTextW(g_token, token, ARRAYSIZE(token));
     GetWindowTextW(g_role, role, ARRAYSIZE(role));
     is_host = wcsstr(role, L"主机") != NULL;
+    use_local_relay = wcsstr(role, L"本机中继") != NULL;
     context->is_host = is_host;
     if (!file_exists(context->game_path)) {
         show_status(L"请先选择有效的 WE8.exe。 ");
@@ -354,8 +374,8 @@ static void start_test(void) {
     }
     if (wcslen(relay) >= ARRAYSIZE(context->relay) || wcslen(room) >= ARRAYSIZE(context->room) ||
         wcslen(logical_ip) >= ARRAYSIZE(context->logical_ip) || parse_port(relay) == 0 ||
-        !valid_room(room) || !valid_ipv4(logical_ip)) {
-        show_status(L"请检查中继地址、房间名和逻辑 IP。房间名只支持英文、数字、短横线和下划线。 ");
+        !valid_room(room) || !valid_ipv4(logical_ip) || !valid_token(token)) {
+        show_status(L"请检查中继地址、房间名、逻辑 IP 和测试令牌。令牌需要 8-127 个 ASCII 字符。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
@@ -367,12 +387,15 @@ static void start_test(void) {
     wcsncpy_s(context->relay, ARRAYSIZE(context->relay), relay, _TRUNCATE);
     wcsncpy_s(context->room, ARRAYSIZE(context->room), room, _TRUNCATE);
     wcsncpy_s(context->logical_ip, ARRAYSIZE(context->logical_ip), logical_ip, _TRUNCATE);
+    wcsncpy_s(context->token, ARRAYSIZE(context->token), token, _TRUNCATE);
     if (!make_log_path(is_host ? L"Host-A" : L"Client-B", context->log_path, ARRAYSIZE(context->log_path))) {
         show_status(L"无法创建桌面日志路径。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
-    if (is_host && !start_local_relay(relay, error_text, ARRAYSIZE(error_text))) {
+    if (use_local_relay) SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
+    if (use_local_relay && !start_local_relay(relay, error_text, ARRAYSIZE(error_text))) {
+        SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
         show_status(error_text);
         HeapFree(GetProcessHeap(), 0, context);
         return;
@@ -381,6 +404,7 @@ static void start_test(void) {
     show_status(L"正在启动 WE8 并加载无网卡 Socket Hook，请稍候...");
     thread = CreateThread(NULL, 0, launch_thread, context, 0, NULL);
     if (thread == NULL) {
+        SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
         EnableWindow(g_start, TRUE);
         show_status(L"无法创建启动线程。 ");
         HeapFree(GetProcessHeap(), 0, context);
@@ -410,13 +434,14 @@ static void create_controls(HWND window) {
     g_role = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
         24, 148, 190, 120, window, (HMENU)ID_ROLE, NULL, NULL);
     set_font(g_role, font);
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机（自动启动本机中继）");
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"客机（连接已有中继）");
+    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机（云端中继）");
+    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"客机（云端中继）");
+    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机（本机中继）");
     SendMessageW(g_role, CB_SETCURSEL, 0, 0);
     control = CreateWindowExW(0, L"STATIC", L"中继地址", WS_CHILD | WS_VISIBLE,
         240, 124, 110, 22, window, NULL, NULL, NULL);
     set_font(control, font);
-    g_relay = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"127.0.0.1:22333",
+    g_relay = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"8.155.145.132:22333",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 240, 148, 408, 27, window, (HMENU)ID_RELAY, NULL, NULL);
     set_font(g_relay, font);
     control = CreateWindowExW(0, L"STATIC", L"房间名", WS_CHILD | WS_VISIBLE,
@@ -431,25 +456,35 @@ static void create_controls(HWND window) {
     g_logical_ip = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10.250.1.1",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 240, 214, 180, 27, window, (HMENU)ID_LOGICAL_IP, NULL, NULL);
     set_font(g_logical_ip, font);
+    control = CreateWindowExW(0, L"STATIC", L"测试令牌", WS_CHILD | WS_VISIBLE,
+        24, 256, 110, 22, window, NULL, NULL, NULL);
+    set_font(control, font);
+    g_token = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD,
+        24, 280, 396, 27, window, (HMENU)ID_TOKEN, NULL, NULL);
+    set_font(g_token, font);
     g_start = CreateWindowExW(0, L"BUTTON", L"启动无网卡联机", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        440, 210, 208, 34, window, (HMENU)ID_START, NULL, NULL);
+        440, 276, 208, 34, window, (HMENU)ID_START, NULL, NULL);
     set_font(g_start, font);
     g_status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
-        L"主机：中继地址保持 127.0.0.1:22333。\r\n"
-        L"客机：中继地址填写主机局域网 IP:22333。\r\n"
-        L"两端房间名相同、逻辑 IP 必须不同。此版本不安装 TAP/n2n。",
+        L"云端测试：两端保持 8.155.145.132:22333，房间名和测试令牌相同。\r\n"
+        L"主机逻辑 IP 使用 10.250.1.1，客机使用 10.250.1.2。\r\n"
+        L"此版本不安装 TAP/n2n，不修改系统 IP 或路由。",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        24, 270, 624, 145, window, (HMENU)ID_STATUS, NULL, NULL);
+        24, 334, 624, 145, window, (HMENU)ID_STATUS, NULL, NULL);
     set_font(g_status, font);
 }
 
 static void apply_role_defaults(void) {
     int selection = (int)SendMessageW(g_role, CB_GETCURSEL, 0, 0);
     if (selection == 1) {
-        SetWindowTextW(g_relay, L"192.168.3.1:22333");
+        SetWindowTextW(g_relay, L"8.155.145.132:22333");
         SetWindowTextW(g_logical_ip, L"10.250.1.2");
-    } else {
+    } else if (selection == 2) {
         SetWindowTextW(g_relay, L"127.0.0.1:22333");
+        SetWindowTextW(g_logical_ip, L"10.250.1.1");
+    } else {
+        SetWindowTextW(g_relay, L"8.155.145.132:22333");
         SetWindowTextW(g_logical_ip, L"10.250.1.1");
     }
 }
@@ -479,6 +514,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, L
             show_status(context->status);
             if (context->success) EnableWindow(g_start, FALSE);
             else EnableWindow(g_start, TRUE);
+            SecureZeroMemory(context->token, sizeof(context->token));
             HeapFree(GetProcessHeap(), 0, context);
             return 0;
         }
@@ -510,7 +546,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_lin
     if (!RegisterClassExW(&window_class)) return 1;
     window = CreateWindowExW(0, window_class.lpszClassName, L"WEL 无虚拟网卡联机测试",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 700, 480, NULL, NULL, instance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 700, 545, NULL, NULL, instance, NULL);
     if (window == NULL) return 2;
     ShowWindow(window, show_command);
     UpdateWindow(window);
