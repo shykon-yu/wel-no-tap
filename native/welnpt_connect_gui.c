@@ -161,20 +161,21 @@ static int api_request(const wchar_t *base_url, const wchar_t *endpoint, const w
     request = WinHttpOpenRequest(connection, method, full_path, NULL, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (request == NULL) goto failed;
-    if (!WinHttpAddRequestHeadersW(request, L"Content-Type: application/json\r\nAccept: application/json\r\n", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
+    if (!WinHttpAddRequestHeaders(request, L"Content-Type: application/json\r\nAccept: application/json\r\n", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
     if (bearer != NULL && bearer[0] != '\0') {
         wchar_t authorization[2304];
         wchar_t bearer_wide[2048];
         int length = MultiByteToWideChar(CP_UTF8, 0, bearer, -1, bearer_wide, ARRAYSIZE(bearer_wide));
         if (length <= 0) goto failed;
         _snwprintf_s(authorization, ARRAYSIZE(authorization), _TRUNCATE, L"Authorization: Bearer %ls\r\n", bearer_wide);
-        if (!WinHttpAddRequestHeadersW(request, authorization, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
+        if (!WinHttpAddRequestHeaders(request, authorization, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
     }
     if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         (LPVOID)(body != NULL ? body : ""), body != NULL ? (DWORD)strlen(body) : 0,
         body != NULL ? (DWORD)strlen(body) : 0, 0) || !WinHttpReceiveResponse(request, NULL)) goto failed;
     value = sizeof(*status);
-    if (!WinHttpQueryInfo(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, status, &value, NULL)) goto failed;
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, status, &value, WINHTTP_NO_HEADER_INDEX)) goto failed;
     for (;;) {
         char *expanded;
         if (!WinHttpQueryDataAvailable(request, &available)) goto failed;
