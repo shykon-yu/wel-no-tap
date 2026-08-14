@@ -18,7 +18,11 @@
 #define ID_CHOOSE_GAME 1107
 #define ID_START 1108
 #define ID_STATUS 1109
+#define ID_COPY_TOKEN 1110
 #define WM_LAUNCH_COMPLETE (WM_APP + 1)
+
+/* Temporary two-player test credential; replace before any public release. */
+#define WELNPT_TEST_TOKEN L"WEL-P2-TEST-ONLY-20260814"
 
 typedef struct launch_context {
     HWND window;
@@ -324,6 +328,43 @@ static void show_status(const wchar_t *message) {
     SetWindowTextW(g_status, message);
 }
 
+static void copy_token(void) {
+    int length = GetWindowTextLengthW(g_token);
+    HGLOBAL memory;
+    wchar_t *text;
+    if (length <= 0) {
+        show_status(L"测试令牌为空，无法复制。 ");
+        return;
+    }
+    memory = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(length + 1) * sizeof(wchar_t));
+    if (memory == NULL) {
+        show_status(L"复制测试令牌失败。 ");
+        return;
+    }
+    text = (wchar_t *)GlobalLock(memory);
+    if (text == NULL) {
+        GlobalFree(memory);
+        show_status(L"复制测试令牌失败。 ");
+        return;
+    }
+    GetWindowTextW(g_token, text, length + 1);
+    GlobalUnlock(memory);
+    if (!OpenClipboard(g_window)) {
+        GlobalFree(memory);
+        show_status(L"无法打开剪贴板，请重试。 ");
+        return;
+    }
+    EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, memory) == NULL) {
+        GlobalFree(memory);
+        CloseClipboard();
+        show_status(L"复制测试令牌失败。 ");
+        return;
+    }
+    CloseClipboard();
+    show_status(L"测试令牌已复制。主机和客机使用同一个令牌即可。 ");
+}
+
 static void choose_game(void) {
     OPENFILENAMEW dialog;
     wchar_t path[MAX_PATH] = L"";
@@ -459,19 +500,22 @@ static void create_controls(HWND window) {
     control = CreateWindowExW(0, L"STATIC", L"测试令牌", WS_CHILD | WS_VISIBLE,
         24, 256, 110, 22, window, NULL, NULL, NULL);
     set_font(control, font);
-    g_token = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    g_token = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", WELNPT_TEST_TOKEN,
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD,
-        24, 280, 396, 27, window, (HMENU)ID_TOKEN, NULL, NULL);
+        24, 280, 420, 27, window, (HMENU)ID_TOKEN, NULL, NULL);
     set_font(g_token, font);
+    control = CreateWindowExW(0, L"BUTTON", L"复制令牌", WS_CHILD | WS_VISIBLE,
+        456, 276, 100, 34, window, (HMENU)ID_COPY_TOKEN, NULL, NULL);
+    set_font(control, font);
     g_start = CreateWindowExW(0, L"BUTTON", L"启动无网卡联机", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        440, 276, 208, 34, window, (HMENU)ID_START, NULL, NULL);
+        566, 276, 182, 34, window, (HMENU)ID_START, NULL, NULL);
     set_font(g_start, font);
     g_status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
         L"云端测试：两端保持 8.155.145.132:22333，房间名和测试令牌相同。\r\n"
         L"主机逻辑 IP 使用 10.250.1.1，客机使用 10.250.1.2。\r\n"
         L"此版本不安装 TAP/n2n，不修改系统 IP 或路由。",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        24, 334, 624, 145, window, (HMENU)ID_STATUS, NULL, NULL);
+        24, 334, 724, 145, window, (HMENU)ID_STATUS, NULL, NULL);
     set_font(g_status, font);
 }
 
@@ -502,6 +546,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, L
             }
             if (LOWORD(w_param) == ID_START) {
                 start_test();
+                return 0;
+            }
+            if (LOWORD(w_param) == ID_COPY_TOKEN) {
+                copy_token();
                 return 0;
             }
             if (LOWORD(w_param) == ID_ROLE && HIWORD(w_param) == CBN_SELCHANGE) {
@@ -546,7 +594,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_lin
     if (!RegisterClassExW(&window_class)) return 1;
     window = CreateWindowExW(0, window_class.lpszClassName, L"WEL 无虚拟网卡联机测试",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 700, 545, NULL, NULL, instance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 545, NULL, NULL, instance, NULL);
     if (window == NULL) return 2;
     ShowWindow(window, show_command);
     UpdateWindow(window);

@@ -68,15 +68,16 @@ Host computer:
 1. Open `WEL无网卡联机测试.exe`.
 2. Select `主机（云端中继）`.
 3. Keep relay `8.155.145.132:22333`, room `wel-test-room`, logical IP
-   `10.250.1.1`, and enter the private P2 test token.
+   `10.250.1.1`. The GUI pre-fills the temporary two-player token; use
+   `复制令牌` if you need to transfer it manually.
 4. Select `WE8.exe`, start, then create a host inside WE8.
 
 Client computer:
 
 1. Open the same GUI and select `客机（云端中继）`.
 2. Keep relay `8.155.145.132:22333`.
-3. Use the same room and token, with a different logical IP such as
-   `10.250.1.2`.
+3. Use the same room and the pre-filled token, with a different logical IP
+   such as `10.250.1.2`.
 4. Select `WE8.exe`, start, then search and join normally.
 
 Neither player needs an inbound firewall rule. Both players only send and
@@ -103,7 +104,8 @@ with the current TAP/n2n platform.
 
 ## Scope and Security
 
-P2 authenticates packets with a deployment test token. It does not encrypt
+P2 authenticates packets with a deployment test token. The current GUI embeds
+a temporary two-player token for this private test only. It does not encrypt
 WE8 payloads and does not yet use platform-issued per-player credentials.
 
 Before production integration, the shared test token must be replaced with
