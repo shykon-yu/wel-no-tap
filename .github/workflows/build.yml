@@ -34,10 +34,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'welnptgame.exe build failed' }
           & "$output/welnptgame.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'launcher self-test failed' }
+          & cl.exe /nologo /W4 /O2 /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0601 `
+            native/welnpt_gui.c `
+            /Fe:"$output/WEL无网卡观测工具.exe" /link Comdlg32.lib Shell32.lib /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { throw 'WEL GUI build failed' }
       - name: Upload prototype binaries
         uses: actions/upload-artifact@v4
         with:
-          name: wel-no-tap-prototype-x86
+          name: WEL无网卡观测工具-x86
           path: build/x86/*
           if-no-files-found: error
           retention-days: 14

@@ -26,7 +26,7 @@ typedef int (WSAAPI *wel_closesocket_fn)(SOCKET);
 
 static HMODULE g_hook_module;
 static volatile LONG g_stopping;
-static char g_trace_path[MAX_PATH];
+static wchar_t g_trace_path[MAX_PATH];
 static wel_socket_fn g_real_socket;
 static wel_wsasocketa_fn g_real_wsa_socket_a;
 static wel_wsa_socketw_fn g_real_wsa_socket_w;
@@ -50,14 +50,14 @@ static void trace_line(const char *format, ...) {
     DWORD written;
     int length;
 
-    if (g_trace_path[0] == '\0') return;
+    if (g_trace_path[0] == L'\0') return;
     va_start(arguments, format);
     _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, arguments);
     va_end(arguments);
     length = _snprintf_s(line, sizeof(line), _TRUNCATE, "{\"tick\":%lu,%s}\r\n",
         (unsigned long)GetTickCount(), message);
     if (length <= 0) return;
-    file = CreateFileA(g_trace_path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+    file = CreateFileW(g_trace_path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) return;
     WriteFile(file, line, (DWORD)length, &written, NULL);
@@ -346,8 +346,8 @@ static void signal_ready(void) {
 static int initialize_hook(void) {
     HMODULE winsock = GetModuleHandleW(L"ws2_32.dll");
     HANDLE worker;
-    DWORD path_length = GetEnvironmentVariableA("WEL_NOTAP_TRACE_PATH", g_trace_path, sizeof(g_trace_path));
-    if (path_length == 0 || path_length >= sizeof(g_trace_path)) return 0;
+    DWORD path_length = GetEnvironmentVariableW(L"WEL_NOTAP_TRACE_PATH", g_trace_path, ARRAYSIZE(g_trace_path));
+    if (path_length == 0 || path_length >= ARRAYSIZE(g_trace_path)) return 0;
     if (winsock == NULL) winsock = LoadLibraryW(L"ws2_32.dll");
     if (winsock == NULL) return 0;
 

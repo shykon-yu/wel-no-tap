@@ -19,4 +19,9 @@ if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll 编译失败。' }
   (Join-Path $source 'welnpt_launcher.c') /Fe:(Join-Path $output 'welnptgame.exe')
 if ($LASTEXITCODE -ne 0) { throw 'welnptgame.exe 编译失败。' }
 
+& cl.exe /nologo /W4 /O2 /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0601 `
+  (Join-Path $source 'welnpt_gui.c') /Fe:(Join-Path $output 'WEL无网卡观测工具.exe') `
+  /link Comdlg32.lib Shell32.lib /SUBSYSTEM:WINDOWS
+if ($LASTEXITCODE -ne 0) { throw 'WEL无网卡观测工具.exe 编译失败。' }
+
 Write-Host "构建完成：$output"

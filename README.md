@@ -6,11 +6,12 @@ current production client in `welopenvpn-clean`.
 
 ## Status
 
-`P0 - Winsock observation` is implemented. `welnptgame.exe` starts WE8 in a
-suspended state, injects `welnpttrace.dll`, waits for the hook-ready event, and
-then resumes the game. The DLL writes a line-delimited trace for the network
-APIs that determine whether a later virtual-socket layer can deliver packets
-correctly:
+`P0 - Winsock observation` is implemented. `WEL无网卡观测工具.exe` is the
+preferred graphical launcher: choose `WE8.exe`, choose the local role, then
+click start. It starts WE8 in a suspended state, injects `welnpttrace.dll`,
+waits for the hook-ready event, and then resumes the game. The DLL writes a
+line-delimited trace for the network APIs that determine whether a later
+virtual-socket layer can deliver packets correctly:
 
 - `bind`, `sendto`, `WSASendTo`
 - `recvfrom`, `WSARecvFrom`
@@ -53,6 +54,7 @@ The output is written to `build\x86`:
 ```text
 welnptgame.exe
 welnpttrace.dll
+WEL无网卡观测工具.exe
 ```
 
 The DLL is x86 because the tested `WE8.exe` is x86. Do not inject it into a
@@ -60,20 +62,18 @@ The DLL is x86 because the tested `WE8.exe` is x86. Do not inject it into a
 
 ## Run a Local Trace
 
-The game must be started through the launcher so the hook is present before
-WE8 starts its networking code.
+Keep `WEL无网卡观测工具.exe` and `welnpttrace.dll` in the same extracted
+directory. On each computer:
 
-```powershell
-$trace = Join-Path $env:USERPROFILE 'Desktop\wel-notap-trace.jsonl'
-.\build\x86\welnptgame.exe `
-  --game 'D:\Games\WE8.exe' `
-  --hook '.\build\x86\welnpttrace.dll' `
-  --trace $trace
-```
+1. Open `WEL无网卡观测工具.exe`.
+2. Select `WE8.exe`.
+3. Select `Host-A` on the hosting computer and `Client-B` on the joining computer.
+4. Click **Start observation and launch WE8**.
+5. Complete the normal LAN host, search, join, and match test.
+6. Exit WE8 and use **Open results directory** to find the Desktop `.jsonl` file.
 
-Run the normal local-LAN test: open WE8, create a host on A, search and join
-from B, then close both games. Send the generated trace files together with
-the existing `.welcap.zip` packages.
+The console `welnptgame.exe` is retained for automation only. Send the two
+generated trace files together with the existing `.welcap.zip` packages.
 
 ## Next Stages
 
