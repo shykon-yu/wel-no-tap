@@ -46,7 +46,7 @@ jobs:
           Invoke-Compiler 'GUI launcher' @(
             '/nologo', '/W4', '/O2', '/MT', '/utf-8', '/D_CRT_SECURE_NO_WARNINGS', '/DUNICODE', '/D_UNICODE',
             '/D_WIN32_WINNT=0x0601', 'native/welnpt_gui.c', "/Fe:$output/WEL无网卡观测工具.exe",
-            '/link', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
+            '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
           )
       - name: Upload prototype binaries
         uses: actions/upload-artifact@v4
