@@ -61,7 +61,7 @@ jobs:
           Invoke-Compiler 'connection GUI' @(
             '/nologo', '/W4', '/O2', '/MT', '/utf-8', '/D_CRT_SECURE_NO_WARNINGS', '/DUNICODE', '/D_UNICODE',
             '/D_WIN32_WINNT=0x0601', 'native/welnpt_connect_gui.c', "/Fe:$output/WEL无网卡联机测试.exe",
-            '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', '/SUBSYSTEM:WINDOWS'
+            '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', 'Winhttp.lib', '/SUBSYSTEM:WINDOWS'
           )
           Compress-Archive -Path "$output/*" -DestinationPath 'build/WEL无网卡云中继测试-P2-x86-完整包.zip' -Force
       - name: Upload complete Windows package

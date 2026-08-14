@@ -26,6 +26,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now welnpt-notap-relay
 ```
 
+Go API 同时配置同一公网中继地址和同一密钥：
+
+```env
+WEL_NOTAP_RELAY_HOST=8.155.145.132
+WEL_NOTAP_RELAY_PORT=22333
+WEL_NOTAP_RELAY_TOKEN=<与 WEL_NOTAP_TOKEN 相同的值>
+```
+
+这些变量只属于 Go API 的 No-TAP 控制器，不替换现有 TAP/n2n 房间配置。No-TAP
+使用独立的 `no_tap_rooms`、`no_tap_room_leases` 和 `10.122.1.0/24` 至
+`10.122.3.0/24`；TAP 客户端继续使用原有表和 `10.222.x.x`。
+
 只开放新端口：
 
 ```bash

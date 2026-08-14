@@ -4,25 +4,20 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
-#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
+#include <winhttp.h>
 
 #define ID_GAME_PATH 1101
-#define ID_RELAY 1102
 #define ID_ROOM 1103
-#define ID_LOGICAL_IP 1104
 #define ID_ROLE 1105
-#define ID_TOKEN 1106
 #define ID_CHOOSE_GAME 1107
 #define ID_START 1108
 #define ID_STATUS 1109
-#define ID_COPY_TOKEN 1110
 #define WM_LAUNCH_COMPLETE (WM_APP + 1)
-
-/* Temporary two-player test credential; replace before any public release. */
-#define WELNPT_TEST_TOKEN L"WEL-P2-TEST-ONLY-20260814"
+#define WELNPT_DEFAULT_API_URL L"http://8.155.145.132:8082/api/v1"
 
 typedef struct launch_context {
     HWND window;
@@ -32,7 +27,11 @@ typedef struct launch_context {
     wchar_t relay[MAX_PATH];
     wchar_t room[64];
     wchar_t logical_ip[64];
-    wchar_t token[128];
+    wchar_t token[256];
+    wchar_t api_url[512];
+    wchar_t username[256];
+    wchar_t password[256];
+    int room_id;
     wchar_t status[1024];
     DWORD process_id;
     int is_host;
@@ -41,14 +40,232 @@ typedef struct launch_context {
 
 static HWND g_window;
 static HWND g_game_path;
-static HWND g_relay;
 static HWND g_room;
-static HWND g_logical_ip;
-static HWND g_token;
+static HWND g_api_url;
+static HWND g_username;
+static HWND g_password;
 static HWND g_role;
 static HWND g_start;
 static HWND g_status;
-static HANDLE g_relay_job;
+
+static int valid_ipv4(const wchar_t *value);
+static int valid_room(const wchar_t *value);
+static int valid_token(const wchar_t *value);
+
+static int wide_to_utf8(const wchar_t *value, char *result, int count) {
+    int length;
+    if (value == NULL || result == NULL || count < 1) return 0;
+    length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, result, count, NULL, NULL);
+    return length > 0;
+}
+
+static int json_escape(const char *value, char *result, size_t count) {
+    size_t source, target = 0;
+    if (value == NULL || result == NULL || count == 0) return 0;
+    for (source = 0; value[source] != '\0'; ++source) {
+        unsigned char character = (unsigned char)value[source];
+        const char *escaped = NULL;
+        if (character == '\\') escaped = "\\\\";
+        else if (character == '"') escaped = "\\\"";
+        else if (character == '\r') escaped = "\\r";
+        else if (character == '\n') escaped = "\\n";
+        if (escaped != NULL) {
+            size_t length = strlen(escaped);
+            if (target + length + 1 > count) return 0;
+            memcpy(result + target, escaped, length);
+            target += length;
+        } else {
+            if (character < 0x20 || target + 2 > count) return 0;
+            result[target++] = (char)character;
+        }
+    }
+    result[target] = '\0';
+    return 1;
+}
+
+static int json_string_value(const char *json, const char *key, char *result, size_t count) {
+    char marker[96];
+    const char *cursor;
+    size_t target = 0;
+    if (json == NULL || key == NULL || result == NULL || count == 0) return 0;
+    _snprintf_s(marker, sizeof(marker), _TRUNCATE, "\"%s\"", key);
+    cursor = strstr(json, marker);
+    if (cursor == NULL) return 0;
+    cursor = strchr(cursor + strlen(marker), ':');
+    if (cursor == NULL) return 0;
+    ++cursor;
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
+    if (*cursor++ != '"') return 0;
+    while (*cursor != '\0' && *cursor != '"') {
+        char character = *cursor++;
+        if (character == '\\') {
+            character = *cursor++;
+            if (character == '\0') return 0;
+            if (character == 'n') character = '\n';
+            else if (character == 'r') character = '\r';
+            else if (character == 't') character = '\t';
+        }
+        if (target + 1 >= count) return 0;
+        result[target++] = character;
+    }
+    if (*cursor != '"') return 0;
+    result[target] = '\0';
+    return 1;
+}
+
+static int json_integer_value(const char *json, const char *key, int *result) {
+    char marker[96];
+    const char *cursor;
+    char *end;
+    long value;
+    if (json == NULL || key == NULL || result == NULL) return 0;
+    _snprintf_s(marker, sizeof(marker), _TRUNCATE, "\"%s\"", key);
+    cursor = strstr(json, marker);
+    if (cursor == NULL) return 0;
+    cursor = strchr(cursor + strlen(marker), ':');
+    if (cursor == NULL) return 0;
+    value = strtol(cursor + 1, &end, 10);
+    if (end == cursor + 1 || value < 1 || value > 65535) return 0;
+    *result = (int)value;
+    return 1;
+}
+
+static int api_request(const wchar_t *base_url, const wchar_t *endpoint, const wchar_t *method,
+    const char *body, const char *bearer, DWORD *status, char **response_body, wchar_t *error_text, size_t error_count) {
+    wchar_t url[512], host[256], path[512], full_path[768];
+    URL_COMPONENTS components;
+    HINTERNET session = NULL, connection = NULL, request = NULL;
+    DWORD flags = 0, value, available, received, used = 0;
+    char *response = NULL;
+    int ok = 0;
+
+    if (base_url == NULL || endpoint == NULL || method == NULL || status == NULL || response_body == NULL) return 0;
+    *response_body = NULL;
+    wcsncpy_s(url, ARRAYSIZE(url), base_url, _TRUNCATE);
+    ZeroMemory(&components, sizeof(components));
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = (DWORD)-1;
+    components.dwHostNameLength = (DWORD)-1;
+    components.dwUrlPathLength = (DWORD)-1;
+    if (!WinHttpCrackUrl(url, 0, 0, &components)) goto failed;
+    if (components.dwHostNameLength >= ARRAYSIZE(host) || components.dwUrlPathLength >= ARRAYSIZE(path)) goto failed;
+    wcsncpy_s(host, ARRAYSIZE(host), components.lpszHostName, components.dwHostNameLength);
+    wcsncpy_s(path, ARRAYSIZE(path), components.lpszUrlPath, components.dwUrlPathLength);
+    _snwprintf_s(full_path, ARRAYSIZE(full_path), _TRUNCATE, L"%ls%ls", path, endpoint);
+    if (components.nScheme == INTERNET_SCHEME_HTTPS) flags = WINHTTP_FLAG_SECURE;
+    session = WinHttpOpen(L"WEL-NoTap/0.1", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+    if (session == NULL) goto failed;
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
+    connection = WinHttpConnect(session, host, components.nPort, 0);
+    if (connection == NULL) goto failed;
+    request = WinHttpOpenRequest(connection, method, full_path, NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (request == NULL) goto failed;
+    if (!WinHttpAddRequestHeadersW(request, L"Content-Type: application/json\r\nAccept: application/json\r\n", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
+    if (bearer != NULL && bearer[0] != '\0') {
+        wchar_t authorization[2304];
+        wchar_t bearer_wide[2048];
+        int length = MultiByteToWideChar(CP_UTF8, 0, bearer, -1, bearer_wide, ARRAYSIZE(bearer_wide));
+        if (length <= 0) goto failed;
+        _snwprintf_s(authorization, ARRAYSIZE(authorization), _TRUNCATE, L"Authorization: Bearer %ls\r\n", bearer_wide);
+        if (!WinHttpAddRequestHeadersW(request, authorization, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) goto failed;
+    }
+    if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        (LPVOID)(body != NULL ? body : ""), body != NULL ? (DWORD)strlen(body) : 0,
+        body != NULL ? (DWORD)strlen(body) : 0, 0) || !WinHttpReceiveResponse(request, NULL)) goto failed;
+    value = sizeof(*status);
+    if (!WinHttpQueryInfo(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, status, &value, NULL)) goto failed;
+    for (;;) {
+        char *expanded;
+        if (!WinHttpQueryDataAvailable(request, &available)) goto failed;
+        if (available == 0) break;
+        expanded = response == NULL
+            ? (char *)HeapAlloc(GetProcessHeap(), 0, used + available + 1)
+            : (char *)HeapReAlloc(GetProcessHeap(), 0, response, used + available + 1);
+        if (expanded == NULL) goto failed;
+        response = expanded;
+        if (!WinHttpReadData(request, response + used, available, &received)) goto failed;
+        used += received;
+        if (received == 0) break;
+    }
+    if (response == NULL) {
+        response = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 1);
+        if (response == NULL) goto failed;
+    } else response[used] = '\0';
+    *response_body = response;
+    response = NULL;
+    ok = 1;
+    goto cleanup;
+
+failed:
+    if (error_text != NULL && error_count > 0) {
+        _snwprintf_s(error_text, error_count, _TRUNCATE, L"网络请求失败（Windows 错误 %lu）。", GetLastError());
+    }
+cleanup:
+    if (response != NULL) HeapFree(GetProcessHeap(), 0, response);
+    if (request != NULL) WinHttpCloseHandle(request);
+    if (connection != NULL) WinHttpCloseHandle(connection);
+    if (session != NULL) WinHttpCloseHandle(session);
+    return ok;
+}
+
+static void api_free_body(char *body) {
+    if (body != NULL) HeapFree(GetProcessHeap(), 0, body);
+}
+
+static int api_login_and_join(launch_context *context, wchar_t *error_text, size_t error_count) {
+    char username[768], password[768], escaped_username[1536], escaped_password[1536];
+    char request_body[3328], *response = NULL, token[2048], relay[512], community[128], ip[64];
+    wchar_t join_endpoint[64];
+    wchar_t local_error[256];
+    DWORD status = 0;
+    int relay_port = 0;
+    if (!wide_to_utf8(context->username, username, sizeof(username)) || !wide_to_utf8(context->password, password, sizeof(password)) ||
+        !json_escape(username, escaped_username, sizeof(escaped_username)) || !json_escape(password, escaped_password, sizeof(escaped_password))) {
+        wcsncpy_s(error_text, error_count, L"账号或密码包含无法处理的字符。", _TRUNCATE);
+        return 0;
+    }
+    _snprintf_s(request_body, sizeof(request_body), _TRUNCATE, "{\"username\":\"%s\",\"password\":\"%s\"}", escaped_username, escaped_password);
+    if (!api_request(context->api_url, L"/auth/login", L"POST", request_body, NULL, &status, &response, local_error, ARRAYSIZE(local_error))) {
+        wcsncpy_s(error_text, error_count, local_error, _TRUNCATE);
+        return 0;
+    }
+    if (status != 200 || !json_string_value(response, "token", token, sizeof(token))) {
+        char api_error[512] = "";
+        if (json_string_value(response, "error", api_error, sizeof(api_error))) {
+            wchar_t wide_error[512];
+            MultiByteToWideChar(CP_UTF8, 0, api_error, -1, wide_error, ARRAYSIZE(wide_error));
+            wcsncpy_s(error_text, error_count, wide_error, _TRUNCATE);
+        } else wcsncpy_s(error_text, error_count, L"账号登录失败，请检查账号密码或平台地址。", _TRUNCATE);
+        api_free_body(response);
+        return 0;
+    }
+    api_free_body(response);
+    response = NULL;
+    _snwprintf_s(join_endpoint, ARRAYSIZE(join_endpoint), _TRUNCATE, L"/notap/rooms/%d/join", context->room_id);
+    if (!api_request(context->api_url, join_endpoint, L"POST", "{}", token, &status, &response, local_error, ARRAYSIZE(local_error))) {
+        wcsncpy_s(error_text, error_count, local_error, _TRUNCATE);
+        return 0;
+    }
+    if (status != 200 || !json_string_value(response, "relay_host", relay, sizeof(relay)) ||
+        !json_integer_value(response, "relay_port", &relay_port) || !json_string_value(response, "virtual_ip", ip, sizeof(ip)) ||
+        !json_string_value(response, "community", community, sizeof(community)) || !json_string_value(response, "relay_token", token, sizeof(token))) {
+        char api_error[512] = "";
+        if (json_string_value(response, "error", api_error, sizeof(api_error))) {
+            wchar_t wide_error[512];
+            MultiByteToWideChar(CP_UTF8, 0, api_error, -1, wide_error, ARRAYSIZE(wide_error));
+            wcsncpy_s(error_text, error_count, wide_error, _TRUNCATE);
+        } else wcsncpy_s(error_text, error_count, L"进入无网卡房间失败，中继参数不完整。", _TRUNCATE);
+        api_free_body(response);
+        return 0;
+    }
+    api_free_body(response);
+    _snwprintf_s(context->relay, ARRAYSIZE(context->relay), _TRUNCATE, L"%hs:%d", relay, relay_port);
+    MultiByteToWideChar(CP_UTF8, 0, community, -1, context->room, ARRAYSIZE(context->room));
+    MultiByteToWideChar(CP_UTF8, 0, ip, -1, context->logical_ip, ARRAYSIZE(context->logical_ip));
+    MultiByteToWideChar(CP_UTF8, 0, token, -1, context->token, ARRAYSIZE(context->token));
+    return valid_room(context->room) && valid_ipv4(context->logical_ip) && valid_token(context->token);
+}
 
 static void set_font(HWND control, HFONT font) {
     SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
@@ -110,14 +327,6 @@ static wchar_t *game_directory(const wchar_t *game_path) {
         return NULL;
     }
     return directory;
-}
-
-static int parse_port(const wchar_t *endpoint) {
-    const wchar_t *separator = wcsrchr(endpoint, L':');
-    unsigned long port;
-    if (separator == NULL || separator[1] == L'\0') return 0;
-    port = wcstoul(separator + 1, NULL, 10);
-    return port > 0 && port <= 65535 ? (int)port : 0;
 }
 
 static int valid_ipv4(const wchar_t *value) {
@@ -187,58 +396,6 @@ static int inject_hook(HANDLE process, const wchar_t *hook_path, DWORD *error) {
     CloseHandle(thread);
     VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
     return module_handle != 0;
-}
-
-static int start_local_relay(const wchar_t *endpoint, wchar_t *error_text, size_t error_count) {
-    wchar_t relay_path[MAX_PATH];
-    wchar_t command_line[MAX_PATH + 32];
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
-    HANDLE job;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
-    int port = parse_port(endpoint);
-
-    if (port == 0) {
-        wcsncpy_s(error_text, error_count, L"中继地址端口无效。", _TRUNCATE);
-        return 0;
-    }
-    if (g_relay_job != NULL) return 1;
-    if (!sibling_path(L"welnptrelay.exe", relay_path, ARRAYSIZE(relay_path))) {
-        wcsncpy_s(error_text, error_count, L"没有找到 welnptrelay.exe。请把中继程序和 GUI 放在同一目录。", _TRUNCATE);
-        return 0;
-    }
-    _snwprintf_s(command_line, ARRAYSIZE(command_line), _TRUNCATE, L"\"%ls\" %d", relay_path, port);
-    ZeroMemory(&startup, sizeof(startup));
-    ZeroMemory(&process, sizeof(process));
-    startup.cb = sizeof(startup);
-    if (!CreateProcessW(NULL, command_line, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-        NULL, NULL, &startup, &process)) {
-        _snwprintf_s(error_text, error_count, _TRUNCATE, L"启动本机中继失败（Windows 错误 %lu）。", GetLastError());
-        return 0;
-    }
-    job = CreateJobObjectW(NULL, NULL);
-    if (job != NULL) {
-        ZeroMemory(&limits, sizeof(limits));
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-        AssignProcessToJobObject(job, process.hProcess);
-    }
-    CloseHandle(process.hThread);
-    g_relay_job = job;
-    if (WaitForSingleObject(process.hProcess, 300) == WAIT_OBJECT_0) {
-        DWORD exit_code = 0;
-        GetExitCodeProcess(process.hProcess, &exit_code);
-        CloseHandle(process.hProcess);
-        if (g_relay_job != NULL) {
-            CloseHandle(g_relay_job);
-            g_relay_job = NULL;
-        }
-        _snwprintf_s(error_text, error_count, _TRUNCATE,
-            L"本机中继启动后退出（代码 %lu），端口可能已被占用。", exit_code);
-        return 0;
-    }
-    CloseHandle(process.hProcess);
-    return 1;
 }
 
 static DWORD WINAPI launch_thread(LPVOID parameter) {
@@ -324,45 +481,22 @@ done:
     return 0;
 }
 
-static void show_status(const wchar_t *message) {
-    SetWindowTextW(g_status, message);
+static DWORD WINAPI api_launch_thread(LPVOID parameter) {
+    launch_context *context = (launch_context *)parameter;
+    wchar_t error_text[512] = L"";
+    if (!api_login_and_join(context, error_text, ARRAYSIZE(error_text))) {
+        _snwprintf_s(context->status, ARRAYSIZE(context->status), _TRUNCATE,
+            L"无网卡房间连接失败。\r\n\r\n%ls\r\n\r\n"
+            L"请确认账号密码正确，并确认 Go 后端已配置 No-TAP 中继。",
+            error_text[0] != L'\0' ? error_text : L"服务端没有返回有效的房间凭据。");
+        PostMessageW(context->window, WM_LAUNCH_COMPLETE, 0, (LPARAM)context);
+        return 0;
+    }
+    return launch_thread(context);
 }
 
-static void copy_token(void) {
-    int length = GetWindowTextLengthW(g_token);
-    HGLOBAL memory;
-    wchar_t *text;
-    if (length <= 0) {
-        show_status(L"测试令牌为空，无法复制。 ");
-        return;
-    }
-    memory = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(length + 1) * sizeof(wchar_t));
-    if (memory == NULL) {
-        show_status(L"复制测试令牌失败。 ");
-        return;
-    }
-    text = (wchar_t *)GlobalLock(memory);
-    if (text == NULL) {
-        GlobalFree(memory);
-        show_status(L"复制测试令牌失败。 ");
-        return;
-    }
-    GetWindowTextW(g_token, text, length + 1);
-    GlobalUnlock(memory);
-    if (!OpenClipboard(g_window)) {
-        GlobalFree(memory);
-        show_status(L"无法打开剪贴板，请重试。 ");
-        return;
-    }
-    EmptyClipboard();
-    if (SetClipboardData(CF_UNICODETEXT, memory) == NULL) {
-        GlobalFree(memory);
-        CloseClipboard();
-        show_status(L"复制测试令牌失败。 ");
-        return;
-    }
-    CloseClipboard();
-    show_status(L"测试令牌已复制。主机和客机使用同一个令牌即可。 ");
+static void show_status(const wchar_t *message) {
+    SetWindowTextW(g_status, message);
 }
 
 static void choose_game(void) {
@@ -382,27 +516,24 @@ static void choose_game(void) {
 static void start_test(void) {
     launch_context *context;
     wchar_t role[64];
-    wchar_t relay[ARRAYSIZE(context->relay)];
-    wchar_t room[ARRAYSIZE(context->room)];
-    wchar_t logical_ip[ARRAYSIZE(context->logical_ip)];
-    wchar_t token[ARRAYSIZE(context->token)];
-    wchar_t error_text[256];
+    wchar_t api_url[ARRAYSIZE(context->api_url)];
+    wchar_t username[ARRAYSIZE(context->username)];
+    wchar_t password[ARRAYSIZE(context->password)];
+    LRESULT room_id;
     HANDLE thread;
     int is_host;
-    int use_local_relay;
 
     context = (launch_context *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*context));
     if (context == NULL) return;
     context->window = g_window;
     GetWindowTextW(g_game_path, context->game_path, ARRAYSIZE(context->game_path));
-    GetWindowTextW(g_relay, relay, ARRAYSIZE(relay));
-    GetWindowTextW(g_room, room, ARRAYSIZE(room));
-    GetWindowTextW(g_logical_ip, logical_ip, ARRAYSIZE(logical_ip));
-    GetWindowTextW(g_token, token, ARRAYSIZE(token));
+    GetWindowTextW(g_api_url, api_url, ARRAYSIZE(api_url));
+    GetWindowTextW(g_username, username, ARRAYSIZE(username));
+    GetWindowTextW(g_password, password, ARRAYSIZE(password));
     GetWindowTextW(g_role, role, ARRAYSIZE(role));
     is_host = wcsstr(role, L"主机") != NULL;
-    use_local_relay = wcsstr(role, L"本机中继") != NULL;
     context->is_host = is_host;
+    room_id = SendMessageW(g_room, CB_GETITEMDATA, SendMessageW(g_room, CB_GETCURSEL, 0, 0), 0);
     if (!file_exists(context->game_path)) {
         show_status(L"请先选择有效的 WE8.exe。 ");
         HeapFree(GetProcessHeap(), 0, context);
@@ -413,39 +544,24 @@ static void start_test(void) {
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
-    if (wcslen(relay) >= ARRAYSIZE(context->relay) || wcslen(room) >= ARRAYSIZE(context->room) ||
-        wcslen(logical_ip) >= ARRAYSIZE(context->logical_ip) || parse_port(relay) == 0 ||
-        !valid_room(room) || !valid_ipv4(logical_ip) || !valid_token(token)) {
-        show_status(L"请检查中继地址、房间名、逻辑 IP 和测试令牌。令牌需要 8-127 个 ASCII 字符。 ");
+    if (api_url[0] == L'\0' || username[0] == L'\0' || password[0] == L'\0' || room_id < 1 || room_id > 3) {
+        show_status(L"请填写 API 地址、账号、密码，并选择无网卡房间。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
-    if (!is_host && (logical_ip[0] == L'\0')) {
-        show_status(L"客机必须填写与主机不同的逻辑 IP。 ");
-        HeapFree(GetProcessHeap(), 0, context);
-        return;
-    }
-    wcsncpy_s(context->relay, ARRAYSIZE(context->relay), relay, _TRUNCATE);
-    wcsncpy_s(context->room, ARRAYSIZE(context->room), room, _TRUNCATE);
-    wcsncpy_s(context->logical_ip, ARRAYSIZE(context->logical_ip), logical_ip, _TRUNCATE);
-    wcsncpy_s(context->token, ARRAYSIZE(context->token), token, _TRUNCATE);
+    wcsncpy_s(context->api_url, ARRAYSIZE(context->api_url), api_url, _TRUNCATE);
+    wcsncpy_s(context->username, ARRAYSIZE(context->username), username, _TRUNCATE);
+    wcsncpy_s(context->password, ARRAYSIZE(context->password), password, _TRUNCATE);
+    context->room_id = (int)room_id;
     if (!make_log_path(is_host ? L"Host-A" : L"Client-B", context->log_path, ARRAYSIZE(context->log_path))) {
         show_status(L"无法创建桌面日志路径。 ");
         HeapFree(GetProcessHeap(), 0, context);
         return;
     }
-    if (use_local_relay) SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
-    if (use_local_relay && !start_local_relay(relay, error_text, ARRAYSIZE(error_text))) {
-        SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
-        show_status(error_text);
-        HeapFree(GetProcessHeap(), 0, context);
-        return;
-    }
     EnableWindow(g_start, FALSE);
-    show_status(L"正在启动 WE8 并加载无网卡 Socket Hook，请稍候...");
-    thread = CreateThread(NULL, 0, launch_thread, context, 0, NULL);
+    show_status(L"正在登录账号并申请无网卡房间，请稍候...");
+    thread = CreateThread(NULL, 0, api_launch_thread, context, 0, NULL);
     if (thread == NULL) {
-        SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
         EnableWindow(g_start, TRUE);
         show_status(L"无法创建启动线程。 ");
         HeapFree(GetProcessHeap(), 0, context);
@@ -469,68 +585,56 @@ static void create_controls(HWND window) {
     control = CreateWindowExW(0, L"BUTTON", L"选择游戏", WS_CHILD | WS_VISIBLE,
         548, 81, 100, 29, window, (HMENU)ID_CHOOSE_GAME, NULL, NULL);
     set_font(control, font);
-    control = CreateWindowExW(0, L"STATIC", L"本机角色", WS_CHILD | WS_VISIBLE,
+    control = CreateWindowExW(0, L"STATIC", L"Go API 地址", WS_CHILD | WS_VISIBLE,
         24, 124, 110, 22, window, NULL, NULL, NULL);
     set_font(control, font);
+    g_api_url = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", WELNPT_DEFAULT_API_URL,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 24, 148, 440, 27, window, NULL, NULL, NULL);
+    set_font(g_api_url, font);
+    control = CreateWindowExW(0, L"STATIC", L"账号", WS_CHILD | WS_VISIBLE,
+        24, 190, 55, 22, window, NULL, NULL, NULL);
+    set_font(control, font);
+    g_username = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 80, 186, 210, 27, window, NULL, NULL, NULL);
+    set_font(g_username, font);
+    control = CreateWindowExW(0, L"STATIC", L"密码", WS_CHILD | WS_VISIBLE,
+        310, 190, 55, 22, window, NULL, NULL, NULL);
+    set_font(control, font);
+    g_password = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD, 366, 186, 210, 27, window, NULL, NULL, NULL);
+    set_font(g_password, font);
+    control = CreateWindowExW(0, L"STATIC", L"本机角色", WS_CHILD | WS_VISIBLE,
+        24, 232, 110, 22, window, NULL, NULL, NULL);
+    set_font(control, font);
     g_role = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-        24, 148, 190, 120, window, (HMENU)ID_ROLE, NULL, NULL);
+        24, 256, 220, 100, window, (HMENU)ID_ROLE, NULL, NULL);
     set_font(g_role, font);
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机（云端中继）");
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"客机（云端中继）");
-    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机（本机中继）");
+    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"主机");
+    SendMessageW(g_role, CB_ADDSTRING, 0, (LPARAM)L"客机");
     SendMessageW(g_role, CB_SETCURSEL, 0, 0);
-    control = CreateWindowExW(0, L"STATIC", L"中继地址", WS_CHILD | WS_VISIBLE,
-        240, 124, 110, 22, window, NULL, NULL, NULL);
+    control = CreateWindowExW(0, L"STATIC", L"无网卡房间", WS_CHILD | WS_VISIBLE,
+        280, 232, 110, 22, window, NULL, NULL, NULL);
     set_font(control, font);
-    g_relay = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"8.155.145.132:22333",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 240, 148, 408, 27, window, (HMENU)ID_RELAY, NULL, NULL);
-    set_font(g_relay, font);
-    control = CreateWindowExW(0, L"STATIC", L"房间名", WS_CHILD | WS_VISIBLE,
-        24, 190, 110, 22, window, NULL, NULL, NULL);
-    set_font(control, font);
-    g_room = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"wel-test-room", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        24, 214, 190, 27, window, (HMENU)ID_ROOM, NULL, NULL);
+    g_room = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+        280, 256, 300, 110, window, (HMENU)ID_ROOM, NULL, NULL);
     set_font(g_room, font);
-    control = CreateWindowExW(0, L"STATIC", L"本机逻辑 IP", WS_CHILD | WS_VISIBLE,
-        240, 190, 110, 22, window, NULL, NULL, NULL);
-    set_font(control, font);
-    g_logical_ip = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10.250.1.1",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 240, 214, 180, 27, window, (HMENU)ID_LOGICAL_IP, NULL, NULL);
-    set_font(g_logical_ip, font);
-    control = CreateWindowExW(0, L"STATIC", L"测试令牌", WS_CHILD | WS_VISIBLE,
-        24, 256, 110, 22, window, NULL, NULL, NULL);
-    set_font(control, font);
-    g_token = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", WELNPT_TEST_TOKEN,
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD,
-        24, 280, 420, 27, window, (HMENU)ID_TOKEN, NULL, NULL);
-    set_font(g_token, font);
-    control = CreateWindowExW(0, L"BUTTON", L"复制令牌", WS_CHILD | WS_VISIBLE,
-        456, 276, 100, 34, window, (HMENU)ID_COPY_TOKEN, NULL, NULL);
-    set_font(control, font);
-    g_start = CreateWindowExW(0, L"BUTTON", L"启动无网卡联机", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        566, 276, 182, 34, window, (HMENU)ID_START, NULL, NULL);
+    SendMessageW(g_room, CB_ADDSTRING, 0, (LPARAM)L"01 - 10.122.1.0/24");
+    SendMessageW(g_room, CB_SETITEMDATA, 0, 1);
+    SendMessageW(g_room, CB_ADDSTRING, 0, (LPARAM)L"02 - 10.122.2.0/24");
+    SendMessageW(g_room, CB_SETITEMDATA, 1, 2);
+    SendMessageW(g_room, CB_ADDSTRING, 0, (LPARAM)L"03 - 10.122.3.0/24");
+    SendMessageW(g_room, CB_SETITEMDATA, 2, 3);
+    SendMessageW(g_room, CB_SETCURSEL, 0, 0);
+    g_start = CreateWindowExW(0, L"BUTTON", L"登录并启动 WE8", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        24, 386, 220, 34, window, (HMENU)ID_START, NULL, NULL);
     set_font(g_start, font);
     g_status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
-        L"云端测试：两端保持 8.155.145.132:22333，房间名和测试令牌相同。\r\n"
-        L"主机逻辑 IP 使用 10.250.1.1，客机使用 10.250.1.2。\r\n"
-        L"此版本不安装 TAP/n2n，不修改系统 IP 或路由。",
+        L"登录后选择同一个无网卡房间。服务端会为主机和客机分别分配 10.122.x.x 逻辑地址。\r\n"
+        L"此版本不安装 TAP/n2n，不修改系统 IP 或路由；中继参数由 Go 后端下发。\r\n"
+        L"请在两台电脑上分别使用自己的 Laravel 账号登录。",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        24, 334, 724, 145, window, (HMENU)ID_STATUS, NULL, NULL);
+        24, 440, 724, 145, window, (HMENU)ID_STATUS, NULL, NULL);
     set_font(g_status, font);
-}
-
-static void apply_role_defaults(void) {
-    int selection = (int)SendMessageW(g_role, CB_GETCURSEL, 0, 0);
-    if (selection == 1) {
-        SetWindowTextW(g_relay, L"8.155.145.132:22333");
-        SetWindowTextW(g_logical_ip, L"10.250.1.2");
-    } else if (selection == 2) {
-        SetWindowTextW(g_relay, L"127.0.0.1:22333");
-        SetWindowTextW(g_logical_ip, L"10.250.1.1");
-    } else {
-        SetWindowTextW(g_relay, L"8.155.145.132:22333");
-        SetWindowTextW(g_logical_ip, L"10.250.1.1");
-    }
 }
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -548,14 +652,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, L
                 start_test();
                 return 0;
             }
-            if (LOWORD(w_param) == ID_COPY_TOKEN) {
-                copy_token();
-                return 0;
-            }
-            if (LOWORD(w_param) == ID_ROLE && HIWORD(w_param) == CBN_SELCHANGE) {
-                apply_role_defaults();
-                return 0;
-            }
             break;
         case WM_LAUNCH_COMPLETE: {
             launch_context *context = (launch_context *)l_param;
@@ -563,14 +659,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, L
             if (context->success) EnableWindow(g_start, FALSE);
             else EnableWindow(g_start, TRUE);
             SecureZeroMemory(context->token, sizeof(context->token));
+            SecureZeroMemory(context->password, sizeof(context->password));
             HeapFree(GetProcessHeap(), 0, context);
             return 0;
         }
         case WM_DESTROY:
-            if (g_relay_job != NULL) {
-                CloseHandle(g_relay_job);
-                g_relay_job = NULL;
-            }
             PostQuitMessage(0);
             return 0;
     }
@@ -594,7 +687,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_lin
     if (!RegisterClassExW(&window_class)) return 1;
     window = CreateWindowExW(0, window_class.lpszClassName, L"WEL 无虚拟网卡联机测试",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 545, NULL, NULL, instance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 650, NULL, NULL, instance, NULL);
     if (window == NULL) return 2;
     ShowWindow(window, show_command);
     UpdateWindow(window);

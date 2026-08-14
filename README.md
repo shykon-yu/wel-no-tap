@@ -10,6 +10,9 @@ system routes. It does not modify the current production client in
 `P2 - authenticated cloud relay validation` is implemented. P1 completed a
 real two-computer WE8 match without a virtual adapter: all overlapping packets
 and bytes matched in both directions, and the Hook reported zero queue drops.
+The current connection GUI authenticates through the shared Go API and receives
+its room address, logical IP, community, and relay credential from the separate
+No-TAP controller.
 
 The build contains two independent tools:
 
@@ -63,31 +66,23 @@ All injected DLLs are x86 because the tested `WE8.exe` is x86.
 
 Keep the complete artifact extracted on both computers.
 
-Host computer:
+On both computers:
 
 1. Open `WEL无网卡联机测试.exe`.
-2. Select `主机（云端中继）`.
-3. Keep relay `8.155.145.132:22333`, room `wel-test-room`, logical IP
-   `10.250.1.1`. The GUI pre-fills the temporary two-player token; use
-   `复制令牌` if you need to transfer it manually.
-4. Select `WE8.exe`, start, then create a host inside WE8.
+2. Enter the Go API address, Laravel account, and password.
+3. Select the same No-TAP room, for example `01 - 10.122.1.0/24`.
+4. Select `主机` or `客机`, select `WE8.exe`, and click `登录并启动 WE8`.
 
-Client computer:
+The Go API assigns a different logical address to each active account. The
+host then creates a room inside WE8; the client searches and joins normally.
+The two players must select the same No-TAP room, but use their own Laravel
+accounts. No TAP/n2n driver, system route, or manually copied token is needed.
 
-1. Open the same GUI and select `客机（云端中继）`.
-2. Keep relay `8.155.145.132:22333`.
-3. Use the same room and the pre-filled token, with a different logical IP
-   such as `10.250.1.2`.
-4. Select `WE8.exe`, start, then search and join normally.
-
-Neither player needs an inbound firewall rule. Both players only send and
-receive through one outbound UDP mapping to the cloud relay.
+Neither player needs an inbound WE8 port. Both players only send and receive
+through one outbound UDP mapping to the cloud relay.
 
 Both machines write a JSONL diagnostic log to the Desktop. Send both files
 together after each test, whether it succeeds or fails.
-
-The older LAN flow remains available as `主机（本机中继）` for regression
-testing.
 
 ## Linux Relay
 
@@ -99,19 +94,20 @@ Build with:
 
 The production host uses the independent systemd unit in `deploy/systemd` and
 an `/etc/welnpt-notap.env` file containing `WEL_NOTAP_PORT` and the private
-test token. It does not share a process, port, configuration, or restart cycle
+relay secret. It does not share a process, port, configuration, or restart cycle
 with the current TAP/n2n platform.
 
 ## Scope and Security
 
-P2 authenticates packets with a deployment test token. The current GUI embeds
-a temporary two-player token for this private test only. It does not encrypt
-WE8 payloads and does not yet use platform-issued per-player credentials.
+P2 authenticates packets with a deployment relay secret. The GUI does not
+embed that secret: the Go API authenticates the Laravel account and returns
+the room credential for the current lease. The relay secret is still shared
+by the No-TAP deployment and should be rotated as an operational secret.
 
-Before production integration, the shared test token must be replaced with
-platform-issued room/player credentials, replay protection, and rate limits.
-P2P can be added later as an optimization; a reliable authenticated relay
-remains the baseline.
+The current protocol does not encrypt WE8 payloads. Production hardening should
+add per-player credentials, replay protection, and rate limits. P2P can be
+added later as an optimization; a reliable authenticated relay remains the
+baseline.
 
 Detailed design and the confirmed WE8 Socket timeline are in
 [`docs/NO_TAP_ARCHITECTURE_ZH.md`](docs/NO_TAP_ARCHITECTURE_ZH.md).
