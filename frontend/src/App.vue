@@ -250,9 +250,12 @@ async function joinRoom(room: Room) {
       } catch (error) {
         directCandidateStatus.value = 'relay-only'
         directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
-        warningMessage.value = messageOf(error).includes('ICE candidate 收集超时')
+        const message = messageOf(error)
+        warningMessage.value = message.includes('ICE candidate 收集超时')
           ? '直连候选收集超时，当前仅使用中继；稍后点击玩家 Ping 可再次尝试'
-          : `直连候选准备失败，当前仅使用中继：${messageOf(error)}`
+          : message.includes('ICE 辅助程序提前退出')
+            ? `直连组件未正常启动，当前仅使用中继：${message}`
+            : `直连候选准备失败，当前仅使用中继：${message}`
       }
     }
     networkStatus.value = {

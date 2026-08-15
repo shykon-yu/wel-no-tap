@@ -15,6 +15,8 @@ let iceHookPort = 0
 let iceLineBuffer = ''
 let iceSdpBuffer = ''
 let readingIceSdp = false
+let iceExitError = ''
+let iceDiagnostics = []
 let pendingIcePing = null
 let pendingRelayPing = null
 let lastRemoteDescription = ''
@@ -89,6 +91,13 @@ function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
 }
 
+function rememberIceDiagnostic(rawLine) {
+  const line = String(rawLine || '').replace(/[\r\n]+/g, ' ').trim()
+  if (!line || line === 'LOCAL_SDP_BEGIN' || line === 'LOCAL_SDP_END' || line.startsWith('a=')) return
+  iceDiagnostics.push(line.slice(0, 300))
+  if (iceDiagnostics.length > 12) iceDiagnostics.shift()
+}
+
 function waitForIceCandidate(child, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs
@@ -100,7 +109,7 @@ function waitForIceCandidate(child, timeoutMs = 12000) {
       }
       if (Date.now() >= deadline || iceProcess !== child) {
         clearInterval(timer)
-        reject(new Error('ICE candidate 收集超时'))
+        reject(new Error(iceProcess !== child ? (iceExitError || 'ICE 辅助程序已退出') : 'ICE candidate 收集超时'))
       }
     }, 100)
   })
@@ -156,6 +165,11 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
   iceLocalDescription = ''
   iceAgentPort = 0
   iceState = 'gathering'
+  iceLineBuffer = ''
+  iceSdpBuffer = ''
+  readingIceSdp = false
+  iceExitError = ''
+  iceDiagnostics = []
   const environment = { ...process.env }
   if (relay && room && logicalIp && token) {
     environment.WEL_NOTAP_RELAY = String(relay)
@@ -173,12 +187,20 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
     while ((newline = iceLineBuffer.indexOf('\n')) >= 0) {
       const line = iceLineBuffer.slice(0, newline + 1)
       iceLineBuffer = iceLineBuffer.slice(newline + 1)
+      rememberIceDiagnostic(line)
       handleIceLine(line)
     }
   }
   child.stdout.on('data', consume)
-  child.stderr.on('data', (chunk) => { /* the helper reports protocol state on stdout */ void chunk })
-  child.once('close', () => { if (iceProcess === child) { iceProcess = null; iceState = 'failed' } })
+  child.stderr.on('data', (chunk) => { rememberIceDiagnostic('stderr: ' + chunk.toString('utf8')) })
+  child.once('close', (code) => {
+    if (iceProcess === child) {
+      iceProcess = null
+      iceState = 'failed'
+      const detail = iceDiagnostics.length ? '：' + iceDiagnostics.slice(-3).join(' | ') : ''
+      iceExitError = 'ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）' + detail
+    }
+  })
   return waitForIceCandidate(child)
 }
 
@@ -293,6 +315,8 @@ async function disconnect() {
   pendingRelayPing = null
   lastRemoteDescription = ''
   lastLogPath = ''
+  iceExitError = ''
+  iceDiagnostics = []
   return { stopped: true }
 }
 
