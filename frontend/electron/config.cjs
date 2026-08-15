@@ -14,6 +14,7 @@ const defaults = {
   WEL_API_ROOM_JOIN_PATH: '/notap/rooms/{roomId}/join',
   WEL_API_ROOM_HEARTBEAT_PATH: '/notap/rooms/{roomId}/heartbeat',
   WEL_API_ROOM_LEAVE_PATH: '/notap/rooms/{roomId}/leave',
+  WEL_API_ROOM_ICE_PATH: '/notap/rooms/{roomId}/ice',
   WEL_GAME_NAME: 'WE8',
 }
 
@@ -74,6 +75,7 @@ function publicConfig() {
     apiRoomJoinPath: values.WEL_API_ROOM_JOIN_PATH,
     apiRoomHeartbeatPath: values.WEL_API_ROOM_HEARTBEAT_PATH,
     apiRoomLeavePath: values.WEL_API_ROOM_LEAVE_PATH,
+    apiRoomIcePath: values.WEL_API_ROOM_ICE_PATH,
     configFile: filePath,
   }
 }

@@ -291,6 +291,16 @@ int main(int argc, char **argv) {
         if (header->type == WELNPT_PACKET_DATA) {
             delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
             if (delivered == 0) ++g_stats.route_drops;
+        } else if (header->type == WELNPT_PACKET_PING) {
+            char pong[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+            welnpt_packet_header *pong_header = (welnpt_packet_header *)pong;
+            memcpy(pong, packet, (size_t)received);
+            pong_header->type = WELNPT_PACKET_PONG;
+            if (sign_packet(pong, (size_t)received) && sendto(socket_handle, pong, received, 0,
+                (const struct sockaddr *)&source, sizeof(source)) == received) {
+                ++g_stats.forwarded_packets;
+                g_stats.forwarded_bytes += (uint64_t)received;
+            }
         }
         if (now - last_stats >= 60000) {
             log_stats(now);

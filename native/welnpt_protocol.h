@@ -10,6 +10,8 @@
 #define WELNPT_MAX_PAYLOAD 4096
 #define WELNPT_PACKET_REGISTER 1
 #define WELNPT_PACKET_DATA 2
+#define WELNPT_PACKET_PING 3
+#define WELNPT_PACKET_PONG 4
 #define WELNPT_FLAG_BROADCAST 0x01
 
 #pragma pack(push, 1)
@@ -40,7 +42,8 @@ static void welnpt_initialize_header(welnpt_packet_header *header, uint8_t type)
 static int welnpt_valid_header(const welnpt_packet_header *header) {
     return memcmp(header->magic, "WNP2", 4) == 0 &&
         header->version == WELNPT_PROTOCOL_VERSION &&
-        (header->type == WELNPT_PACKET_REGISTER || header->type == WELNPT_PACKET_DATA);
+        (header->type == WELNPT_PACKET_REGISTER || header->type == WELNPT_PACKET_DATA ||
+         header->type == WELNPT_PACKET_PING || header->type == WELNPT_PACKET_PONG);
 }
 
 #endif

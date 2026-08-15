@@ -29,6 +29,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = 'build/x86'
           New-Item $output -ItemType Directory -Force | Out-Null
+          $juiceOutput = 'build/x86/libjuice'
+          New-Item $juiceOutput -ItemType Directory -Force | Out-Null
           function Invoke-Compiler([string]$label, [string[]]$arguments) {
             $compilerOutput = & cl.exe @arguments 2>&1
             $compilerExit = $LASTEXITCODE
@@ -38,6 +40,14 @@ jobs:
               throw "$label build failed"
             }
           }
+          $juiceSources = Get-ChildItem 'third_party/libjuice/src' -Filter '*.c' | ForEach-Object { $_.FullName }
+          Invoke-Compiler 'libjuice static library' @(
+            '/nologo', '/W3', '/O2', '/MT', '/c', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX', '/DJUICE_STATIC', '/D_WIN32_WINNT=0x0601', '/D_CRT_SECURE_NO_WARNINGS',
+            '/Ithird_party/libjuice/include', '/Ithird_party/libjuice/src', $juiceSources, "/Fo:$juiceOutput/"
+          )
+          $juiceObjects = Get-ChildItem $juiceOutput -Filter '*.obj' | ForEach-Object { $_.FullName }
+          & lib.exe /nologo /OUT:$output/juice-static.lib $juiceObjects
+          if ($LASTEXITCODE -ne 0) { throw 'libjuice static library build failed' }
           Invoke-Compiler 'trace DLL' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             '/LD', 'native/welnpt_trace.c', "/Fe:$output/welnpttrace.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
@@ -67,6 +77,11 @@ jobs:
             '/nologo', '/W4', '/O2', '/MT', '/utf-8', '/D_CRT_SECURE_NO_WARNINGS', '/DUNICODE', '/D_UNICODE',
             '/D_WIN32_WINNT=0x0601', 'native/welnpt_connect_gui.c', "/Fe:$output/WEL无网卡联机.exe",
             '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', 'Winhttp.lib', '/SUBSYSTEM:WINDOWS'
+          )
+          Invoke-Compiler 'libjuice ICE helper' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            '/Ithird_party/libjuice/include', 'native/welnpt_ice.c', "/Fe:$output/welnptice.exe",
+            '/link', 'Ws2_32.lib', 'Bcrypt.lib', "$output/juice-static.lib"
           )
           Compress-Archive -Path "$output/*" -DestinationPath 'build/WEL无网卡云中继-P2-x86-完整包.zip' -Force
       - name: Upload complete Windows package

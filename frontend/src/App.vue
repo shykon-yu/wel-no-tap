@@ -40,6 +40,7 @@ const roomMembersIntervalMs = 15 * 1000
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let roomMembersTimer: number | undefined
+let transportStatusTimer: number | undefined
 let signingOut = false
 let leaseEpoch = 0
 
@@ -81,6 +82,7 @@ function startRoomMembersMonitor() {
 }
 
 function clearRoomSessionState() {
+  stopTransportStatusMonitor()
   activeLease.value = null
   networkStatus.value = null
   pingResults.value = {}
@@ -88,12 +90,31 @@ function clearRoomSessionState() {
   warningMessage.value = ''
 }
 
+function stopTransportStatusMonitor() {
+  if (transportStatusTimer !== undefined) window.clearInterval(transportStatusTimer)
+  transportStatusTimer = undefined
+}
+
+function startTransportStatusMonitor() {
+  stopTransportStatusMonitor()
+  if (!desktop()?.transportStatus) return
+  transportStatusTimer = window.setInterval(async () => {
+    try { notice.value = (await desktop()!.transportStatus()).summary } catch { /* diagnostic status is best effort */ }
+  }, 2000)
+}
+
 async function loadRoomMembers() {
   const lease = activeLease.value
   if (!lease) return
   try {
     const result = await roomApi.members(lease.room_id)
-    if (activeLease.value?.room_id === lease.room_id) roomMembers.value = result.members
+    if (activeLease.value?.room_id === lease.room_id) {
+      roomMembers.value = result.members
+      const peer = result.members.find(member => !member.is_self && member.ice_description)
+      if (peer?.ice_description && desktop()?.configureIce) {
+        try { await desktop()!.configureIce(peer.ice_description) } catch { /* relay remains available */ }
+      }
+    }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) await forceSignedOut(error.message)
   }
@@ -207,6 +228,19 @@ async function joinRoom(room: Room) {
   try {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
+    if (desktop()?.prepareIce) {
+      try {
+        const ice = await desktop()!.prepareIce({
+          stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
+          relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
+          logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
+        })
+        await roomApi.publishIce(room.id, ice.localDescription)
+        notice.value = '已进入房间，正在探测直连'
+      } catch (error) {
+        warningMessage.value = `直连候选准备失败，将继续使用中继：${messageOf(error)}`
+      }
+    }
     networkStatus.value = {
       ready: true,
       connected: true,
@@ -294,10 +328,13 @@ async function launchGame() {
       room: activeLease.value.community,
       logicalIp: activeLease.value.logical_ip || activeLease.value.virtual_ip,
       token: activeLease.value.relay_token,
+      remoteIp: roomMembers.value.find(member => !member.is_self && member.ice_description)?.virtual_ip,
+      remoteDescription: roomMembers.value.find(member => !member.is_self && member.ice_description)?.ice_description,
     })
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
     notice.value = '已启动 WE8'
+    startTransportStatusMonitor()
   } catch (error) {
     errorMessage.value = messageOf(error)
   } finally {
@@ -306,10 +343,15 @@ async function launchGame() {
 }
 async function pingMember(member: RoomMember) {
   if (!desktop()) return
-  pingResults.value = { ...pingResults.value, [member.user_id]: { host: member.virtual_ip, reachable: false, summary: '正在 Ping...' } }
+  pingResults.value = { ...pingResults.value, [member.user_id]: { host: member.virtual_ip, reachable: false, summary: '正在探测中继与直连...' } }
   try {
-    const result = await desktop()!.pingHost(member.virtual_ip)
-    pingResults.value = { ...pingResults.value, [member.user_id]: result }
+    let relaySummary = '中继不可用'
+    try { relaySummary = `中继 ${await desktop()!.pingRelay()} ms` } catch (error) { relaySummary = messageOf(error) }
+    let directSummary = member.ice_description ? '直连探测中，请稍后再试' : '对方尚未完成 candidate'
+    if (member.ice_description && desktop()?.pingIce) {
+      try { directSummary = `直连 ${await desktop()!.pingIce(member.ice_description)} ms` } catch (error) { directSummary = messageOf(error) }
+    }
+    pingResults.value = { ...pingResults.value, [member.user_id]: { host: member.virtual_ip, reachable: relaySummary.startsWith('中继 '), summary: `${relaySummary}；${directSummary}` } }
   } catch (error) {
     pingResults.value = {
       ...pingResults.value,
@@ -364,6 +406,7 @@ onBeforeUnmount(() => {
   stopLeaseHeartbeat()
   stopSessionMonitor()
   stopRoomMembersMonitor()
+  stopTransportStatusMonitor()
 })
 </script>
 

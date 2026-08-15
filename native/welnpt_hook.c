@@ -16,6 +16,7 @@
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
+#define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
 
 typedef SOCKET (WSAAPI *wel_socket_fn)(int, int, int);
 typedef SOCKET (WSAAPI *wel_wsasocketa_fn)(int, int, int, LPWSAPROTOCOL_INFOA, GROUP, DWORD);
@@ -56,6 +57,11 @@ static int g_locks_initialized;
 static virtual_socket g_sockets[WELNPT_MAX_SOCKETS];
 static SOCKET g_transport = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
+static SOCKET g_direct_transport = INVALID_SOCKET;
+static struct sockaddr_in g_direct_agent_address;
+static uint32_t g_direct_peer_ip;
+static unsigned short g_direct_hook_port;
+static volatile LONG g_direct_connected;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
 static welnpt_auth_context g_auth;
@@ -221,6 +227,27 @@ static int enqueue_datagram(const welnpt_packet_header *header, const char *payl
     return 1;
 }
 
+static int handle_transport_packet(char *packet, int received, const char *path) {
+	welnpt_packet_header *header;
+	int payload_length;
+	if (received < (int)sizeof(welnpt_packet_header)) return 0;
+	header = (welnpt_packet_header *)packet;
+	payload_length = (int)ntohs(header->payload_length);
+	if (!welnpt_valid_header(header) || header->type != WELNPT_PACKET_DATA ||
+		memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
+		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
+		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
+		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
+	if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
+		log_line("\"api\":\"transport-drop\",\"path\":\"%s\",\"targetPort\":%u,\"length\":%d",
+			path, (unsigned)ntohs(header->target_port), payload_length);
+		return 0;
+	}
+	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"sourcePort\":%u,\"length\":%d",
+		path, (unsigned)ntohs(header->source_port), payload_length);
+	return 1;
+}
+
 static int send_register_packet(void) {
     welnpt_packet_header header;
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
@@ -263,10 +290,23 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
         WSASetLastError(WSAEACCES);
         return SOCKET_ERROR;
     }
+    if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && g_direct_transport != INVALID_SOCKET &&
+        header->target_ip == g_direct_peer_ip && InterlockedCompareExchange(&g_direct_connected, 0, 0) != 0) {
+        sent = g_real_sendto(g_direct_transport, packet, (int)sizeof(*header) + length, 0,
+            (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
+        if (sent != SOCKET_ERROR) {
+            log_line("\"api\":\"sendto\",\"path\":\"direct\",\"socket\":%llu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d",
+                (unsigned __int64)handle, (unsigned)source_port, (unsigned)ntohs(target->sin_port), length);
+            WSASetLastError(0);
+            return length;
+        }
+        InterlockedExchange(&g_direct_connected, 0);
+        log_line("\"api\":\"direct-fallback\",\"reason\":\"local-send-failed\"");
+    }
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
     if (sent == SOCKET_ERROR) return SOCKET_ERROR;
-    log_line("\"api\":\"sendto\",\"socket\":%llu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d",
+    log_line("\"api\":\"sendto\",\"path\":\"relay\",\"socket\":%llu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d",
         (unsigned __int64)handle, (unsigned)source_port, (unsigned)ntohs(target->sin_port), length);
     WSASetLastError(0);
     return length;
@@ -589,21 +629,29 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
         }
         received = g_real_recvfrom(g_transport, packet, sizeof(packet), 0,
             (struct sockaddr *)&source, &source_length);
-        if (received >= (int)sizeof(welnpt_packet_header)) {
-            welnpt_packet_header *header = (welnpt_packet_header *)packet;
-            int payload_length = (int)ntohs(header->payload_length);
-            if (welnpt_valid_header(header) && header->type == WELNPT_PACKET_DATA &&
-                memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) == 0 &&
-                (((header->flags & WELNPT_FLAG_BROADCAST) != 0) || header->target_ip == g_logical_ip) &&
-                payload_length <= WELNPT_MAX_PAYLOAD &&
-                received == (int)sizeof(*header) + payload_length &&
-                welnpt_auth_verify(&g_auth, packet, received)) {
-                if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
-                    log_line("\"api\":\"relay-drop\",\"targetPort\":%u,\"length\":%d",
-                        (unsigned)ntohs(header->target_port), payload_length);
-                }
-            }
+        if (received > 0) handle_transport_packet(packet, received, "relay");
+    }
+    return 0;
+}
+
+static DWORD WINAPI direct_receive_thread(LPVOID unused) {
+    char packet[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+    (void)unused;
+    while (InterlockedCompareExchange(&g_stopping, 0, 0) == 0) {
+        struct sockaddr_in source;
+        int source_length = sizeof(source);
+        int received = g_real_recvfrom(g_direct_transport, packet, sizeof(packet), 0,
+            (struct sockaddr *)&source, &source_length);
+        if (received <= 0) continue;
+        if (received > (int)strlen(WELNPT_ICE_STATE_PREFIX) &&
+            memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
+            const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
+            int connected = strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0;
+            InterlockedExchange(&g_direct_connected, connected);
+            log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"", received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
+            continue;
         }
+        handle_transport_packet(packet, received, "direct");
     }
     return 0;
 }
@@ -624,6 +672,9 @@ static int load_configuration(void) {
     char relay[256];
     char logical_ip[64];
     char token[WELNPT_AUTH_SECRET_MAX];
+    char direct_peer_ip[64];
+    char direct_agent_port[16];
+    char direct_hook_port[16];
     char *separator;
     char port[16];
     struct addrinfo hints;
@@ -649,6 +700,23 @@ static int load_configuration(void) {
     if (getaddrinfo(relay, port, &hints, &addresses) != 0 || addresses == NULL) return 0;
     CopyMemory(&g_relay_address, addresses->ai_addr, sizeof(g_relay_address));
     freeaddrinfo(addresses);
+
+    if (GetEnvironmentVariableA("WEL_NOTAP_DIRECT_PEER_IP", direct_peer_ip, sizeof(direct_peer_ip)) > 0 &&
+        GetEnvironmentVariableA("WEL_NOTAP_DIRECT_AGENT_PORT", direct_agent_port, sizeof(direct_agent_port)) > 0 &&
+        GetEnvironmentVariableA("WEL_NOTAP_DIRECT_HOOK_PORT", direct_hook_port, sizeof(direct_hook_port)) > 0) {
+        unsigned long agent_port = strtoul(direct_agent_port, NULL, 10);
+        unsigned long hook_port = strtoul(direct_hook_port, NULL, 10);
+        if (agent_port > 0 && agent_port <= 65535 && hook_port > 0 && hook_port <= 65535 &&
+            InetPtonA(AF_INET, direct_peer_ip, &g_direct_peer_ip) == 1) {
+            ZeroMemory(&g_direct_agent_address, sizeof(g_direct_agent_address));
+            g_direct_agent_address.sin_family = AF_INET;
+            g_direct_agent_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+            g_direct_agent_address.sin_port = htons((u_short)agent_port);
+            g_direct_hook_port = (unsigned short)hook_port;
+        } else {
+            g_direct_peer_ip = 0;
+        }
+    }
     return 1;
 }
 
@@ -656,6 +724,7 @@ static int initialize_hook(void) {
     HMODULE winsock;
     WSADATA winsock_data;
     struct sockaddr_in local_address;
+    struct sockaddr_in direct_address;
     DWORD timeout = 500;
     HANDLE worker;
 
@@ -691,11 +760,34 @@ static int initialize_hook(void) {
     local_address.sin_port = 0;
     if (g_real_bind(g_transport, (const struct sockaddr *)&local_address, sizeof(local_address)) == SOCKET_ERROR) return 0;
     setsockopt(g_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+	if (g_direct_peer_ip != 0 && g_direct_hook_port != 0) {
+		g_direct_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (g_direct_transport != INVALID_SOCKET) {
+			ZeroMemory(&direct_address, sizeof(direct_address));
+			direct_address.sin_family = AF_INET;
+			direct_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+			direct_address.sin_port = htons(g_direct_hook_port);
+			if (g_real_bind(g_direct_transport, (const struct sockaddr *)&direct_address, sizeof(direct_address)) == SOCKET_ERROR) {
+				g_real_closesocket(g_direct_transport);
+				g_direct_transport = INVALID_SOCKET;
+			} else {
+				setsockopt(g_direct_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+				g_real_sendto(g_direct_transport, "WELICESTATE?", 12, 0,
+					(const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
+			}
+		}
+	}
     send_register_packet();
     patch_module_imports(GetModuleHandleW(NULL));
     worker = CreateThread(NULL, 0, relay_receive_thread, NULL, 0, NULL);
     if (worker == NULL) return 0;
     CloseHandle(worker);
+	if (g_direct_transport != INVALID_SOCKET) {
+		worker = CreateThread(NULL, 0, direct_receive_thread, NULL, 0, NULL);
+		if (worker != NULL) CloseHandle(worker);
+		log_line("\"api\":\"direct-ready\",\"hookPort\":%u,\"agentPort\":%u",
+			(unsigned)g_direct_hook_port, (unsigned)ntohs(g_direct_agent_address.sin_port));
+	}
     worker = CreateThread(NULL, 0, module_watch_thread, NULL, 0, NULL);
     if (worker != NULL) CloseHandle(worker);
     log_line("\"api\":\"hook-ready\",\"mode\":\"virtual-socket\",\"protocol\":2");

@@ -7,7 +7,8 @@ system routes. It does not modify the current production client in
 
 ## Current Status
 
-`P2 - authenticated cloud relay` is implemented. P1 completed a real
+`P3 - libjuice ICE direct path with relay fallback` is being integrated. P2
+authenticated cloud relay remains the default reliability path. P1 completed a real
 two-computer WE8 match without a virtual adapter: all overlapping packets
 and bytes matched in both directions, and the Hook reported zero queue drops.
 The current connection GUI authenticates through the shared Go API and receives
@@ -21,13 +22,14 @@ The build contains two independent tools:
 - `WEL无网卡观测工具.exe`: retains the P0 observation workflow and does not
   alter network traffic.
 
-The P2 data path is:
+The data path is:
 
 ```text
 WE8.exe
   -> welnpt.dll virtual UDP sockets
   -> one physical UDP transport socket
-  -> authenticated Linux/Windows room relay on UDP 22333
+  -> libjuice ICE direct UDP after connectivity checks, or authenticated
+     Linux/Windows room relay on UDP 22333
   -> peer welnpt.dll
   -> peer WE8.exe recvfrom queue
 ```
@@ -58,6 +60,7 @@ welnptrelay.exe
 WEL无网卡观测工具.exe
 welnpttrace.dll
 welnptgame.exe
+welnptice.exe
 ```
 
 All injected DLLs are x86 because the tested `WE8.exe` is x86.
@@ -88,6 +91,7 @@ WEL_API_ROOM_MEMBERS_PATH=/notap/rooms/{roomId}/members
 WEL_API_ROOM_JOIN_PATH=/notap/rooms/{roomId}/join
 WEL_API_ROOM_HEARTBEAT_PATH=/notap/rooms/{roomId}/heartbeat
 WEL_API_ROOM_LEAVE_PATH=/notap/rooms/{roomId}/leave
+WEL_API_ROOM_ICE_PATH=/notap/rooms/{roomId}/ice
 ```
 
 The No-TAP UI reuses the platform room workflow: login, game selection, room
@@ -137,9 +141,10 @@ the room credential for the current lease. The relay secret is still shared
 by the No-TAP deployment and should be rotated as an operational secret.
 
 The current protocol does not encrypt WE8 payloads. Production hardening should
-add per-player credentials, replay protection, and rate limits. P2P can be
-added later as an optimization; a reliable authenticated relay remains the
-baseline.
+add per-player credentials, replay protection, and rate limits. P2P is an
+optimization only: search broadcasts remain on the relay, and unicast game
+packets switch to direct only after libjuice reports `connected` or `completed`.
+Any failed direct check automatically keeps the authenticated relay path.
 
 Detailed design and the confirmed WE8 Socket timeline are in
 [`docs/NO_TAP_ARCHITECTURE_ZH.md`](docs/NO_TAP_ARCHITECTURE_ZH.md).

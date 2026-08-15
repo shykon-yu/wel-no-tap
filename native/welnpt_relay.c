@@ -183,6 +183,11 @@ int wmain(int argc, wchar_t **argv) {
             fflush(stdout);
         } else if (header->type == WELNPT_PACKET_DATA) {
             forward_data(socket_handle, packet, received, header);
+        } else if (header->type == WELNPT_PACKET_PING) {
+            header->type = WELNPT_PACKET_PONG;
+            if (welnpt_auth_sign(&g_auth, packet, received)) {
+                sendto(socket_handle, packet, received, 0, (const struct sockaddr *)&source, sizeof(source));
+            }
         }
     }
 }

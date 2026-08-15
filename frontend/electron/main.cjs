@@ -82,8 +82,13 @@ function chooseGame(event) {
 
 ipcMain.on('get-runtime-config', (event) => { event.returnValue = runtime })
 ipcMain.handle('notap-status', () => notap.status())
+ipcMain.handle('notap-transport-status', () => notap.transportStatus())
 ipcMain.handle('notap-disconnect', () => notap.disconnect())
 ipcMain.handle('notap-ping', (_event, host) => notap.pingHost(host))
+ipcMain.handle('notap-prepare-ice', (_event, options) => notap.prepareIce(options))
+ipcMain.handle('notap-configure-ice', (_event, remoteDescription) => notap.configureIce(remoteDescription))
+ipcMain.handle('notap-ping-ice', (_event, remoteDescription) => notap.pingIce(remoteDescription))
+ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', (_event, options) => notap.launch(options))
 
