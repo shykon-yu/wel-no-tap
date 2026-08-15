@@ -1,7 +1,7 @@
 {
   "name": "wel-no-tap-client",
   "private": true,
-  "version": "0.0.10",
+  "version": "0.0.11",
   "packageManager": "pnpm@11.11.0",
   "type": "module",
   "main": "electron/main.cjs",
@@ -76,7 +76,7 @@
       "perMachine": true,
       "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "WEL无网卡对战平台 v0.0.10",
+      "shortcutName": "WEL无网卡对战平台 v0.0.11",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     }

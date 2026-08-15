@@ -56,33 +56,70 @@ static wchar_t *game_directory(const wchar_t *game_path) {
     return directory;
 }
 
-static int inject_hook(HANDLE process, const wchar_t *hook_path) {
+static int inject_hook(HANDLE process, const wchar_t *hook_path, DWORD *error, const char **stage) {
     SIZE_T path_size = (wcslen(hook_path) + 1) * sizeof(wchar_t);
     LPVOID remote_path = VirtualAllocEx(process, NULL, path_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     HMODULE kernel32 = GetModuleHandleW(L"Kernel32.dll");
     FARPROC load_library;
     HANDLE thread;
     DWORD module_handle = 0;
+    DWORD wait_result;
 
-    if (remote_path == NULL || kernel32 == NULL) return 0;
-    if (!WriteProcessMemory(process, remote_path, hook_path, path_size, NULL)) {
+    *error = ERROR_SUCCESS;
+    *stage = "VirtualAllocEx";
+    if (remote_path == NULL) {
+        *error = GetLastError();
+        return 0;
+    }
+    if (kernel32 == NULL) {
+        *stage = "GetModuleHandleW(Kernel32.dll)";
+        *error = GetLastError();
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
         return 0;
     }
+    *stage = "WriteProcessMemory";
+    if (!WriteProcessMemory(process, remote_path, hook_path, path_size, NULL)) {
+        *error = GetLastError();
+        VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
+        return 0;
+    }
+    *stage = "GetProcAddress(LoadLibraryW)";
     load_library = GetProcAddress(kernel32, "LoadLibraryW");
     if (load_library == NULL) {
+        *error = GetLastError();
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
         return 0;
     }
+    *stage = "CreateRemoteThread";
     thread = CreateRemoteThread(process, NULL, 0, (LPTHREAD_START_ROUTINE)load_library, remote_path, 0, NULL);
     if (thread == NULL) {
+        *error = GetLastError();
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
         return 0;
     }
-    if (WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0) GetExitCodeThread(thread, &module_handle);
+    *stage = "WaitForSingleObject(LoadLibraryW)";
+    wait_result = WaitForSingleObject(thread, 10000);
+    if (wait_result != WAIT_OBJECT_0) {
+        *error = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+        CloseHandle(thread);
+        VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
+        return 0;
+    }
+    *stage = "GetExitCodeThread(LoadLibraryW)";
+    if (!GetExitCodeThread(thread, &module_handle)) {
+        *error = GetLastError();
+        CloseHandle(thread);
+        VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
+        return 0;
+    }
     CloseHandle(thread);
     VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-    return module_handle != 0;
+    if (module_handle == 0) {
+        *stage = "LoadLibraryW(welnpt.dll)";
+        *error = ERROR_MOD_NOT_FOUND;
+        return 0;
+    }
+    return 1;
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -100,6 +137,8 @@ int wmain(int argc, wchar_t **argv) {
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
     HANDLE ready_event;
+    DWORD injection_error;
+    const char *injection_stage;
 
     if (!parse_options(argc, argv, &options)) {
         fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> --log <file>\n", stderr);
@@ -163,8 +202,9 @@ int wmain(int argc, wchar_t **argv) {
     HeapFree(GetProcessHeap(), 0, command_line);
     free(working_directory);
 
-    if (!inject_hook(process.hProcess, hook)) {
-        fprintf(stderr, "Hook module injection failed: Windows error %lu\n", GetLastError());
+    if (!inject_hook(process.hProcess, hook, &injection_error, &injection_stage)) {
+        fprintf(stderr, "Hook module injection failed at %s: Windows error %lu\n",
+            injection_stage, (unsigned long)injection_error);
         TerminateProcess(process.hProcess, 7);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
