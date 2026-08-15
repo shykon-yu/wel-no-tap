@@ -10,10 +10,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: wel-no-tap-build
+  cancel-in-progress: true
+
 jobs:
   build-x86:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
@@ -84,32 +88,29 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.11.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install Electron dependencies
         shell: pwsh
         working-directory: frontend
         run: |
           $ErrorActionPreference = 'Stop'
-          pnpm install --no-frozen-lockfile --reporter=append-only
+          npm ci --ignore-scripts --no-audit --no-fund --prefer-offline
 
       - name: Build Vue frontend
         shell: pwsh
         working-directory: frontend
         run: |
           $ErrorActionPreference = 'Stop'
-          pnpm build
+          npm run build
 
       - name: Package Electron installer
         shell: pwsh
         working-directory: frontend
         run: |
           $ErrorActionPreference = 'Stop'
-          pnpm exec electron-builder --win nsis --publish never
+          npx --no-install electron-builder --win nsis --publish never
 
       - name: Upload Electron installer
         uses: actions/upload-artifact@v4
