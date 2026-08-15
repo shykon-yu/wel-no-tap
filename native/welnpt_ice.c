@@ -66,9 +66,15 @@ static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *us
 }
 
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr) {
+	const char *type = "unknown";
 	(void)agent;
-	(void)sdp;
 	(void)user_ptr;
+	if (sdp != NULL) {
+		if (strstr(sdp, " typ host") != NULL) type = "host";
+		else if (strstr(sdp, " typ srflx") != NULL) type = "srflx";
+		else if (strstr(sdp, " typ relay") != NULL) type = "relay";
+	}
+	output_line("CANDIDATE %s", type);
 }
 
 static void on_gathering_done(juice_agent_t *agent, void *user_ptr) {
@@ -257,16 +263,23 @@ int main(int argc, char **argv) {
 	HANDLE relay_thread = NULL;
 	char command[256];
 	int index;
+	int validate_args = 0;
 	DWORD timeout = 250;
 
 	for (index = 1; index < argc; ++index) {
-		if (strcmp(argv[index], "--stun-host") == 0 && index + 1 < argc) stun_host = argv[++index];
-		else if (strcmp(argv[index], "--stun-port") == 0 && index + 1 < argc && !parse_port(argv[++index], &stun_port)) return 2;
-		else if (strcmp(argv[index], "--hook-port") == 0 && index + 1 < argc && !parse_port(argv[++index], &hook_port)) return 2;
+		if (strcmp(argv[index], "--stun-host") == 0) {
+			if (index + 1 >= argc) return 2;
+			stun_host = argv[++index];
+		} else if (strcmp(argv[index], "--stun-port") == 0) {
+			if (index + 1 >= argc || !parse_port(argv[++index], &stun_port)) return 2;
+		} else if (strcmp(argv[index], "--hook-port") == 0) {
+			if (index + 1 >= argc || !parse_port(argv[++index], &hook_port)) return 2;
+		} else if (strcmp(argv[index], "--validate-args") == 0) validate_args = 1;
 		else if (strcmp(argv[index], "--self-test") == 0) return 0;
 		else return 2;
 	}
-	if (hook_port == 0) return 2;
+	if (stun_host == NULL || stun_host[0] == '\0' || stun_port == 0 || hook_port == 0) return 2;
+	if (validate_args) return 0;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	InitializeCriticalSection(&g_output_lock);
 	InitializeCriticalSection(&g_ping_lock);
@@ -297,6 +310,7 @@ int main(int argc, char **argv) {
 	g_agent = juice_create(&config);
 	if (g_agent == NULL) return 7;
 	output_line("LOCAL_PORT %u", (unsigned)ntohs(local_address.sin_port));
+	output_line("GATHERING_STARTED %s %u", stun_host, (unsigned)stun_port);
 	transport_thread = CreateThread(NULL, 0, local_transport_thread, NULL, 0, NULL);
 	if (transport_thread == NULL || juice_gather_candidates(g_agent) != JUICE_ERR_SUCCESS) return 8;
 	if (initialize_relay()) relay_thread = CreateThread(NULL, 0, relay_receive_thread, NULL, 0, NULL);

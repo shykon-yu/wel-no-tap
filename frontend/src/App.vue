@@ -236,6 +236,7 @@ async function joinRoom(room: Room) {
     activeLease.value = lease
     directCandidateStatus.value = 'gathering'
     directCandidateMessage.value = '正在收集直连候选'
+    notice.value = `正在连接直连服务 ${lease.ice_stun_host}:${lease.ice_stun_port} 并收集 candidate...`
     if (desktop()?.prepareIce) {
       try {
         const ice = await desktop()!.prepareIce({
@@ -252,9 +253,9 @@ async function joinRoom(room: Room) {
         directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
         const message = messageOf(error)
         warningMessage.value = message.includes('ICE candidate 收集超时')
-          ? '直连候选收集超时，当前仅使用中继；稍后点击玩家 Ping 可再次尝试'
+          ? '已尝试通过直连服务收集 candidate，但 12 秒内未完成；当前仅使用中继，稍后点击玩家 Ping 可再次尝试'
           : message.includes('ICE 辅助程序提前退出')
-            ? `直连组件未正常启动，当前仅使用中继：${message}`
+            ? `已尝试启动直连候选收集，但组件提前退出；当前仅使用中继：${message}`
             : `直连候选准备失败，当前仅使用中继：${message}`
       }
     }

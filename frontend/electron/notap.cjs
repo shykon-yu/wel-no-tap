@@ -129,6 +129,7 @@ function handleIceLine(rawLine) {
   }
   if (line === 'LOCAL_SDP_BEGIN') { readingIceSdp = true; iceSdpBuffer = ''; return }
   if (line.startsWith('LOCAL_PORT ')) { iceAgentPort = Number(line.slice(11)) || 0; return }
+  if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; return }
   if (line.startsWith('STATE ')) { iceState = line.slice(6) || 'unknown'; return }
   if (line.startsWith('PING_RESULT ')) {
     const [, nonce, milliseconds] = line.split(' ')
