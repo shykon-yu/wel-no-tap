@@ -41,17 +41,20 @@ let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let roomMembersTimer: number | undefined
 let signingOut = false
+let leaseEpoch = 0
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
   heartbeatTimer = undefined
+  leaseEpoch += 1
 }
 
 function startLeaseHeartbeat() {
   stopLeaseHeartbeat()
   if (!activeLease.value) return
-  void renewLease()
-  heartbeatTimer = window.setInterval(() => { void renewLease() }, heartbeatIntervalMs)
+  const epoch = ++leaseEpoch
+  void renewLease(epoch)
+  heartbeatTimer = window.setInterval(() => { void renewLease(epoch) }, heartbeatIntervalMs)
 }
 
 function stopSessionMonitor() {
@@ -125,7 +128,7 @@ async function forceSignedOut(message: string) {
   signingOut = false
 }
 
-async function renewLease() {
+async function renewLease(epoch: number) {
   const lease = activeLease.value
   if (!lease) return
   try {
@@ -137,6 +140,8 @@ async function renewLease() {
       return
     }
     if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+      // A response from a previous room must not clear a newer room session.
+      if (epoch !== leaseEpoch) return
       stopLeaseHeartbeat()
       stopRoomMembersMonitor()
       try { await desktop()?.disconnect() } catch { /* local connection may already be gone */ }
