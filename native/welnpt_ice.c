@@ -33,9 +33,17 @@ static volatile LONG g_connected;
 static CRITICAL_SECTION g_output_lock;
 static CRITICAL_SECTION g_ping_lock;
 static char g_ping_nonce[64];
-static ULONGLONG g_ping_started;
+static LARGE_INTEGER g_counter_frequency;
+static LARGE_INTEGER g_ping_started;
 static char g_relay_ping_nonce[64];
-static ULONGLONG g_relay_ping_started;
+static LARGE_INTEGER g_relay_ping_started;
+
+static double elapsed_milliseconds(LARGE_INTEGER started) {
+	LARGE_INTEGER current;
+	if (g_counter_frequency.QuadPart <= 0 || !QueryPerformanceCounter(&current)) return 0.0;
+	return ((double)(current.QuadPart - started.QuadPart) * 1000.0) /
+		(double)g_counter_frequency.QuadPart;
+}
 
 static void output_line(const char *format, ...) {
 	va_list arguments;
@@ -107,7 +115,7 @@ static void on_receive(juice_agent_t *agent, const char *data, size_t size, void
 		size_t nonce_length = size - strlen(WEL_ICE_PONG_PREFIX);
 		EnterCriticalSection(&g_ping_lock);
 		if (g_ping_nonce[0] != '\0' && strlen(g_ping_nonce) == nonce_length && memcmp(g_ping_nonce, nonce, nonce_length) == 0) {
-			output_line("PING_RESULT %s %llu", g_ping_nonce, (unsigned long long)(GetTickCount64() - g_ping_started));
+			output_line("PING_RESULT %s %.1f", g_ping_nonce, elapsed_milliseconds(g_ping_started));
 			g_ping_nonce[0] = '\0';
 		}
 		LeaveCriticalSection(&g_ping_lock);
@@ -149,8 +157,8 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 			!welnpt_auth_verify(&g_auth, packet, received)) continue;
 		EnterCriticalSection(&g_ping_lock);
 		if (g_relay_ping_nonce[0] != '\0' && ntohl(header->sequence) == (uint32_t)strtoul(g_relay_ping_nonce, NULL, 10)) {
-			output_line("RELAY_PING_RESULT %s %llu", g_relay_ping_nonce,
-				(unsigned long long)(GetTickCount64() - g_relay_ping_started));
+			output_line("RELAY_PING_RESULT %s %.1f", g_relay_ping_nonce,
+				elapsed_milliseconds(g_relay_ping_started));
 			g_relay_ping_nonce[0] = '\0';
 		}
 		LeaveCriticalSection(&g_ping_lock);
@@ -181,7 +189,7 @@ static void send_ping(const char *nonce) {
 	}
 	EnterCriticalSection(&g_ping_lock);
 	strncpy_s(g_ping_nonce, sizeof(g_ping_nonce), nonce, _TRUNCATE);
-	g_ping_started = GetTickCount64();
+	QueryPerformanceCounter(&g_ping_started);
 	length = _snprintf_s(packet, sizeof(packet), _TRUNCATE, "%s%s", WEL_ICE_PING_PREFIX, g_ping_nonce);
 	if (length <= 0 || juice_send(g_agent, packet, (size_t)length) != JUICE_ERR_SUCCESS) {
 		g_ping_nonce[0] = '\0';
@@ -199,7 +207,7 @@ static void send_relay_ping(const char *nonce) {
 	}
 	EnterCriticalSection(&g_ping_lock);
 	strncpy_s(g_relay_ping_nonce, sizeof(g_relay_ping_nonce), nonce, _TRUNCATE);
-	g_relay_ping_started = GetTickCount64();
+	QueryPerformanceCounter(&g_relay_ping_started);
 	welnpt_initialize_header(header, WELNPT_PACKET_PING);
 	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
 	header->source_ip = g_logical_ip;
@@ -283,6 +291,7 @@ int main(int argc, char **argv) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	InitializeCriticalSection(&g_output_lock);
 	InitializeCriticalSection(&g_ping_lock);
+	if (!QueryPerformanceFrequency(&g_counter_frequency)) return 3;
 	if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 3;
 
 	g_local_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

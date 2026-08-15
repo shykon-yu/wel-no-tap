@@ -53,7 +53,7 @@ function locate(candidates) {
 function ensureLogPath() {
   fs.mkdirSync(logDirectory, { recursive: true })
   const now = new Date()
-  const stamp = now.toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)
+  const stamp = now.toISOString().replace(/[-:TZ.]/g, '').slice(0, 17)
   return path.join(logDirectory, 'room-session-' + stamp + '.jsonl')
 }
 
@@ -73,18 +73,35 @@ function status() {
 }
 
 function transportStatus() {
-  let pathName = 'relay'
+  let pathName = 'pending'
+  let sawRelayPacket = false
   if (lastLogPath && fs.existsSync(lastLogPath)) {
     try {
       const contents = fs.readFileSync(lastLogPath, 'utf8')
       const lines = contents.trim().split(/\r?\n/).slice(-500).reverse()
+      let latestDirectStateSeen = false
       for (const line of lines) {
-        if (line.includes('"api":"direct-fallback"') || (line.includes('"api":"direct-state"') && !line.includes('"state":"connected"') && !line.includes('"state":"completed"'))) { pathName = 'relay'; break }
+        if (line.includes('"api":"direct-fallback"')) { pathName = 'relay'; break }
+        if (line.includes('"api":"direct-state"')) {
+          if (latestDirectStateSeen) continue
+          latestDirectStateSeen = true
+          if (line.includes('"state":"failed"') || line.includes('"state":"disconnected"')) { pathName = 'relay'; break }
+          continue
+        }
         if (line.includes('"path":"direct"')) { pathName = 'direct'; break }
+        if (line.includes('"path":"relay"') && line.includes('"broadcast":false')) sawRelayPacket = true
       }
+      if (pathName === 'pending' && sawRelayPacket) pathName = 'relay'
     } catch {}
   }
-  return { path: pathName, directState: iceState, summary: pathName === 'direct' ? '当前比赛路径：P2P 直连' : '当前比赛路径：云中继' }
+  const summary = pathName === 'direct'
+    ? '本场比赛单播：P2P 直连'
+    : pathName === 'relay'
+      ? '本场比赛单播：云中继'
+      : iceState === 'connected' || iceState === 'completed'
+        ? 'P2P 直连已建立，等待游戏单播'
+        : '游戏已启动，等待网络数据'
+  return { path: pathName, directState: iceState, summary }
 }
 
 function chooseHookPort() {

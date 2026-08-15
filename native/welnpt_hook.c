@@ -306,7 +306,8 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
     if (sent == SOCKET_ERROR) return SOCKET_ERROR;
-    log_line("\"api\":\"sendto\",\"path\":\"relay\",\"socket\":%llu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d",
+    log_line("\"api\":\"sendto\",\"path\":\"relay\",\"broadcast\":%s,\"socket\":%llu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d",
+        (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
         (unsigned __int64)handle, (unsigned)source_port, (unsigned)ntohs(target->sin_port), length);
     WSASetLastError(0);
     return length;

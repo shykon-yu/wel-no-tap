@@ -14,6 +14,7 @@ const loading = ref(false)
 const errorMessage = ref('')
 const warningMessage = ref('')
 const notice = ref('')
+const gameTransportSummary = ref('尚未启动游戏')
 const directCandidateStatus = ref<'waiting' | 'gathering' | 'ready' | 'relay-only'>('waiting')
 const directCandidateMessage = ref('尚未收集直连候选')
 const pingResults = ref<Record<number, PingResult | undefined>>({})
@@ -97,6 +98,7 @@ function clearRoomSessionState() {
   pingResults.value = {}
   selectedMemberId.value = null
   warningMessage.value = ''
+  gameTransportSummary.value = '尚未启动游戏'
 }
 
 function stopTransportStatusMonitor() {
@@ -107,9 +109,11 @@ function stopTransportStatusMonitor() {
 function startTransportStatusMonitor() {
   stopTransportStatusMonitor()
   if (!desktop()?.transportStatus) return
-  transportStatusTimer = window.setInterval(async () => {
-    try { notice.value = (await desktop()!.transportStatus()).summary } catch { /* diagnostic status is best effort */ }
-  }, 2000)
+  const refresh = async () => {
+    try { gameTransportSummary.value = (await desktop()!.transportStatus()).summary } catch { /* status is best effort */ }
+  }
+  void refresh()
+  transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
 }
 
 async function loadRoomMembers() {
@@ -365,6 +369,7 @@ async function launchGame() {
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
     notice.value = result.detail.includes('injection=apc') ? '已启动 WE8（APC 兼容模式）' : '已启动 WE8'
+    gameTransportSummary.value = '游戏已启动，正在确认联机线路'
     startTransportStatusMonitor()
   } catch (error) {
     errorMessage.value = messageOf(error)
@@ -556,7 +561,7 @@ onBeforeUnmount(() => {
 
       <section class="connection-strip room-status-strip" :class="{ connected: activeLease }">
         <div><p class="eyebrow">房间信息</p><h3>{{ roomInfoTitle }}</h3><span><Router :size="15" /> {{ roomInfoSubtitle }}</span></div>
-        <div class="connection-actions"><span class="secure"><ShieldCheck :size="17" /> 逻辑 IP：{{ virtualIpLabel }}</span><button class="primary-button launch" @click="launchGame" :disabled="!activeLease || !networkStatus?.connected"><Play :size="17" /> 启动 {{ runtimeConfig.gameName }}</button><button v-if="activeLease" class="secondary-button" @click="leaveRoom" :disabled="loading">退出房间</button></div>
+        <div class="connection-actions"><span class="secure"><ShieldCheck :size="17" /> 逻辑 IP：{{ virtualIpLabel }}</span><span class="transport-status"><Router :size="17" /> {{ gameTransportSummary }}</span><button class="primary-button launch" @click="launchGame" :disabled="!activeLease || !networkStatus?.connected"><Play :size="17" /> 启动 {{ runtimeConfig.gameName }}</button><button v-if="activeLease" class="secondary-button" @click="leaveRoom" :disabled="loading">退出房间</button></div>
       </section>
 
       <div class="room-workspace">
