@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } = require('electron')
+const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain, shell } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
@@ -95,6 +95,56 @@ function chooseGame(event) {
   }).then((result) => result.canceled ? null : result.filePaths[0] || null)
 }
 
+function isHookInjectionFailure(error) {
+  const message = String(error instanceof Error ? error.message : error || '')
+  return message.includes('Hook module injection failed') ||
+    message.includes('Hook module did not initialize') ||
+    message.includes('QueueUserAPC') ||
+    message.includes('CreateRemoteThread')
+}
+
+async function openWindowsSecurity() {
+  try {
+    await shell.openExternal('windowsdefender://threat/')
+    return
+  } catch {}
+  try {
+    const child = require('node:child_process').spawn('control.exe', ['/name', 'Microsoft.ActionCenter'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+    })
+    child.unref()
+  } catch {}
+}
+
+async function launchGameWithRecovery(event, options) {
+  try {
+    return await notap.launch(options)
+  } catch (error) {
+    if (!isHookInjectionFailure(error)) throw error
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const exactError = String(error instanceof Error ? error.message : error || '未知错误')
+    writeLog('常规与 APC Hook 注入均未成功', error)
+    const result = await dialog.showMessageBox(owner, {
+      type: 'warning',
+      title: '游戏 Hook 被系统拦截',
+      message: '平台已自动尝试常规注入和 APC 兼容模式，但 Windows 或安全软件仍然拒绝加载 Hook。',
+      detail: '可以先重试一次；若仍失败，请打开安全中心的“保护历史记录”，允许 welnptgame.exe、welnpt.dll 和 WE8.exe 后重新启动游戏。\n\n准确错误：' + exactError,
+      buttons: ['重新尝试', '打开 Windows 安全中心', '取消'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    })
+    if (result.response === 0) return notap.launch(options)
+    if (result.response === 1) {
+      await openWindowsSecurity()
+      throw new Error('已打开 Windows 安全中心。请在保护历史记录中允许相关程序，然后重新点击启动游戏。\n原始错误：' + exactError)
+    }
+    throw error
+  }
+}
+
 ipcMain.on('get-runtime-config', (event) => { event.returnValue = runtime })
 ipcMain.handle('notap-status', () => notap.status())
 ipcMain.handle('notap-transport-status', () => notap.transportStatus())
@@ -105,7 +155,7 @@ ipcMain.handle('notap-configure-ice', (_event, remoteDescription) => notap.confi
 ipcMain.handle('notap-ping-ice', (_event, remoteDescription) => notap.pingIce(remoteDescription))
 ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-choose-game', chooseGame)
-ipcMain.handle('notap-launch-game', (_event, options) => notap.launch(options))
+ipcMain.handle('notap-launch-game', launchGameWithRecovery)
 ipcMain.handle('platform-complete-quit', finishQuit)
 
 function createWindow() {
