@@ -14,6 +14,8 @@ const loading = ref(false)
 const errorMessage = ref('')
 const warningMessage = ref('')
 const notice = ref('')
+const directCandidateStatus = ref<'waiting' | 'gathering' | 'ready' | 'relay-only'>('waiting')
+const directCandidateMessage = ref('尚未收集直连候选')
 const pingResults = ref<Record<number, PingResult | undefined>>({})
 const selectedMemberId = ref<number | null>(null)
 const form = ref({ username: '', password: '' })
@@ -26,6 +28,9 @@ const activeRoomName = computed(() => activeRoom.value?.name ?? (activeLease.val
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
+  if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 正在收集直连候选`
+  if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
+  if (directCandidateStatus.value === 'relay-only') return `${activeRoomName.value} · 中继已连接 · 仅使用中继`
   return networkStatus.value?.connected ? `${activeRoomName.value} · 网络已连接` : `${activeRoomName.value} · 正在确认网络`
 })
 const virtualIpLabel = computed(() => {
@@ -87,6 +92,8 @@ function clearRoomSessionState() {
   stopTransportStatusMonitor()
   activeLease.value = null
   networkStatus.value = null
+  directCandidateStatus.value = 'waiting'
+  directCandidateMessage.value = '尚未收集直连候选'
   pingResults.value = {}
   selectedMemberId.value = null
   warningMessage.value = ''
@@ -112,10 +119,6 @@ async function loadRoomMembers() {
     const result = await roomApi.members(lease.room_id)
     if (activeLease.value?.room_id === lease.room_id) {
       roomMembers.value = result.members
-      const peer = result.members.find(member => !member.is_self && member.ice_description)
-      if (peer?.ice_description && desktop()?.configureIce) {
-        try { await desktop()!.configureIce(peer.ice_description) } catch { /* relay remains available */ }
-      }
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) await forceSignedOut(error.message)
@@ -227,9 +230,12 @@ async function joinRoom(room: Room) {
   errorMessage.value = ''
   warningMessage.value = ''
   let lease: Lease | null = null
+  let roomNotice = '已进入房间，当前仅使用中继'
   try {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
+    directCandidateStatus.value = 'gathering'
+    directCandidateMessage.value = '正在收集直连候选'
     if (desktop()?.prepareIce) {
       try {
         const ice = await desktop()!.prepareIce({
@@ -238,11 +244,15 @@ async function joinRoom(room: Room) {
           logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
         })
         await roomApi.publishIce(room.id, ice.localDescription)
-        notice.value = '已进入房间，正在探测直连'
+        directCandidateStatus.value = 'ready'
+        directCandidateMessage.value = summarizeCandidates(ice.localDescription)
+        roomNotice = `已进入房间，${directCandidateMessage.value}`
       } catch (error) {
+        directCandidateStatus.value = 'relay-only'
+        directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
         warningMessage.value = messageOf(error).includes('ICE candidate 收集超时')
-          ? '直连候选暂未准备好，当前将继续使用中继；稍后可点击 Ping 重试'
-          : `直连候选准备失败，当前将继续使用中继：${messageOf(error)}`
+          ? '直连候选收集超时，当前仅使用中继；稍后点击玩家 Ping 可再次尝试'
+          : `直连候选准备失败，当前仅使用中继：${messageOf(error)}`
       }
     }
     networkStatus.value = {
@@ -253,7 +263,7 @@ async function joinRoom(room: Room) {
     }
     startLeaseHeartbeat()
     startRoomMembersMonitor()
-    notice.value = '已进入房间'
+    notice.value = roomNotice
     await loadRooms()
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
@@ -367,13 +377,13 @@ async function pingMember(member: RoomMember) {
       reachable: false,
       summary: '正在探测中继与直连...',
       relay: { reachable: false, summary: '探测中...' },
-      direct: { reachable: false, summary: member.ice_description ? '探测中...' : '对方尚未完成 candidate' },
+      direct: { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' },
     },
   }
   try {
     let relayResult = { reachable: false, summary: '中继不可用' }
     try { relayResult = { reachable: true, summary: `中继 ${await desktop()!.pingRelay()} ms` } } catch { /* keep relay unavailable */ }
-    let directResult = { reachable: false, summary: member.ice_description ? '直连探测中，请稍后再试' : '对方尚未完成 candidate' }
+    let directResult = { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' }
     pingResults.value = {
       ...pingResults.value,
       [member.user_id]: {
@@ -467,6 +477,18 @@ function messageOf(error: unknown) {
   if (typeof error === 'string') return error
   if (error instanceof Error) return error.message
   return '发生未知错误'
+}
+
+function summarizeCandidates(description: string) {
+  const candidates = String(description || '').split(/\r?\n/).filter(line => line.startsWith('a=candidate:'))
+  const host = candidates.filter(line => / typ host(?: |$)/.test(line)).length
+  const serverReflexive = candidates.filter(line => / typ srflx(?: |$)/.test(line)).length
+  const relay = candidates.filter(line => / typ relay(?: |$)/.test(line)).length
+  const details = [`${candidates.length} 个候选`]
+  if (host) details.push(`${host} 个本机地址`)
+  if (serverReflexive) details.push(`${serverReflexive} 个公网地址`)
+  if (relay) details.push(`${relay} 个中继地址`)
+  return `直连候选已就绪（${details.join('，')}）`
 }
 
 onMounted(() => {
