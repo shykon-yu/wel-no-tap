@@ -405,8 +405,12 @@ async function pingMember(member: RoomMember) {
             logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
           })
           await roomApi.publishIce(lease.room_id, ice.localDescription)
+          directCandidateStatus.value = 'ready'
+          directCandidateMessage.value = summarizeCandidates(ice.localDescription)
         } catch {
           localCandidateReady = false
+          directCandidateStatus.value = 'relay-only'
+          directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
           directResult = { reachable: false, summary: '本机直连候选收集超时' }
         }
       }

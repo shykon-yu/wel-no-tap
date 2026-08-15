@@ -250,7 +250,7 @@ function launch({ gamePath, relay, room, logicalIp, token, remoteIp, remoteDescr
     WEL_NOTAP_TOKEN: String(token),
     WEL_NOTAP_LOG_PATH: logPath,
   }
-  if (iceProcess && iceAgentPort && iceHookPort) {
+  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
     if (remoteIp) environment.WEL_NOTAP_DIRECT_PEER_IP = String(remoteIp)
