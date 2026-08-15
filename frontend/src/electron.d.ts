@@ -8,10 +8,17 @@ export type DesktopLeaseStatus = {
   warnings?: string[]
 }
 
+export type PingPathResult = {
+  reachable: boolean
+  summary: string
+}
+
 export type PingResult = {
   host: string
   reachable: boolean
   summary: string
+  relay: PingPathResult
+  direct: PingPathResult
 }
 
 export type TransportPingResult = {

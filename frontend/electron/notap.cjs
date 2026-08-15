@@ -89,6 +89,23 @@ function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
 }
 
+function waitForIceCandidate(child, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs
+    const timer = setInterval(() => {
+      if (iceLocalDescription && iceAgentPort && iceProcess === child) {
+        clearInterval(timer)
+        resolve()
+        return
+      }
+      if (Date.now() >= deadline || iceProcess !== child) {
+        clearInterval(timer)
+        reject(new Error('ICE candidate 收集超时'))
+      }
+    }, 100)
+  })
+}
+
 function handleIceLine(rawLine) {
   const line = rawLine.replace(/[\r\n]+$/, '')
   if (readingIceSdp) {
@@ -134,7 +151,7 @@ function handleIceLine(rawLine) {
 function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
-  if (iceProcess && !iceProcess.killed) return Promise.resolve()
+  if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
   iceHookPort = chooseHookPort()
   iceLocalDescription = ''
   iceAgentPort = 0
@@ -162,13 +179,7 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
   child.stdout.on('data', consume)
   child.stderr.on('data', (chunk) => { /* the helper reports protocol state on stdout */ void chunk })
   child.once('close', () => { if (iceProcess === child) { iceProcess = null; iceState = 'failed' } })
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + 12000
-    const timer = setInterval(() => {
-      if (iceLocalDescription && iceAgentPort && iceProcess === child) { clearInterval(timer); resolve(); return }
-      if (Date.now() >= deadline || !iceProcess) { clearInterval(timer); reject(new Error('ICE candidate 收集超时')); }
-    }, 100)
-  })
+  return waitForIceCandidate(child)
 }
 
 async function prepareIce(options) {

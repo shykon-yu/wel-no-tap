@@ -240,7 +240,9 @@ async function joinRoom(room: Room) {
         await roomApi.publishIce(room.id, ice.localDescription)
         notice.value = '已进入房间，正在探测直连'
       } catch (error) {
-        warningMessage.value = `直连候选准备失败，将继续使用中继：${messageOf(error)}`
+        warningMessage.value = messageOf(error).includes('ICE candidate 收集超时')
+          ? '直连候选暂未准备好，当前将继续使用中继；稍后可点击 Ping 重试'
+          : `直连候选准备失败，当前将继续使用中继：${messageOf(error)}`
       }
     }
     networkStatus.value = {
@@ -358,19 +360,70 @@ async function launchGame() {
 }
 async function pingMember(member: RoomMember) {
   if (!desktop()) return
-  pingResults.value = { ...pingResults.value, [member.user_id]: { host: member.virtual_ip, reachable: false, summary: '正在探测中继与直连...' } }
+  pingResults.value = {
+    ...pingResults.value,
+    [member.user_id]: {
+      host: member.virtual_ip,
+      reachable: false,
+      summary: '正在探测中继与直连...',
+      relay: { reachable: false, summary: '探测中...' },
+      direct: { reachable: false, summary: member.ice_description ? '探测中...' : '对方尚未完成 candidate' },
+    },
+  }
   try {
-    let relaySummary = '中继不可用'
-    try { relaySummary = `中继 ${await desktop()!.pingRelay()} ms` } catch (error) { relaySummary = messageOf(error) }
-    let directSummary = member.ice_description ? '直连探测中，请稍后再试' : '对方尚未完成 candidate'
-    if (member.ice_description && desktop()?.pingIce) {
-      try { directSummary = `直连 ${await desktop()!.pingIce(member.ice_description)} ms` } catch (error) { directSummary = messageOf(error) }
+    let relayResult = { reachable: false, summary: '中继不可用' }
+    try { relayResult = { reachable: true, summary: `中继 ${await desktop()!.pingRelay()} ms` } } catch { /* keep relay unavailable */ }
+    let directResult = { reachable: false, summary: member.ice_description ? '直连探测中，请稍后再试' : '对方尚未完成 candidate' }
+    pingResults.value = {
+      ...pingResults.value,
+      [member.user_id]: {
+        host: member.virtual_ip,
+        reachable: relayResult.reachable,
+        summary: `${relayResult.summary}；${directResult.summary}`,
+        relay: relayResult,
+        direct: directResult,
+      },
     }
-    pingResults.value = { ...pingResults.value, [member.user_id]: { host: member.virtual_ip, reachable: relaySummary.startsWith('中继 '), summary: `${relaySummary}；${directSummary}` } }
+    if (member.ice_description && desktop()?.pingIce) {
+      let localCandidateReady = true
+      const lease = activeLease.value
+      if (lease && desktop()?.prepareIce) {
+        try {
+          const ice = await desktop()!.prepareIce({
+            stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
+            relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
+            logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
+          })
+          await roomApi.publishIce(lease.room_id, ice.localDescription)
+        } catch {
+          localCandidateReady = false
+          directResult = { reachable: false, summary: '本机直连候选收集超时' }
+        }
+      }
+      if (localCandidateReady) {
+        try { directResult = { reachable: true, summary: `直连 ${await desktop()!.pingIce(member.ice_description)} ms` } } catch { directResult = { reachable: false, summary: '直连不可用' } }
+      }
+    }
+    pingResults.value = {
+      ...pingResults.value,
+      [member.user_id]: {
+        host: member.virtual_ip,
+        reachable: relayResult.reachable || directResult.reachable,
+        summary: `${relayResult.summary}；${directResult.summary}`,
+        relay: relayResult,
+        direct: directResult,
+      },
+    }
   } catch (error) {
     pingResults.value = {
       ...pingResults.value,
-      [member.user_id]: { host: member.virtual_ip, reachable: false, summary: messageOf(error) },
+      [member.user_id]: {
+        host: member.virtual_ip,
+        reachable: false,
+        summary: messageOf(error),
+        relay: { reachable: false, summary: '中继不可用' },
+        direct: { reachable: false, summary: '直连不可用' },
+      },
     }
   }
 }
@@ -486,7 +539,10 @@ onBeforeUnmount(() => {
               <div class="detail-row"><span>真实 IP</span><strong>{{ selectedMember.real_ip || '未知' }}</strong></div>
               <div class="detail-row">
                 <span>Ping</span>
-                <strong :class="['ping-result', { ok: selectedMemberPing?.reachable }]">{{ selectedMemberPing?.summary || '未检测' }}</strong>
+                <div class="ping-results">
+                  <div><span>中继</span><strong :class="['ping-result', { ok: selectedMemberPing?.relay.reachable }]">{{ selectedMemberPing?.relay.summary || '未检测' }}</strong></div>
+                  <div><span>直连</span><strong :class="['ping-result', { ok: selectedMemberPing?.direct.reachable }]">{{ selectedMemberPing?.direct.summary || '未检测' }}</strong></div>
+                </div>
               </div>
             </div>
             <footer class="member-modal-footer">

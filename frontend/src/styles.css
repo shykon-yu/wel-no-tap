@@ -32,6 +32,9 @@
 .member-modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .ping-result { color: #75858a; }
 .ping-result.ok { color: #2d7041; }
+.ping-results { display: grid; gap: 5px; min-width: 0; }
+.ping-results > div { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; }
+.ping-results > div > span { color: #75858a; font-size: 12px; font-weight: 700; }
 .member-avatar { width: 29px; height: 29px; flex: 0 0 29px; display: grid; place-items: center; color: #23575a; background: #e5f0ef; border-radius: 50%; font-size: 13px; font-weight: 700; }
 .member-row em { margin-left: auto; color: #2d7041; font-size: 11px; font-style: normal; }
 .member-empty { margin: 12px 0 0; color: #75858a; font-size: 13px; }
