@@ -41,10 +41,13 @@ jobs:
             }
           }
           $juiceSources = Get-ChildItem 'third_party/libjuice/src' -Filter '*.c' | ForEach-Object { $_.FullName }
-          Invoke-Compiler 'libjuice static library' @(
-            '/nologo', '/W3', '/O2', '/MT', '/c', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX', '/DJUICE_STATIC', '/D_WIN32_WINNT=0x0601', '/D_CRT_SECURE_NO_WARNINGS',
-            '/Ithird_party/libjuice/include', '/Ithird_party/libjuice/src', $juiceSources, "/Fo:$juiceOutput/"
-          )
+          foreach ($juiceSource in $juiceSources) {
+            $juiceObject = Join-Path $juiceOutput (([IO.Path]::GetFileNameWithoutExtension($juiceSource)) + '.obj')
+            Invoke-Compiler 'libjuice static library' @(
+              '/nologo', '/W3', '/O2', '/MT', '/c', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX', '/DJUICE_STATIC', '/D_WIN32_WINNT=0x0601', '/D_CRT_SECURE_NO_WARNINGS',
+              '/Ithird_party/libjuice/include', '/Ithird_party/libjuice/src', $juiceSource, "/Fo:$juiceObject"
+            )
+          }
           $juiceObjects = Get-ChildItem $juiceOutput -Filter '*.obj' | ForEach-Object { $_.FullName }
           & lib.exe /nologo /OUT:$output/juice-static.lib $juiceObjects
           if ($LASTEXITCODE -ne 0) { throw 'libjuice static library build failed' }
