@@ -20,4 +20,5 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   configureIce: (remoteDescription) => ipcRenderer.invoke('notap-configure-ice', remoteDescription),
   pingIce: (remoteDescription) => ipcRenderer.invoke('notap-ping-ice', remoteDescription),
   pingRelay: () => ipcRenderer.invoke('notap-ping-relay'),
+  pingRelayPeer: (remoteIp) => ipcRenderer.invoke('notap-ping-relay-peer', remoteIp),
 })

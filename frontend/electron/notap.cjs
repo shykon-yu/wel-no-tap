@@ -19,6 +19,7 @@ let iceExitError = ''
 let iceDiagnostics = []
 let pendingIcePing = null
 let pendingRelayPing = null
+let pendingRelayPeerPing = null
 let lastRemoteDescription = ''
 let lastLogPath = ''
 
@@ -172,6 +173,19 @@ function handleIceLine(rawLine) {
   }
   if (line.startsWith('RELAY_PING_UNAVAILABLE ')) {
     if (pendingRelayPing) { const pending = pendingRelayPing; pendingRelayPing = null; pending.reject(new Error('中继探测不可用')); }
+    return
+  }
+  if (line.startsWith('RELAY_PEER_PING_RESULT ')) {
+    const [, nonce, milliseconds] = line.split(' ')
+    if (pendingRelayPeerPing && pendingRelayPeerPing.nonce === nonce) {
+      const pending = pendingRelayPeerPing
+      pendingRelayPeerPing = null
+      pending.resolve(Number(milliseconds) || 0)
+    }
+    return
+  }
+  if (line.startsWith('RELAY_PEER_PING_UNAVAILABLE ')) {
+    if (pendingRelayPeerPing) { const pending = pendingRelayPeerPing; pendingRelayPeerPing = null; pending.reject(new Error('中继玩家探测不可用')); }
   }
 }
 
@@ -295,6 +309,21 @@ function pingRelay() {
   })
 }
 
+function pingRelayPeer(remoteIp) {
+  if (!iceProcess) return Promise.reject(new Error('中继玩家探测未准备'))
+  if (!remoteIp) return Promise.reject(new Error('对方逻辑 IP 未知'))
+  const nonce = String(Date.now() >>> 0)
+  return new Promise((resolve, reject) => {
+    pendingRelayPeerPing = { nonce, resolve, reject }
+    iceProcess.stdin.write('PING_RELAY_PEER ' + nonce + ' ' + String(remoteIp).trim() + '\n')
+    setTimeout(() => {
+      if (pendingRelayPeerPing?.nonce !== nonce) return
+      pendingRelayPeerPing = null
+      reject(new Error('中继玩家探测超时'))
+    }, 5000)
+  })
+}
+
 function resolveGamePath(gamePath) {
   const normalized = path.normalize(String(gamePath || '').trim().replace(/^"(.*)"$/, '$1'))
   if (!normalized || !fs.existsSync(normalized) || !fs.statSync(normalized).isFile()) {
@@ -362,6 +391,7 @@ async function disconnect() {
   iceLocalDescription = ''
   pendingIcePing = null
   pendingRelayPing = null
+  pendingRelayPeerPing = null
   lastRemoteDescription = ''
   lastLogPath = ''
   iceExitError = ''
@@ -377,4 +407,4 @@ function pingHost(host) {
   }
 }
 
-module.exports = { configureIce: setRemoteIce, disconnect, launch, pingHost, status, transportStatus, prepareIce, pingIce, pingRelay }
+module.exports = { configureIce: setRemoteIce, disconnect, launch, pingHost, status, transportStatus, prepareIce, pingIce, pingRelay, pingRelayPeer }

@@ -37,6 +37,8 @@ static LARGE_INTEGER g_counter_frequency;
 static LARGE_INTEGER g_ping_started;
 static char g_relay_ping_nonce[64];
 static LARGE_INTEGER g_relay_ping_started;
+static char g_relay_peer_ping_nonce[64];
+static LARGE_INTEGER g_relay_peer_ping_started;
 
 static double elapsed_milliseconds(LARGE_INTEGER started) {
 	LARGE_INTEGER current;
@@ -152,14 +154,36 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 		welnpt_packet_header *header;
 		if (received < (int)sizeof(welnpt_packet_header)) continue;
 		header = (welnpt_packet_header *)packet;
-		if (!welnpt_valid_header(header) || header->type != WELNPT_PACKET_PONG ||
-			memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
+		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
 			!welnpt_auth_verify(&g_auth, packet, received)) continue;
+		if (header->type == WELNPT_PACKET_PING) {
+			/* 中继转发的 PING：目标是自己则回 PONG，发回中继由其转发给发起方 */
+			if (header->target_ip == g_logical_ip && g_relay_socket != INVALID_SOCKET) {
+				char pong[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+				welnpt_packet_header *pong_header = (welnpt_packet_header *)pong;
+				memcpy(pong, packet, (size_t)received);
+				pong_header->type = WELNPT_PACKET_PONG;
+				pong_header->source_ip = g_logical_ip;
+				pong_header->target_ip = header->source_ip;
+				if (welnpt_auth_sign(&g_auth, pong, (size_t)received) &&
+					sendto(g_relay_socket, pong, (size_t)received, 0,
+						(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == received) {
+					/* 转发式 PING 已应答 */
+				}
+			}
+			continue;
+		}
+		if (header->type != WELNPT_PACKET_PONG) continue;
 		EnterCriticalSection(&g_ping_lock);
 		if (g_relay_ping_nonce[0] != '\0' && ntohl(header->sequence) == (uint32_t)strtoul(g_relay_ping_nonce, NULL, 10)) {
 			output_line("RELAY_PING_RESULT %s %.1f", g_relay_ping_nonce,
 				elapsed_milliseconds(g_relay_ping_started));
 			g_relay_ping_nonce[0] = '\0';
+		} else if (g_relay_peer_ping_nonce[0] != '\0' &&
+			ntohl(header->sequence) == (uint32_t)strtoul(g_relay_peer_ping_nonce, NULL, 10)) {
+			output_line("RELAY_PEER_PING_RESULT %s %.1f", g_relay_peer_ping_nonce,
+				elapsed_milliseconds(g_relay_peer_ping_started));
+			g_relay_peer_ping_nonce[0] = '\0';
 		}
 		LeaveCriticalSection(&g_ping_lock);
 	}
@@ -216,6 +240,29 @@ static void send_relay_ping(const char *nonce) {
 		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
 		g_relay_ping_nonce[0] = '\0';
 		output_line("RELAY_PING_UNAVAILABLE %s", nonce);
+	}
+	LeaveCriticalSection(&g_ping_lock);
+}
+
+static void send_relay_peer_ping(const char *nonce, uint32_t target_ip) {
+	char packet[sizeof(welnpt_packet_header)];
+	welnpt_packet_header *header = (welnpt_packet_header *)packet;
+	if (g_relay_socket == INVALID_SOCKET || target_ip == 0) {
+		output_line("RELAY_PEER_PING_UNAVAILABLE %s", nonce);
+		return;
+	}
+	EnterCriticalSection(&g_ping_lock);
+	strncpy_s(g_relay_peer_ping_nonce, sizeof(g_relay_peer_ping_nonce), nonce, _TRUNCATE);
+	QueryPerformanceCounter(&g_relay_peer_ping_started);
+	welnpt_initialize_header(header, WELNPT_PACKET_PING);
+	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
+	header->source_ip = g_logical_ip;
+	header->target_ip = target_ip;
+	header->sequence = htonl((u_long)strtoul(nonce, NULL, 10));
+	if (!welnpt_auth_sign(&g_auth, packet, sizeof(packet)) || sendto(g_relay_socket, packet, sizeof(packet), 0,
+		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
+		g_relay_peer_ping_nonce[0] = '\0';
+		output_line("RELAY_PEER_PING_UNAVAILABLE %s", nonce);
 	}
 	LeaveCriticalSection(&g_ping_lock);
 }
@@ -337,6 +384,26 @@ int main(int argc, char **argv) {
 			}
 		} else if (strncmp(command, "PING ", 5) == 0 && command[5] != '\0') {
 			send_ping(command + 5);
+		} else if (strncmp(command, "PING_RELAY_PEER ", 16) == 0 && command[16] != '\0') {
+			char *space = strchr(command + 16, ' ');
+			if (space != NULL && space[1] != '\0') {
+				char nonce[64];
+				size_t nonce_length = (size_t)(space - (command + 16));
+				uint32_t target_ip;
+				if (nonce_length > 0 && nonce_length < sizeof(nonce)) {
+					memcpy(nonce, command + 16, nonce_length);
+					nonce[nonce_length] = '\0';
+					if (InetPtonA(AF_INET, space + 1, &target_ip) == 1) {
+						send_relay_peer_ping(nonce, target_ip);
+					} else {
+						output_line("RELAY_PEER_PING_UNAVAILABLE %s", nonce);
+					}
+				} else {
+					output_line("RELAY_PEER_PING_UNAVAILABLE %s", command + 16);
+				}
+			} else {
+				output_line("RELAY_PEER_PING_UNAVAILABLE %s", command + 16);
+			}
 		} else if (strncmp(command, "PING_RELAY ", 11) == 0 && command[11] != '\0') {
 			send_relay_ping(command + 11);
 		} else if (strcmp(command, "EXIT") == 0) {

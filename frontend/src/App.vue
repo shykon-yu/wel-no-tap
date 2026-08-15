@@ -384,22 +384,28 @@ async function pingMember(member: RoomMember) {
     [member.user_id]: {
       host: member.virtual_ip,
       reachable: false,
-      summary: '正在探测中继与直连...',
-      relay: { reachable: false, summary: '探测中...' },
+      summary: '正在探测中继服务器、中继玩家与直连...',
+      relayServer: { reachable: false, summary: '探测中...' },
+      relayPeer: { reachable: false, summary: '探测中...' },
       direct: { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' },
     },
   }
   try {
-    let relayResult = { reachable: false, summary: '中继不可用' }
-    try { relayResult = { reachable: true, summary: `中继 ${await desktop()!.pingRelay()} ms` } } catch { /* keep relay unavailable */ }
+    let relayServerResult = { reachable: false, summary: '中继服务器不可用' }
+    try { relayServerResult = { reachable: true, summary: `中继服务器 ${await desktop()!.pingRelay()} ms` } } catch { /* keep relay unavailable */ }
+    let relayPeerResult = { reachable: false, summary: member.virtual_ip ? '中继玩家探测中...' : '对方逻辑 IP 未知' }
+    if (desktop()?.pingRelayPeer && member.virtual_ip) {
+      try { relayPeerResult = { reachable: true, summary: `中继玩家 ${await desktop()!.pingRelayPeer(member.virtual_ip)} ms` } } catch { /* keep relay peer unavailable */ }
+    }
     let directResult = { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' }
     pingResults.value = {
       ...pingResults.value,
       [member.user_id]: {
         host: member.virtual_ip,
-        reachable: relayResult.reachable,
-        summary: `${relayResult.summary}；${directResult.summary}`,
-        relay: relayResult,
+        reachable: relayServerResult.reachable || relayPeerResult.reachable,
+        summary: `${relayServerResult.summary}；${relayPeerResult.summary}；${directResult.summary}`,
+        relayServer: relayServerResult,
+        relayPeer: relayPeerResult,
         direct: directResult,
       },
     }
@@ -445,9 +451,10 @@ async function pingMember(member: RoomMember) {
       ...pingResults.value,
       [member.user_id]: {
         host: member.virtual_ip,
-        reachable: relayResult.reachable || directResult.reachable,
-        summary: `${relayResult.summary}；${directResult.summary}`,
-        relay: relayResult,
+        reachable: relayServerResult.reachable || relayPeerResult.reachable || directResult.reachable,
+        summary: `${relayServerResult.summary}；${relayPeerResult.summary}；${directResult.summary}`,
+        relayServer: relayServerResult,
+        relayPeer: relayPeerResult,
         direct: directResult,
       },
     }
@@ -458,7 +465,8 @@ async function pingMember(member: RoomMember) {
         host: member.virtual_ip,
         reachable: false,
         summary: messageOf(error),
-        relay: { reachable: false, summary: '中继不可用' },
+        relayServer: { reachable: false, summary: '中继服务器不可用' },
+        relayPeer: { reachable: false, summary: '中继玩家不可用' },
         direct: { reachable: false, summary: '直连不可用' },
       },
     }
@@ -543,6 +551,7 @@ onBeforeUnmount(() => {
         <p v-if="errorMessage" class="form-error">{{ errorMessage }}</p>
         <button class="primary-button" :disabled="loading">{{ loading ? '处理中...' : '登录平台' }}</button>
       </form>
+      <footer class="auth-copyright">© 2026 {{ runtimeConfig.platformName }} · 版权所有 · 【WRH】比安</footer>
     </section>
   </main>
 
@@ -552,6 +561,7 @@ onBeforeUnmount(() => {
       <div class="user-row"><span class="avatar">{{ user.nickname.slice(0, 1) }}</span><span><strong>{{ user.nickname }}</strong><small>@{{ user.username }}</small></span></div>
       <nav><a class="active"><Users :size="18" /> 对战房间</a></nav>
       <div class="sidebar-actions"><button class="logout" @click="logout"><LogOut :size="17" /> 退出登录</button></div>
+      <footer class="sidebar-copyright">© 2026 【WRH】比安</footer>
     </aside>
 
     <section class="content">
@@ -589,7 +599,8 @@ onBeforeUnmount(() => {
               <div class="detail-row">
                 <span>Ping</span>
                 <div class="ping-results">
-                  <div><span>中继</span><strong :class="['ping-result', { ok: selectedMemberPing?.relay.reachable }]">{{ selectedMemberPing?.relay.summary || '未检测' }}</strong></div>
+                  <div><span>中继服务器</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayServer.reachable }]">{{ selectedMemberPing?.relayServer.summary || '未检测' }}</strong></div>
+                  <div><span>中继玩家</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayPeer.reachable }]">{{ selectedMemberPing?.relayPeer.summary || '未检测' }}</strong></div>
                   <div><span>直连</span><strong :class="['ping-result', { ok: selectedMemberPing?.direct.reachable }]">{{ selectedMemberPing?.direct.summary || '未检测' }}</strong></div>
                 </div>
               </div>

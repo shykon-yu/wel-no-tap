@@ -17,7 +17,8 @@ export type PingResult = {
   host: string
   reachable: boolean
   summary: string
-  relay: PingPathResult
+  relayServer: PingPathResult
+  relayPeer: PingPathResult
   direct: PingPathResult
 }
 
@@ -42,6 +43,7 @@ declare global {
       configureIce: (remoteDescription: string) => Promise<boolean>
       pingIce: (remoteDescription: string) => Promise<number>
       pingRelay: () => Promise<number>
+      pingRelayPeer: (remoteIp: string) => Promise<number>
     }
   }
 }

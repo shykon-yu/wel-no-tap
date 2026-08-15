@@ -292,15 +292,26 @@ int main(int argc, char **argv) {
             delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
             if (delivered == 0) ++g_stats.route_drops;
         } else if (header->type == WELNPT_PACKET_PING) {
-            char pong[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
-            welnpt_packet_header *pong_header = (welnpt_packet_header *)pong;
-            memcpy(pong, packet, (size_t)received);
-            pong_header->type = WELNPT_PACKET_PONG;
-            if (sign_packet(pong, (size_t)received) && sendto(socket_handle, pong, received, 0,
-                (const struct sockaddr *)&source, sizeof(source)) == received) {
-                ++g_stats.forwarded_packets;
-                g_stats.forwarded_bytes += (uint64_t)received;
+            if (header->target_ip != 0 && header->target_ip != htonl(INADDR_BROADCAST)) {
+                /* 转发式 PING：目标玩家在房间内则转过去，中继只当中转，不回包 */
+                delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
+                if (delivered == 0) ++g_stats.route_drops;
+            } else {
+                /* 到中继服务器的 PING：就地回 PONG，保持链路健康检查语义 */
+                char pong[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+                welnpt_packet_header *pong_header = (welnpt_packet_header *)pong;
+                memcpy(pong, packet, (size_t)received);
+                pong_header->type = WELNPT_PACKET_PONG;
+                if (sign_packet(pong, (size_t)received) && sendto(socket_handle, pong, received, 0,
+                    (const struct sockaddr *)&source, sizeof(source)) == received) {
+                    ++g_stats.forwarded_packets;
+                    g_stats.forwarded_bytes += (uint64_t)received;
+                }
             }
+        } else if (header->type == WELNPT_PACKET_PONG) {
+            /* 转发式 PING 的回包：按 target_ip 转发回发起方 */
+            delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
+            if (delivered == 0) ++g_stats.route_drops;
         }
         if (now - last_stats >= 60000) {
             log_stats(now);

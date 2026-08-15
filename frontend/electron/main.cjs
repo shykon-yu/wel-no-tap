@@ -154,6 +154,7 @@ ipcMain.handle('notap-prepare-ice', (_event, options) => notap.prepareIce(option
 ipcMain.handle('notap-configure-ice', (_event, remoteDescription) => notap.configureIce(remoteDescription))
 ipcMain.handle('notap-ping-ice', (_event, remoteDescription) => notap.pingIce(remoteDescription))
 ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
+ipcMain.handle('notap-ping-relay-peer', (_event, remoteIp) => notap.pingRelayPeer(remoteIp))
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', launchGameWithRecovery)
 ipcMain.handle('platform-complete-quit', finishQuit)
