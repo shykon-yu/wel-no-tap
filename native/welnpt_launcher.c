@@ -56,7 +56,8 @@ static wchar_t *game_directory(const wchar_t *game_path) {
     return directory;
 }
 
-static int inject_hook(HANDLE process, const wchar_t *hook_path, DWORD *error, const char **stage) {
+static int inject_hook(HANDLE process, HANDLE primary_thread, const wchar_t *hook_path,
+    DWORD *error, const char **stage, LPVOID *apc_remote_path) {
     SIZE_T path_size = (wcslen(hook_path) + 1) * sizeof(wchar_t);
     LPVOID remote_path = VirtualAllocEx(process, NULL, path_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     HMODULE kernel32 = GetModuleHandleW(L"Kernel32.dll");
@@ -67,6 +68,7 @@ static int inject_hook(HANDLE process, const wchar_t *hook_path, DWORD *error, c
 
     *error = ERROR_SUCCESS;
     *stage = "VirtualAllocEx";
+    *apc_remote_path = NULL;
     if (remote_path == NULL) {
         *error = GetLastError();
         return 0;
@@ -94,6 +96,15 @@ static int inject_hook(HANDLE process, const wchar_t *hook_path, DWORD *error, c
     thread = CreateRemoteThread(process, NULL, 0, (LPTHREAD_START_ROUTINE)load_library, remote_path, 0, NULL);
     if (thread == NULL) {
         *error = GetLastError();
+        if (*error == ERROR_ACCESS_DENIED) {
+            *stage = "QueueUserAPC(LoadLibraryW)";
+            if (QueueUserAPC((PAPCFUNC)load_library, primary_thread, (ULONG_PTR)remote_path) != 0) {
+                *apc_remote_path = remote_path;
+                *error = ERROR_SUCCESS;
+                return 1;
+            }
+            *error = GetLastError();
+        }
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
         return 0;
     }
@@ -139,6 +150,8 @@ int wmain(int argc, wchar_t **argv) {
     HANDLE ready_event;
     DWORD injection_error;
     const char *injection_stage;
+    LPVOID apc_remote_path;
+    int resumed_for_apc = 0;
 
     if (!parse_options(argc, argv, &options)) {
         fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> --log <file>\n", stderr);
@@ -202,7 +215,7 @@ int wmain(int argc, wchar_t **argv) {
     HeapFree(GetProcessHeap(), 0, command_line);
     free(working_directory);
 
-    if (!inject_hook(process.hProcess, hook, &injection_error, &injection_stage)) {
+    if (!inject_hook(process.hProcess, process.hThread, hook, &injection_error, &injection_stage, &apc_remote_path)) {
         fprintf(stderr, "Hook module injection failed at %s: Windows error %lu\n",
             injection_stage, (unsigned long)injection_error);
         TerminateProcess(process.hProcess, 7);
@@ -211,23 +224,38 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(ready_event);
         return 7;
     }
+    if (apc_remote_path != NULL) {
+        if (ResumeThread(process.hThread) == (DWORD)-1) {
+            fprintf(stderr, "ResumeThread for APC injection failed: Windows error %lu\n", GetLastError());
+            TerminateProcess(process.hProcess, 9);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            CloseHandle(ready_event);
+            return 9;
+        }
+        resumed_for_apc = 1;
+    }
     if (WaitForSingleObject(ready_event, 5000) != WAIT_OBJECT_0) {
-        fputs("Hook module did not initialize\n", stderr);
+        fputs(apc_remote_path != NULL
+            ? "Hook module did not initialize through QueueUserAPC\n"
+            : "Hook module did not initialize through CreateRemoteThread\n", stderr);
         TerminateProcess(process.hProcess, 8);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(ready_event);
         return 8;
     }
+    if (apc_remote_path != NULL) VirtualFreeEx(process.hProcess, apc_remote_path, 0, MEM_RELEASE);
     CloseHandle(ready_event);
-    if (ResumeThread(process.hThread) == (DWORD)-1) {
+    if (!resumed_for_apc && ResumeThread(process.hThread) == (DWORD)-1) {
         fprintf(stderr, "ResumeThread failed: Windows error %lu\n", GetLastError());
         TerminateProcess(process.hProcess, 9);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         return 9;
     }
-    printf("STARTED pid=%lu\n", (unsigned long)process.dwProcessId);
+    printf("STARTED pid=%lu injection=%s\n", (unsigned long)process.dwProcessId,
+        apc_remote_path != NULL ? "apc" : "remote-thread");
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return 0;

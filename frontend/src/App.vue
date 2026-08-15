@@ -364,7 +364,7 @@ async function launchGame() {
     })
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
-    notice.value = '已启动 WE8'
+    notice.value = result.detail.includes('injection=apc') ? '已启动 WE8（APC 兼容模式）' : '已启动 WE8'
     startTransportStatusMonitor()
   } catch (error) {
     errorMessage.value = messageOf(error)
