@@ -419,7 +419,21 @@ async function pingMember(member: RoomMember) {
         }
       }
       if (localCandidateReady) {
-        try { directResult = { reachable: true, summary: `直连 ${await desktop()!.pingIce(member.ice_description)} ms` } } catch { directResult = { reachable: false, summary: '直连不可用' } }
+        try {
+          directResult = { reachable: true, summary: `直连 ${await desktop()!.pingIce(member.ice_description)} ms` }
+        } catch (error) {
+          const message = messageOf(error)
+          directResult = {
+            reachable: false,
+            summary: message.includes('ICE 直连检查超时')
+              ? 'ICE 直连检查超时'
+              : message.includes('ICE 直连检查失败')
+                ? 'ICE 直连检查失败'
+                : message.includes('直连探测超时')
+                  ? '直连 Ping 超时'
+                  : '直连不可用',
+          }
+        }
       }
     }
     pingResults.value = {

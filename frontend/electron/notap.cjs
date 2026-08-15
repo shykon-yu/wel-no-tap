@@ -219,8 +219,39 @@ function setRemoteIce(remoteDescription) {
   return true
 }
 
-function pingIce(remoteDescription) {
+function waitForIceConnection(timeoutMs = 12000) {
+  const child = iceProcess
+  if (!child || child.killed) return Promise.reject(new Error('直连组件未运行'))
+  if (iceState === 'connected' || iceState === 'completed') return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs
+    const timer = setInterval(() => {
+      if (iceProcess !== child || child.killed) {
+        clearInterval(timer)
+        reject(new Error(iceExitError || '直连组件已退出'))
+        return
+      }
+      if (iceState === 'connected' || iceState === 'completed') {
+        clearInterval(timer)
+        resolve()
+        return
+      }
+      if (iceState === 'failed') {
+        clearInterval(timer)
+        reject(new Error('ICE 直连检查失败'))
+        return
+      }
+      if (Date.now() >= deadline) {
+        clearInterval(timer)
+        reject(new Error('ICE 直连检查超时'))
+      }
+    }, 100)
+  })
+}
+
+async function pingIce(remoteDescription) {
   if (!setRemoteIce(remoteDescription)) return Promise.reject(new Error('对方尚未完成 ICE candidate'))
+  await waitForIceConnection()
   const nonce = Math.random().toString(36).slice(2, 12)
   return new Promise((resolve, reject) => {
     pendingIcePing = { nonce, resolve, reject }
