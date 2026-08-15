@@ -43,6 +43,8 @@ let roomMembersTimer: number | undefined
 let transportStatusTimer: number | undefined
 let signingOut = false
 let leaseEpoch = 0
+let platformExitInProgress = false
+let removeBeforeQuitListener: (() => void) | undefined
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -284,6 +286,19 @@ async function releaseActiveLease() {
   if (cleanupError) throw cleanupError
 }
 
+async function handlePlatformExit() {
+  if (platformExitInProgress) return
+  platformExitInProgress = true
+  try {
+    if (activeLease.value) await releaseActiveLease()
+    else await desktop()?.disconnect()
+  } catch {
+    // Closing must not be blocked by a disconnected API or local helper.
+  } finally {
+    try { await desktop()?.completeQuit() } catch { /* the main-process timeout is the fallback */ }
+  }
+}
+
 async function leaveRoom() {
   if (!activeLease.value) return
   loading.value = true
@@ -401,12 +416,16 @@ function messageOf(error: unknown) {
   return '发生未知错误'
 }
 
-onMounted(restoreSession)
+onMounted(() => {
+  removeBeforeQuitListener = desktop()?.onBeforeQuit?.(() => { void handlePlatformExit() })
+  void restoreSession()
+})
 onBeforeUnmount(() => {
   stopLeaseHeartbeat()
   stopSessionMonitor()
   stopRoomMembersMonitor()
   stopTransportStatusMonitor()
+  removeBeforeQuitListener?.()
 })
 </script>
 

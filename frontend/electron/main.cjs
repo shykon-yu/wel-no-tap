@@ -14,6 +14,7 @@ const logFile = path.join(logDirectory, 'main.log')
 let mainWindow = null
 let tray = null
 let isQuitting = false
+let quitTimer = null
 
 function writeLog(message, error) {
   try {
@@ -40,6 +41,20 @@ function showMainWindow() {
   mainWindow.focus()
 }
 
+function finishQuit() {
+  if (quitTimer) clearTimeout(quitTimer)
+  quitTimer = null
+  isQuitting = true
+  app.quit()
+}
+
+function requestGracefulQuit() {
+  if (isQuitting) return
+  if (!mainWindow || mainWindow.isDestroyed()) return finishQuit()
+  mainWindow.webContents.send('platform-before-quit')
+  quitTimer = setTimeout(finishQuit, 5000)
+}
+
 function trayIconPath() {
   const candidates = app.isPackaged
     ? [path.join(process.resourcesPath, 'welhelper', 'wel.ico')]
@@ -58,14 +73,14 @@ function createTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '打开主界面', click: showMainWindow },
     { type: 'separator' },
-    { label: '退出平台', click: () => { isQuitting = true; app.quit() } },
+    { label: '退出平台', click: requestGracefulQuit },
   ]))
   tray.on('double-click', showMainWindow)
 }
 
 function createChineseMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: '文件', submenu: [{ role: 'reload', label: '重新载入' }, { type: 'separator' }, { role: 'quit', label: '退出' }] },
+    { label: '文件', submenu: [{ role: 'reload', label: '重新载入' }, { type: 'separator' }, { label: '退出', click: requestGracefulQuit }] },
     { label: '编辑', submenu: [{ role: 'cut', label: '剪切' }, { role: 'copy', label: '复制' }, { role: 'paste', label: '粘贴' }, { role: 'selectAll', label: '全选' }] },
     { label: '查看', submenu: [{ role: 'resetZoom', label: '实际大小' }, { role: 'zoomIn', label: '放大' }, { role: 'zoomOut', label: '缩小' }, { type: 'separator' }, { role: 'togglefullscreen', label: '全屏' }] },
     { label: '帮助', submenu: [{ label: '关于', click: () => dialog.showMessageBox({ type: 'info', title: '关于', message: runtime.platformName + ' v' + appVersion }) }] },
@@ -91,6 +106,7 @@ ipcMain.handle('notap-ping-ice', (_event, remoteDescription) => notap.pingIce(re
 ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', (_event, options) => notap.launch(options))
+ipcMain.handle('platform-complete-quit', finishQuit)
 
 function createWindow() {
   mainWindow = new BrowserWindow({

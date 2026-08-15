@@ -9,6 +9,12 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   chooseGame: () => ipcRenderer.invoke('notap-choose-game'),
   launchGame: (options) => ipcRenderer.invoke('notap-launch-game', options),
   disconnect: () => ipcRenderer.invoke('notap-disconnect'),
+  onBeforeQuit: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on('platform-before-quit', listener)
+    return () => ipcRenderer.removeListener('platform-before-quit', listener)
+  },
+  completeQuit: () => ipcRenderer.invoke('platform-complete-quit'),
   pingHost: (host) => ipcRenderer.invoke('notap-ping', host),
   prepareIce: (options) => ipcRenderer.invoke('notap-prepare-ice', options),
   configureIce: (remoteDescription) => ipcRenderer.invoke('notap-configure-ice', remoteDescription),
