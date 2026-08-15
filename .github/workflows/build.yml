@@ -116,7 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WEL无网卡对战平台-安装包
-          path: frontend/release/*
+          path: frontend/release/*.exe
           if-no-files-found: error
           retention-days: 14
 
