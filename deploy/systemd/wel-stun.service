@@ -1,0 +1,14 @@
+[Unit]
+Description=WEL public STUN service
+After=network.target
+
+[Service]
+Type=simple
+User=coturn
+Group=coturn
+ExecStart=/usr/bin/turnserver -c /etc/coturn/wel-stun.conf --no-stdout-log
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

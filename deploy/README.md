@@ -7,6 +7,7 @@
 | 现有 n2n supernode | `22222/UDP+TCP` | `weln2n-supernode.service` |
 | 现有平台 API/Nginx | `8082/80/443 TCP` | Docker/Nginx |
 | P2 无网卡中继 | `22333/UDP` | `welnpt-notap-relay.service` |
+| P2 ICE STUN | `3478/UDP` | `wel-stun.service` |
 
 部署 P2 时禁止重启 Docker、Nginx、OpenVPN 或 `weln2n-supernode`。
 
@@ -47,12 +48,40 @@ sudo firewall-cmd --zone=public --add-port=22333/udp
 
 阿里云安全组还需要单独增加 `UDP 22333` 入方向规则。
 
+## 自建 STUN
+
+libjuice 使用 STUN 收集公网 candidate 和协助 NAT 打洞。STUN 只参与探测，比赛
+数据在 ICE 成功后直接走两台玩家之间；直连失败仍由 `22333/UDP` 云中继兜底。
+
+CentOS 7 可使用 EPEL 的 coturn：
+
+```bash
+sudo yum install -y coturn
+sudo install -m 0644 deploy/coturn/wel-stun.conf /etc/coturn/wel-stun.conf
+sudo install -m 0644 deploy/systemd/wel-stun.service /etc/systemd/system/wel-stun.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now wel-stun
+sudo firewall-cmd --zone=public --permanent --add-port=3478/udp
+sudo firewall-cmd --reload
+```
+
+Go API 环境变量必须指向同一台公网服务器：
+
+```env
+WEL_NOTAP_ICE_STUN_HOST=8.155.145.132
+WEL_NOTAP_ICE_STUN_PORT=3478
+```
+
+阿里云安全组增加 `UDP 3478` 入方向规则，来源可以先设为 `0.0.0.0/0`。仅运行
+`stun-only` 时不需要开放 TURN 中继端口段。
+
 ## 验证
 
 ```bash
 systemctl is-active welnpt-notap-relay
+systemctl is-active wel-stun
 systemctl is-active weln2n-supernode
-ss -lunp | grep -E '22222|22333'
+ss -lunp | grep -E '22222|22333|3478'
 curl -fsS http://127.0.0.1:8082/healthz
 journalctl -u welnpt-notap-relay -n 50 --no-pager
 ```
