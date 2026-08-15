@@ -53,7 +53,6 @@ function startLeaseHeartbeat() {
   stopLeaseHeartbeat()
   if (!activeLease.value) return
   const epoch = ++leaseEpoch
-  void renewLease(epoch)
   heartbeatTimer = window.setInterval(() => { void renewLease(epoch) }, heartbeatIntervalMs)
 }
 
