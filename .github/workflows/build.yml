@@ -45,7 +45,7 @@ jobs:
             $juiceObject = Join-Path $juiceOutput (([IO.Path]::GetFileNameWithoutExtension($juiceSource)) + '.obj')
             Invoke-Compiler 'libjuice static library' @(
               '/nologo', '/W3', '/O2', '/MT', '/c', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX', '/DJUICE_STATIC', '/D_WIN32_WINNT=0x0601', '/D_CRT_SECURE_NO_WARNINGS',
-              '/Ithird_party/libjuice/include', '/Ithird_party/libjuice/src', $juiceSource, "/Fo:$juiceObject"
+              '/Ithird_party/libjuice/include', '/Ithird_party/libjuice/include/juice', '/Ithird_party/libjuice/src', $juiceSource, "/Fo:$juiceObject"
             )
           }
           $juiceObjects = Get-ChildItem $juiceOutput -Filter '*.obj' | ForEach-Object { $_.FullName }

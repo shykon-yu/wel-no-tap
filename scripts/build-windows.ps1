@@ -13,7 +13,7 @@ $juiceOutput = Join-Path $output 'libjuice'
 New-Item -ItemType Directory -Force -Path $juiceOutput | Out-Null
 $juiceSources = Get-ChildItem (Join-Path $root 'third_party\libjuice\src') -Filter '*.c' | ForEach-Object { $_.FullName }
 & cl.exe /nologo /W3 /O2 /MT /c /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DJUICE_STATIC /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS `
-  /I (Join-Path $root 'third_party\libjuice\include') /I (Join-Path $root 'third_party\libjuice\src') `
+  /I (Join-Path $root 'third_party\libjuice\include') /I (Join-Path $root 'third_party\libjuice\include\juice') /I (Join-Path $root 'third_party\libjuice\src') `
   $juiceSources /Fo:(Join-Path $juiceOutput '\')
 if ($LASTEXITCODE -ne 0) { throw 'libjuice 编译失败。' }
 $juiceObjects = Get-ChildItem $juiceOutput -Filter '*.obj' | ForEach-Object { $_.FullName }
