@@ -30,7 +30,7 @@ const activeRoomName = computed(() => activeRoom.value ? displayRoomName(activeR
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
-  if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 正在收集直连候选`
+  if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 直连与 Ping 工具准备中`
   if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
   if (directCandidateStatus.value === 'relay-only') return `${activeRoomName.value} · 中继已连接 · 仅使用中继`
   return networkStatus.value?.connected ? `${activeRoomName.value} · 网络已连接` : `${activeRoomName.value} · 正在确认网络`
@@ -69,6 +69,7 @@ let activeIncomingProbeAgents = 0
 let activeGamePeerIp = ''
 let activeGamePeerTransaction = ''
 let gamePeerEpoch = 0
+let roomPreparationEpoch = 0
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -132,6 +133,7 @@ function clearRoomSessionState() {
   activeGamePeerIp = ''
   activeGamePeerTransaction = ''
   gamePeerEpoch = 0
+  roomPreparationEpoch += 1
 }
 
 function stopTransportStatusMonitor() {
@@ -262,61 +264,64 @@ async function restoreSession() {
   }
 }
 
+function isCurrentRoomPreparation(lease: Lease, epoch: number) {
+  return roomPreparationEpoch === epoch && activeLease.value?.room_id === lease.room_id
+}
+
+async function prepareRoomTools(lease: Lease, epoch: number) {
+  const desktopApi = desktop()
+  if (!desktopApi) return
+
+  // Firewall rules are only an optimization for ICE/Ping. They are deliberately
+  // best-effort and must never hold the room entry or relay fallback hostage.
+  void desktopApi.ensureFirewall({}).catch(() => undefined)
+  if (!desktopApi.prepareIce) return
+
+  try {
+    const ice = await desktopApi.prepareIce({
+      stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
+      relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
+      logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
+    })
+    if (!isCurrentRoomPreparation(lease, epoch)) return
+    await roomApi.publishIce(lease.room_id, ice.localDescription)
+    if (!isCurrentRoomPreparation(lease, epoch)) return
+    directCandidateStatus.value = 'ready'
+    directCandidateMessage.value = summarizeCandidates(ice.localDescription)
+    notice.value = `已进入房间，${directCandidateMessage.value}`
+  } catch (error) {
+    if (!isCurrentRoomPreparation(lease, epoch)) return
+    directCandidateStatus.value = 'relay-only'
+    directCandidateMessage.value = '直连工具准备失败，当前使用中继'
+    // Do not turn an optional ICE failure into a room-entry error. Keep the
+    // detail in the local session log and leave relay/search fully usable.
+    console.warn('直连工具准备失败，继续使用中继', messageOf(error))
+  }
+}
+
 async function joinRoom(room: Room) {
   loading.value = true
   errorMessage.value = ''
   warningMessage.value = ''
   let lease: Lease | null = null
-  let firewallWarning = ''
-  let roomNotice = '已进入房间，当前仅使用中继'
   try {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
-    try {
-      // The same ICE process handles direct Ping and the optional P2P game path.
-      const firewall = await desktop()?.ensureFirewall({})
-      firewallWarning = firewall?.warning || ''
-      warningMessage.value = firewallWarning
-    } catch (error) {
-      firewallWarning = '无法确认 Windows 防火墙规则，直连可能不可用；当前仍可使用中继。'
-      warningMessage.value = firewallWarning
-    }
+    const preparationEpoch = ++roomPreparationEpoch
     directCandidateStatus.value = 'gathering'
-    directCandidateMessage.value = '正在收集直连候选'
-    notice.value = `正在连接直连服务 ${lease.ice_stun_host}:${lease.ice_stun_port} 并收集 candidate...`
-    if (desktop()?.prepareIce) {
-      try {
-        const ice = await desktop()!.prepareIce({
-          stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
-          relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
-          logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
-        })
-        await roomApi.publishIce(room.id, ice.localDescription)
-        directCandidateStatus.value = 'ready'
-        directCandidateMessage.value = summarizeCandidates(ice.localDescription)
-        roomNotice = `已进入房间，${directCandidateMessage.value}`
-      } catch (error) {
-        directCandidateStatus.value = 'relay-only'
-        directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
-        const message = messageOf(error)
-        const candidateWarning = message.includes('ICE candidate 收集超时')
-          ? '已尝试通过直连服务收集 candidate，但 12 秒内未完成；当前仅使用中继，稍后点击玩家 Ping 可再次尝试'
-          : message.includes('ICE 辅助程序提前退出')
-            ? `已尝试启动直连候选收集，但组件提前退出；当前仅使用中继：${message}`
-            : `直连候选准备失败，当前仅使用中继：${message}`
-        warningMessage.value = [firewallWarning, candidateWarning].filter(Boolean).join('\n')
-      }
-    }
+    directCandidateMessage.value = '直连与 Ping 工具准备中，中继已可用'
     networkStatus.value = {
       ready: true,
       connected: true,
-      message: '房间已准备，启动游戏时建立云中继连接',
+      message: '房间已准备，中继兜底可用；直连工具正在后台准备',
       actualIp: lease.logical_ip || lease.virtual_ip,
     }
     startLeaseHeartbeat()
     startRoomMembersMonitor()
-    notice.value = roomNotice
-    await loadRooms()
+    notice.value = '已进入房间，中继兜底可用；直连与 Ping 工具准备中'
+    // Entry is complete at this point. ICE gathering and firewall inspection
+    // continue without keeping the room spinner or blocking relay traffic.
+    void prepareRoomTools(lease, preparationEpoch)
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       await forceSignedOut(error.message)
@@ -406,8 +411,6 @@ async function launchGame() {
     gamePeerTransactions.clear()
     activeGamePeerIp = ''
     activeGamePeerTransaction = ''
-    const firewall = await desktop()!.ensureFirewall({})
-    if (firewall.warning) warningMessage.value = firewall.warning
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,
       relay: `${activeLease.value.relay_host}:${activeLease.value.relay_port}`,

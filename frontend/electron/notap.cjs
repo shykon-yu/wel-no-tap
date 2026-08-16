@@ -144,6 +144,25 @@ function waitForIceCandidate(child, timeoutMs = 12000) {
   })
 }
 
+// The Hook only needs the local ICE agent port at game launch. Candidate
+// gathering may continue in the background and must not delay the relay path.
+function waitForIceAgent(timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs
+    const timer = setInterval(() => {
+      if (iceProcess && iceAgentPort && iceHookPort) {
+        clearInterval(timer)
+        resolve(true)
+        return
+      }
+      if (Date.now() >= deadline || !iceProcess) {
+        clearInterval(timer)
+        resolve(false)
+      }
+    }, 50)
+  })
+}
+
 function handleIceLine(rawLine) {
   const line = rawLine.replace(/[\r\n]+$/, '')
   if (readingIceSdp) {
@@ -565,13 +584,16 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) 
   lastLogPath = logPath
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
-  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort) {
+  if (iceProcess && iceAgentPort && iceHookPort) {
     args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
   }
   return { helper, args, logPath }
 }
 
-function launchElevated(options) {
+async function launchElevated(options) {
+  // Match the normal launch path: provide the direct agent when it is ready,
+  // but never wait for full ICE gathering before starting the Hook.
+  await waitForIceAgent()
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
   const argumentList = args.map(windowsCommandArgument).join(' ')
   // Start-Process -Wait also follows WE8.exe, which the helper launches. Wait for
@@ -596,12 +618,16 @@ function launchElevated(options) {
   })
 }
 
-function launch({ gamePath, relay, room, logicalIp, token }) {
+async function launch({ gamePath, relay, room, logicalIp, token }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
   if (!helper || !hook) throw new Error('缺少 welnptgame.exe 或 welnpt.dll，请重新解压完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
+
+  // Give the background ICE process a short chance to expose its local UDP
+  // port. Never wait for the 12-second candidate gathering deadline here.
+  await waitForIceAgent()
 
   const logPath = ensureLogPath()
   lastLogPath = logPath
@@ -613,7 +639,7 @@ function launch({ gamePath, relay, room, logicalIp, token }) {
     WEL_NOTAP_TOKEN: String(token),
     WEL_NOTAP_LOG_PATH: logPath,
   }
-  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort) {
+  if (iceProcess && iceAgentPort && iceHookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
   }
