@@ -16,9 +16,6 @@ let mainWindow = null
 let tray = null
 let isQuitting = false
 let quitTimer = null
-const firewallConsentAsked = new Map()
-const firewallBlockNoticeShown = new Map()
-const firewallPromptCooldownMs = 10000
 
 function writeLog(message, error) {
   try {
@@ -126,22 +123,11 @@ async function openWindowsSecurity() {
   } catch {}
 }
 
-function openFirewallSettings() {
-  try {
-    const child = require('node:child_process').spawn('control.exe', ['firewall.cpl'], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    })
-    child.unref()
-  } catch {}
-}
-
 function firewallResultMessage(result) {
   const missing = (result.missing || []).map((rule) => rule.name).join('、')
   const blockers = (result.blockers || []).map((rule) => rule.name + (rule.program ? ` (${rule.program})` : '')).join('\n')
-  if (blockers) return `发现 Windows 防火墙存在阻止规则，请删除后重新进入房间：\n${blockers}`
-  if (missing) return `以下 UDP 放行规则尚未生效：${missing}`
+  if (blockers) return `发现 Windows 防火墙存在阻止规则，请删除后重新进入房间：\n${blockers}\n\n建议右键平台选择“以管理员身份运行”；也可以在平台属性的“兼容性”中勾选“以管理员身份运行此程序”。`
+  if (missing) return `以下 UDP 放行规则尚未确认：${missing}\n\n建议右键平台选择“以管理员身份运行”；也可以在平台属性的“兼容性”中勾选“以管理员身份运行此程序”。`
   return 'Windows 防火墙规则状态无法确认，请检查系统防火墙设置。'
 }
 
@@ -149,46 +135,8 @@ async function ensureWindowsFirewall(event, options = {}) {
   if (process.platform !== 'win32') return { state: 'not-needed', warning: '' }
   const status = notap.status()
   const paths = { icePath: status.icePath }
-  let result = await firewall.trySilentFirewall(paths)
+  const result = await firewall.trySilentFirewall(paths)
   if (result.state === 'ready' || result.state === 'not-needed') return { ...result, warning: '' }
-
-  const owner = BrowserWindow.fromWebContents(event.sender)
-  const key = [paths.icePath, paths.gamePath].filter(Boolean).map((value) => String(value).toLowerCase()).join('|')
-  if (result.blockers?.length) {
-    const lastBlockNotice = firewallBlockNoticeShown.get(key) || 0
-    if (Date.now() - lastBlockNotice >= firewallPromptCooldownMs) {
-      firewallBlockNoticeShown.set(key, Date.now())
-      const prompt = await dialog.showMessageBox(owner, {
-        type: 'warning',
-        title: '发现防火墙阻止规则',
-        message: 'Windows 防火墙中存在会阻止 WEL 直连或游戏入站数据的规则。',
-        detail: firewallResultMessage(result) + '\n\n请在防火墙高级设置的“入站规则”中删除这些阻止规则，或确认规则已禁用。当前仍可进入房间，但直连可能不可用。',
-        buttons: ['打开防火墙设置', '继续进入'],
-        defaultId: 0,
-        cancelId: 1,
-        noLink: true,
-      })
-      if (prompt.response === 0) openFirewallSettings()
-    }
-    return { ...result, warning: firewallResultMessage(result) }
-  }
-
-  const lastConsentPrompt = firewallConsentAsked.get(key) || 0
-  if (Date.now() - lastConsentPrompt >= firewallPromptCooldownMs) {
-    firewallConsentAsked.set(key, Date.now())
-    const prompt = await dialog.showMessageBox(owner, {
-      type: 'warning',
-      title: '需要允许 WEL 网络规则',
-      message: 'WEL 需要为直连 ICE 组件写入 Windows 防火墙 UDP 放行规则。',
-      detail: '平台已先尝试静默写入，但当前系统没有确认规则生效。点击“允许并修复”后，Windows 可能显示管理员授权提示。拒绝后仍可进入房间，但直连可能不可用。',
-      buttons: ['允许并修复', '继续进入'],
-      defaultId: 0,
-      cancelId: 1,
-      noLink: true,
-    })
-    if (prompt.response === 0) result = await firewall.applyElevatedFirewall(paths)
-  }
-  if (result.state === 'ready') return { ...result, warning: '' }
   return { ...result, warning: firewallResultMessage(result) + '\n当前仍可进入房间，直连失败时将继续使用中继。' }
 }
 
