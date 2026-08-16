@@ -25,7 +25,8 @@ const LEGACY_GAME_PATH_KEY = 'pes8.game-path'
 const gamePath = ref(localStorage.getItem(GAME_PATH_KEY) ?? localStorage.getItem(LEGACY_GAME_PATH_KEY) ?? '')
 const totalOnline = computed(() => rooms.value.reduce((total, room) => total + room.members, 0))
 const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => room.id === activeLease.value?.room_id) ?? null : null)
-const activeRoomName = computed(() => activeRoom.value?.name ?? (activeLease.value ? `房间 ${activeLease.value.room_id}` : '未进入房间'))
+const displayRoomName = (room: Room) => `房间 ${String(room.id).padStart(2, '0')}`
+const activeRoomName = computed(() => activeRoom.value ? displayRoomName(activeRoom.value) : (activeLease.value ? `房间 ${String(activeLease.value.room_id).padStart(2, '0')}` : '未进入房间'))
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
@@ -391,25 +392,17 @@ async function pingMember(member: RoomMember) {
     },
   }
   try {
-    let relayServerResult = { reachable: false, summary: '中继服务器不可用' }
-    try { relayServerResult = { reachable: true, summary: `中继服务器 ${await desktop()!.pingRelay()} ms` } } catch { /* keep relay unavailable */ }
-    let relayPeerResult = { reachable: false, summary: member.virtual_ip ? '中继玩家探测中...' : '对方逻辑 IP 未知' }
-    if (desktop()?.pingRelayPeer && member.virtual_ip) {
-      try { relayPeerResult = { reachable: true, summary: `中继玩家 ${await desktop()!.pingRelayPeer(member.virtual_ip)} ms` } } catch { /* keep relay peer unavailable */ }
-    }
-    let directResult = { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' }
-    pingResults.value = {
-      ...pingResults.value,
-      [member.user_id]: {
-        host: member.virtual_ip,
-        reachable: relayServerResult.reachable || relayPeerResult.reachable,
-        summary: `${relayServerResult.summary}；${relayPeerResult.summary}；${directResult.summary}`,
-        relayServer: relayServerResult,
-        relayPeer: relayPeerResult,
-        direct: directResult,
-      },
-    }
-    if (member.ice_description && desktop()?.pingIce) {
+    const relayServerPromise = desktop()!.pingRelay()
+      .then(milliseconds => ({ reachable: true, summary: `中继服务器 ${milliseconds} ms` }))
+      .catch(() => ({ reachable: false, summary: '中继服务器不可用' }))
+    const relayPeerPromise = desktop()?.pingRelayPeer && member.virtual_ip
+      ? desktop()!.pingRelayPeer(member.virtual_ip)
+        .then(milliseconds => ({ reachable: true, summary: `中继玩家 ${milliseconds} ms` }))
+        .catch(() => ({ reachable: false, summary: '中继玩家探测超时' }))
+      : Promise.resolve({ reachable: false, summary: member.virtual_ip ? '中继玩家探测不可用' : '对方逻辑 IP 未知' })
+    const directPromise = (async () => {
+      let directResult = { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' }
+      if (!member.ice_description || !desktop()?.pingIce) return directResult
       let localCandidateReady = true
       const lease = activeLease.value
       if (lease && desktop()?.prepareIce) {
@@ -446,7 +439,9 @@ async function pingMember(member: RoomMember) {
           }
         }
       }
-    }
+      return directResult
+    })()
+    const [relayServerResult, relayPeerResult, directResult] = await Promise.all([relayServerPromise, relayPeerPromise, directPromise])
     pingResults.value = {
       ...pingResults.value,
       [member.user_id]: {
@@ -576,7 +571,7 @@ onBeforeUnmount(() => {
 
       <div class="room-workspace">
         <section class="room-section"><div class="section-heading"><h3>可用房间</h3><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="{ unavailable: room.status !== 'open' }"><div class="room-card-top"><span class="region">{{ room.region }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ room.name }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="{ unavailable: room.status !== 'open' }"><div class="room-card-top"><span class="region">云中继</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>

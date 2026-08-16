@@ -160,13 +160,9 @@ function handleIceLine(rawLine) {
     return
   }
   if (line.startsWith('PING_UNAVAILABLE ')) {
-    if (pendingIcePing) {
-      const pending = pendingIcePing
-      pendingIcePing = null
-      if (pending.retryTimer) clearInterval(pending.retryTimer)
-      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
-      pending.reject(new Error('直连探测不可用'))
-    }
+    // The helper may report unavailable while ICE is transitioning to connected.
+    // Keep retrying until the probe deadline so a stale Electron state cannot
+    // turn an already usable game path into a false ICE timeout.
     return
   }
   if (line.startsWith('RELAY_PING_RESULT ')) {
@@ -187,6 +183,8 @@ function handleIceLine(rawLine) {
     if (pendingRelayPeerPing && pendingRelayPeerPing.nonce === nonce) {
       const pending = pendingRelayPeerPing
       pendingRelayPeerPing = null
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
+      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
       pending.resolve(Number(milliseconds) || 0)
     }
     return
@@ -289,23 +287,23 @@ function waitForIceConnection(timeoutMs = 12000) {
 
 async function pingIce(remoteDescription) {
   if (!setRemoteIce(remoteDescription)) return Promise.reject(new Error('对方尚未完成 ICE candidate'))
-  await waitForIceConnection()
-  const nonce = Math.random().toString(36).slice(2, 12)
+  const nonceBase = Math.random().toString(36).slice(2, 12)
   return new Promise((resolve, reject) => {
-    const pending = { nonce, resolve, reject, retryTimer: null, timeoutTimer: null }
+    const pending = { nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, attempt: 0 }
     pendingIcePing = pending
     const send = () => {
       if (pendingIcePing !== pending || !iceProcess) return
-      try { iceProcess.stdin.write('PING ' + nonce + '\n') } catch { /* timeout reports the failed probe */ }
+      pending.nonce = nonceBase + '-' + String(++pending.attempt)
+      try { iceProcess.stdin.write('PING ' + pending.nonce + '\n') } catch { /* timeout reports the failed probe */ }
     }
     send()
     pending.retryTimer = setInterval(send, 500)
     pending.timeoutTimer = setTimeout(() => {
-      if (pendingIcePing?.nonce !== nonce) return
+      if (pendingIcePing !== pending) return
       if (pending.retryTimer) clearInterval(pending.retryTimer)
       pendingIcePing = null
-      reject(new Error('直连探测超时'))
-    }, 8000)
+      reject(new Error(iceState === 'connected' || iceState === 'completed' ? '直连 Ping 超时' : 'ICE 直连检查超时'))
+    }, 12000)
   })
 }
 
@@ -326,15 +324,22 @@ function pingRelay() {
 function pingRelayPeer(remoteIp) {
   if (!iceProcess) return Promise.reject(new Error('中继玩家探测未准备'))
   if (!remoteIp) return Promise.reject(new Error('对方逻辑 IP 未知'))
-  const nonce = String(Date.now() >>> 0)
   return new Promise((resolve, reject) => {
-    pendingRelayPeerPing = { nonce, resolve, reject }
-    iceProcess.stdin.write('PING_RELAY_PEER ' + nonce + ' ' + String(remoteIp).trim() + '\n')
-    setTimeout(() => {
-      if (pendingRelayPeerPing?.nonce !== nonce) return
+    const pending = { nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, remoteIp: String(remoteIp).trim(), sequence: Date.now() >>> 0 }
+    pendingRelayPeerPing = pending
+    const send = () => {
+      if (pendingRelayPeerPing !== pending || !iceProcess) return
+      pending.nonce = String(pending.sequence = (pending.sequence + 1) >>> 0)
+      try { iceProcess.stdin.write('PING_RELAY_PEER ' + pending.nonce + ' ' + pending.remoteIp + '\n') } catch { /* timeout reports the failed probe */ }
+    }
+    send()
+    pending.retryTimer = setInterval(send, 500)
+    pending.timeoutTimer = setTimeout(() => {
+      if (pendingRelayPeerPing !== pending) return
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
       pendingRelayPeerPing = null
       reject(new Error('中继玩家探测超时'))
-    }, 5000)
+    }, 8000)
   })
 }
 
@@ -411,7 +416,13 @@ async function disconnect() {
     pending.reject(new Error('已退出房间，直连探测已取消'))
   }
   pendingRelayPing = null
-  pendingRelayPeerPing = null
+  if (pendingRelayPeerPing) {
+    const pending = pendingRelayPeerPing
+    pendingRelayPeerPing = null
+    if (pending.retryTimer) clearInterval(pending.retryTimer)
+    if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
+    pending.reject(new Error('已退出房间，中继玩家探测已取消'))
+  }
   lastRemoteDescription = ''
   lastLogPath = ''
   iceExitError = ''
