@@ -3,10 +3,12 @@ const path = require('node:path')
 
 const RULE_PREFIX = 'WEL No-TAP'
 const RULES = [
-  { suffix: 'ICE Inbound', direction: 'in' },
-  { suffix: 'ICE Outbound', direction: 'out' },
-  { suffix: 'WE8 Inbound', direction: 'in' },
-  { suffix: 'WE8 Outbound', direction: 'out' },
+  { kind: 'ice', suffix: 'ICE UDP', direction: 'in' },
+  { kind: 'game', suffix: 'WE8 UDP', direction: 'in' },
+]
+const LEGACY_RULE_NAMES = [
+  `${RULE_PREFIX} ICE Inbound`, `${RULE_PREFIX} ICE Outbound`,
+  `${RULE_PREFIX} WE8 Inbound`, `${RULE_PREFIX} WE8 Outbound`,
 ]
 
 function psLiteral(value) {
@@ -46,7 +48,8 @@ function runPowerShell(script, { elevated = false, timeoutMs = 30000 } = {}) {
 }
 
 function normalizeProgram(value) {
-  return path.normalize(String(value || '')).replace(/[\\/]+$/, '').toLowerCase()
+  const program = String(value || '').trim().replace(/^"(.*)"$/, '$1')
+  return path.normalize(program).replace(/[\\/]+$/, '').toLowerCase()
 }
 
 function ruleName(rule) {
@@ -59,7 +62,7 @@ function ruleSpecs({ icePath, gamePath }) {
     { kind: 'game', path: gamePath },
   ].filter((item) => item.path && String(item.path).trim())
   return paths.flatMap((item) => RULES
-    .filter((rule) => rule.suffix.startsWith(item.kind === 'ice' ? 'ICE' : 'WE8'))
+    .filter((rule) => rule.kind === item.kind)
     .map((rule) => ({ ...rule, name: ruleName(rule), program: path.normalize(String(item.path)) })))
 }
 
@@ -98,10 +101,16 @@ async function inspectFirewall(options = {}) {
   const wantedPrograms = new Set(specs.map((spec) => normalizeProgram(spec.program)))
   const blockers = rules.filter((rule) => rule.enabled && rule.direction === 1 && rule.action === 0 && wantedPrograms.has(rule.program))
   const missing = specs.filter((spec) => !rules.some((rule) => rule.enabled && rule.direction === (spec.direction === 'in' ? 1 : 2) && rule.action === 1 && rule.program === normalizeProgram(spec.program) && rule.name === spec.name))
-  return { state: missing.length === 0 && blockers.length === 0 ? 'ready' : 'needs-fix', missing, blockers, rules }
+  const legacy = rules.filter((rule) => LEGACY_RULE_NAMES.includes(rule.name))
+  return { state: missing.length === 0 && blockers.length === 0 && legacy.length === 0 ? 'ready' : 'needs-fix', missing, blockers, legacy, rules }
 }
 
 function applyScript(specs) {
+  const cleanup = [...new Set([...LEGACY_RULE_NAMES, ...specs.map((spec) => spec.name)])]
+    .map((name) => {
+      const args = ['advfirewall', 'firewall', 'delete', 'rule', `name=${name}`].map(psLiteral).join(' ')
+      return `& $netsh ${args} | Out-Null`
+    }).join('\n')
   const lines = specs.map((spec) => {
     const args = [
       'advfirewall', 'firewall', 'add', 'rule',
@@ -109,10 +118,9 @@ function applyScript(specs) {
       `program=${spec.program}`, 'enable=yes', 'profile=any', 'protocol=UDP',
     ]
     const literalArgs = args.map(psLiteral).join(' ')
-    const deleteArgs = ['advfirewall', 'firewall', 'delete', 'rule', `name=${spec.name}`].map(psLiteral).join(' ')
-    return `& $netsh ${deleteArgs} | Out-Null; & $netsh ${literalArgs}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`
+    return `& $netsh ${literalArgs}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`
   }).join('\n')
-  return `$netsh = Join-Path $env:SystemRoot 'System32\\netsh.exe'\n${lines}`
+  return `$netsh = Join-Path $env:SystemRoot 'System32\\netsh.exe'\n${cleanup}\n${lines}`
 }
 
 async function trySilentFirewall(options = {}) {

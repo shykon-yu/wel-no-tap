@@ -140,7 +140,7 @@ function firewallResultMessage(result) {
   const missing = (result.missing || []).map((rule) => rule.name).join('、')
   const blockers = (result.blockers || []).map((rule) => rule.name + (rule.program ? ` (${rule.program})` : '')).join('\n')
   if (blockers) return `发现 Windows 防火墙存在阻止规则，请删除后重新进入房间：\n${blockers}`
-  if (missing) return `以下入站/出站放行规则尚未生效：${missing}`
+  if (missing) return `以下 UDP 放行规则尚未生效：${missing}`
   return 'Windows 防火墙规则状态无法确认，请检查系统防火墙设置。'
 }
 
