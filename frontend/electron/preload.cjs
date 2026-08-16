@@ -17,8 +17,16 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   completeQuit: () => ipcRenderer.invoke('platform-complete-quit'),
   pingHost: (host) => ipcRenderer.invoke('notap-ping', host),
   prepareIce: (options) => ipcRenderer.invoke('notap-prepare-ice', options),
-  configureIce: (remoteDescription) => ipcRenderer.invoke('notap-configure-ice', remoteDescription),
-  pingIce: (remoteDescription) => ipcRenderer.invoke('notap-ping-ice', remoteDescription),
+  configureIce: (options) => ipcRenderer.invoke('notap-configure-ice', options),
+  createProbeIce: (options) => ipcRenderer.invoke('notap-create-probe-ice', options),
+  configureProbeIce: (probeKey, remoteDescription) => ipcRenderer.invoke('notap-configure-probe-ice', probeKey, remoteDescription),
+  pingProbeIce: (probeKey) => ipcRenderer.invoke('notap-ping-probe-ice', probeKey),
+  stopProbeIce: (probeKey) => ipcRenderer.invoke('notap-stop-probe-ice', probeKey),
+  onGamePeer: (callback) => {
+    const listener = (_event, logicalIp) => callback(logicalIp)
+    ipcRenderer.on('notap-game-peer', listener)
+    return () => ipcRenderer.removeListener('notap-game-peer', listener)
+  },
   pingRelay: () => ipcRenderer.invoke('notap-ping-relay'),
   pingRelayPeer: (remoteIp) => ipcRenderer.invoke('notap-ping-relay-peer', remoteIp),
 })

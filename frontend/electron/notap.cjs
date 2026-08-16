@@ -17,11 +17,13 @@ let iceSdpBuffer = ''
 let readingIceSdp = false
 let iceExitError = ''
 let iceDiagnostics = []
-let pendingIcePing = null
 let pendingRelayPing = null
 let pendingRelayPeerPing = null
 let lastRemoteDescription = ''
 let lastLogPath = ''
+let activeGamePeerIp = ''
+const gamePeerListeners = new Set()
+const probeAgents = new Map()
 
 function helperCandidates() {
   return [
@@ -148,21 +150,13 @@ function handleIceLine(rawLine) {
   if (line.startsWith('LOCAL_PORT ')) { iceAgentPort = Number(line.slice(11)) || 0; return }
   if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; return }
   if (line.startsWith('STATE ')) { iceState = line.slice(6) || 'unknown'; return }
-  if (line.startsWith('PING_RESULT ')) {
-    const [, nonce, milliseconds] = line.split(' ')
-    if (pendingIcePing && pendingIcePing.nonce === nonce) {
-      const pending = pendingIcePing
-      pendingIcePing = null
-      if (pending.retryTimer) clearInterval(pending.retryTimer)
-      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
-      pending.resolve(Number(milliseconds) || 0)
+  if (line.startsWith('GAME_PEER ')) {
+    const logicalIp = line.slice(10).trim()
+    if (logicalIp) {
+      for (const listener of gamePeerListeners) {
+        try { listener(logicalIp) } catch {}
+      }
     }
-    return
-  }
-  if (line.startsWith('PING_UNAVAILABLE ')) {
-    // The helper may report unavailable while ICE is transitioning to connected.
-    // Keep retrying until the probe deadline so a stale Electron state cannot
-    // turn an already usable game path into a false ICE timeout.
     return
   }
   if (line.startsWith('RELAY_PING_RESULT ')) {
@@ -207,6 +201,8 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
   readingIceSdp = false
   iceExitError = ''
   iceDiagnostics = []
+  lastRemoteDescription = ''
+  activeGamePeerIp = ''
   const environment = { ...process.env }
   if (relay && room && logicalIp && token) {
     environment.WEL_NOTAP_RELAY = String(relay)
@@ -246,63 +242,155 @@ async function prepareIce(options) {
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 
-function setRemoteIce(remoteDescription) {
+function setRemoteIce(remoteDescription, remoteIp = '') {
   if (!iceProcess || !remoteDescription) return false
   const normalized = String(remoteDescription).replace(/\r?\n/g, '\n').replace(/\n*$/, '\n')
-  if (lastRemoteDescription === normalized) return true
+  const peerIp = String(remoteIp || '').trim()
+  if (lastRemoteDescription === normalized) return !peerIp || peerIp === activeGamePeerIp
+  if (lastRemoteDescription) return false
+  if (peerIp) {
+    iceProcess.stdin.write('TARGET ' + peerIp + '\n')
+    activeGamePeerIp = peerIp
+  }
   iceProcess.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
   lastRemoteDescription = normalized
   return true
 }
 
-function waitForIceConnection(timeoutMs = 12000) {
-  const child = iceProcess
-  if (!child || child.killed) return Promise.reject(new Error('直连组件未运行'))
-  if (iceState === 'connected' || iceState === 'completed') return Promise.resolve()
+function onGamePeer(listener) {
+  if (typeof listener !== 'function') return () => {}
+  gamePeerListeners.add(listener)
+  return () => gamePeerListeners.delete(listener)
+}
+
+function randomProbeKey() {
+  return 'probe-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+}
+
+function stopProbeIce(probeKey) {
+  const probe = probeAgents.get(probeKey)
+  if (!probe) return { stopped: true }
+  probeAgents.delete(probeKey)
+  if (probe.timeoutTimer) clearTimeout(probe.timeoutTimer)
+  if (probe.retryTimer) clearInterval(probe.retryTimer)
+  if (probe.pendingPing) {
+    const pending = probe.pendingPing
+    probe.pendingPing = null
+    pending.reject(new Error('直连探测已结束'))
+  }
+  try { probe.child.stdin.write('EXIT\n') } catch {}
+  try { probe.child.kill() } catch {}
+  return { stopped: true }
+}
+
+function createProbeIce({ stunHost, stunPort }) {
+  const executable = locate(iceCandidates())
+  if (!executable) return Promise.reject(new Error('缺少 welnptice.exe，请重新解压完整客户端'))
+  const key = randomProbeKey()
+  const hookPort = chooseHookPort()
+  const environment = { ...process.env }
+  delete environment.WEL_NOTAP_RELAY
+  delete environment.WEL_NOTAP_ROOM
+  delete environment.WEL_NOTAP_LOGICAL_IP
+  delete environment.WEL_NOTAP_TOKEN
+  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--hook-port', String(hookPort)], {
+    windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
+  })
+  const probe = {
+    key, child, state: 'gathering', localDescription: '', localPort: 0,
+    buffer: '', sdpBuffer: '', readingSdp: false, error: '', pendingPing: null,
+    retryTimer: null, timeoutTimer: null,
+  }
+  probeAgents.set(key, probe)
+  const consume = (chunk) => {
+    probe.buffer += chunk.toString('utf8')
+    let newline
+    while ((newline = probe.buffer.indexOf('\n')) >= 0) {
+      const line = probe.buffer.slice(0, newline).replace(/\r$/, '')
+      probe.buffer = probe.buffer.slice(newline + 1)
+      if (probe.readingSdp) {
+        if (line === 'LOCAL_SDP_END') {
+          probe.readingSdp = false
+          probe.localDescription = probe.sdpBuffer
+          probe.sdpBuffer = ''
+        } else probe.sdpBuffer += line + '\n'
+        continue
+      }
+      if (line === 'LOCAL_SDP_BEGIN') { probe.readingSdp = true; probe.sdpBuffer = ''; continue }
+      if (line.startsWith('LOCAL_PORT ')) { probe.localPort = Number(line.slice(11)) || 0; continue }
+      if (line.startsWith('STATE ')) { probe.state = line.slice(6) || 'unknown'; continue }
+      if (line.startsWith('PING_RESULT ') && probe.pendingPing) {
+        const [, nonce, milliseconds] = line.split(' ')
+        if (probe.pendingPing.nonce === nonce) {
+          const pending = probe.pendingPing
+          probe.pendingPing = null
+          if (probe.retryTimer) clearInterval(probe.retryTimer)
+          if (probe.timeoutTimer) clearTimeout(probe.timeoutTimer)
+          probe.retryTimer = null
+          probe.timeoutTimer = null
+          pending.resolve(Number(milliseconds) || 0)
+        }
+      }
+    }
+  }
+  child.stdout.on('data', consume)
+  child.stderr.on('data', (chunk) => { probe.error = String(chunk).trim().slice(0, 300) || probe.error })
+  child.once('close', (code) => {
+    if (probeAgents.get(key) !== probe) return
+    probe.error ||= '临时 ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）'
+    if (probe.pendingPing) {
+      const pending = probe.pendingPing
+      probe.pendingPing = null
+      pending.reject(new Error(probe.error))
+    }
+  })
   return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs
+    const deadline = Date.now() + 12000
     const timer = setInterval(() => {
-      if (iceProcess !== child || child.killed) {
+      if (probe.localDescription && probe.localPort && probeAgents.get(key) === probe) {
         clearInterval(timer)
-        reject(new Error(iceExitError || '直连组件已退出'))
-        return
-      }
-      if (iceState === 'connected' || iceState === 'completed') {
+        resolve({ probeKey: key, localDescription: probe.localDescription })
+      } else if (Date.now() >= deadline || probeAgents.get(key) !== probe || child.killed) {
         clearInterval(timer)
-        resolve()
-        return
-      }
-      if (iceState === 'failed') {
-        clearInterval(timer)
-        reject(new Error('ICE 直连检查失败'))
-        return
-      }
-      if (Date.now() >= deadline) {
-        clearInterval(timer)
-        reject(new Error('ICE 直连检查超时'))
+        stopProbeIce(key)
+        reject(new Error(probe.error || '临时 ICE candidate 收集超时'))
       }
     }, 100)
   })
 }
 
-async function pingIce(remoteDescription) {
-  if (!setRemoteIce(remoteDescription)) return Promise.reject(new Error('对方尚未完成 ICE candidate'))
+function configureProbeIce(probeKey, remoteDescription) {
+  const probe = probeAgents.get(probeKey)
+  if (!probe || !remoteDescription) return false
+  try {
+    const normalized = String(remoteDescription).replace(/\r?\n/g, '\n').replace(/\n*$/, '\n')
+    probe.child.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
+    return true
+  } catch {
+    return false
+  }
+}
+
+function pingProbeIce(probeKey) {
+  const probe = probeAgents.get(probeKey)
+  if (!probe) return Promise.reject(new Error('直连探测已结束'))
   const nonceBase = Math.random().toString(36).slice(2, 12)
   return new Promise((resolve, reject) => {
-    const pending = { nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, attempt: 0 }
-    pendingIcePing = pending
+    const pending = { nonce: '', resolve, reject, attempt: 0 }
+    probe.pendingPing = pending
     const send = () => {
-      if (pendingIcePing !== pending || !iceProcess) return
+      if (probe.pendingPing !== pending || probe.child.killed) return
       pending.nonce = nonceBase + '-' + String(++pending.attempt)
-      try { iceProcess.stdin.write('PING ' + pending.nonce + '\n') } catch { /* timeout reports the failed probe */ }
+      try { probe.child.stdin.write('PING ' + pending.nonce + '\n') } catch {}
     }
     send()
-    pending.retryTimer = setInterval(send, 500)
-    pending.timeoutTimer = setTimeout(() => {
-      if (pendingIcePing !== pending) return
-      if (pending.retryTimer) clearInterval(pending.retryTimer)
-      pendingIcePing = null
-      reject(new Error(iceState === 'connected' || iceState === 'completed' ? '直连 Ping 超时' : 'ICE 直连检查超时'))
+    probe.retryTimer = setInterval(send, 500)
+    probe.timeoutTimer = setTimeout(() => {
+      if (probe.pendingPing !== pending) return
+      probe.pendingPing = null
+      if (probe.retryTimer) clearInterval(probe.retryTimer)
+      probe.retryTimer = null
+      reject(new Error(probe.state === 'connected' || probe.state === 'completed' ? '直连 Ping 超时' : 'ICE 直连检查超时'))
     }, 12000)
   })
 }
@@ -362,7 +450,7 @@ function windowsCommandArgument(value) {
   return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
 }
 
-function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, remoteIp }) {
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
@@ -372,15 +460,14 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, re
   lastLogPath = logPath
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
-  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort && remoteIp) {
-    args.push('--direct-peer-ip', String(remoteIp), '--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
+  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort) {
+    args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
   }
   return { helper, args, logPath }
 }
 
 function launchElevated(options) {
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
-  if (options?.remoteDescription) setRemoteIce(options.remoteDescription)
   const argumentList = args.map(windowsCommandArgument).join(' ')
   const script = `$process = Start-Process -FilePath ${powerShellLiteral(helper)} -ArgumentList ${powerShellLiteral(argumentList)} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $process.ExitCode`
   const encoded = Buffer.from(script, 'utf16le').toString('base64')
@@ -402,7 +489,7 @@ function launchElevated(options) {
   })
 }
 
-function launch({ gamePath, relay, room, logicalIp, token, remoteIp, remoteDescription }) {
+function launch({ gamePath, relay, room, logicalIp, token }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
@@ -422,8 +509,6 @@ function launch({ gamePath, relay, room, logicalIp, token, remoteIp, remoteDescr
   if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
-    if (remoteIp) environment.WEL_NOTAP_DIRECT_PEER_IP = String(remoteIp)
-    if (remoteDescription) setRemoteIce(remoteDescription)
   }
   const child = spawn(helper, ['--game', executable, '--hook', hook], {
     cwd: path.dirname(executable),
@@ -458,13 +543,6 @@ async function disconnect() {
   iceProcess = null
   iceState = 'waiting'
   iceLocalDescription = ''
-  if (pendingIcePing) {
-    const pending = pendingIcePing
-    pendingIcePing = null
-    if (pending.retryTimer) clearInterval(pending.retryTimer)
-    if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
-    pending.reject(new Error('已退出房间，直连探测已取消'))
-  }
   pendingRelayPing = null
   if (pendingRelayPeerPing) {
     const pending = pendingRelayPeerPing
@@ -474,9 +552,11 @@ async function disconnect() {
     pending.reject(new Error('已退出房间，中继玩家探测已取消'))
   }
   lastRemoteDescription = ''
+  activeGamePeerIp = ''
   lastLogPath = ''
   iceExitError = ''
   iceDiagnostics = []
+  for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)
   return { stopped: true }
 }
 
@@ -488,4 +568,20 @@ function pingHost(host) {
   }
 }
 
-module.exports = { configureIce: setRemoteIce, disconnect, launch, launchElevated, pingHost, status, transportStatus, prepareIce, pingIce, pingRelay, pingRelayPeer }
+module.exports = {
+  configureIce: setRemoteIce,
+  onGamePeer,
+  createProbeIce,
+  configureProbeIce,
+  pingProbeIce,
+  stopProbeIce,
+  disconnect,
+  launch,
+  launchElevated,
+  pingHost,
+  status,
+  transportStatus,
+  prepareIce,
+  pingRelay,
+  pingRelayPeer,
+}

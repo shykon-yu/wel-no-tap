@@ -17,6 +17,8 @@
 
 #define WEL_ICE_BUFFER_SIZE 8192
 #define WEL_ICE_CONTROL_PREFIX "WELICESTATE:"
+#define WEL_ICE_PEER_PREFIX "WELICEPEER:"
+#define WEL_GAME_PEER_PREFIX "WELGAMEPEER:"
 #define WEL_ICE_PING_PREFIX "WELICEPING:"
 #define WEL_ICE_PONG_PREFIX "WELICEPONG:"
 
@@ -63,6 +65,14 @@ static void output_line(const char *format, ...) {
 static void notify_hook(const char *state) {
 	char message[96];
 	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_CONTROL_PREFIX, state);
+	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
+	}
+}
+
+static void notify_hook_peer(const char *logical_ip) {
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_PEER_PREFIX, logical_ip);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
@@ -139,6 +149,16 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 		int received = recvfrom(g_local_socket, buffer, sizeof(buffer), 0, (struct sockaddr *)&source, &source_length);
 		if (received == 12 && memcmp(buffer, "WELICESTATE?", 12) == 0) {
 			notify_hook(InterlockedCompareExchange(&g_connected, 0, 0) != 0 ? "connected" : "connecting");
+		} else if (received > (int)strlen(WEL_GAME_PEER_PREFIX) &&
+			memcmp(buffer, WEL_GAME_PEER_PREFIX, strlen(WEL_GAME_PEER_PREFIX)) == 0) {
+			char peer[INET_ADDRSTRLEN];
+			int peer_length = received - (int)strlen(WEL_GAME_PEER_PREFIX);
+			uint32_t peer_ip;
+			if (peer_length > 0 && peer_length < (int)sizeof(peer)) {
+				memcpy(peer, buffer + strlen(WEL_GAME_PEER_PREFIX), (size_t)peer_length);
+				peer[peer_length] = '\0';
+				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %s", peer);
+			}
 		} else if (received > 0 && InterlockedCompareExchange(&g_connected, 0, 0) != 0) {
 			juice_send(g_agent, buffer, (size_t)received);
 		}
@@ -406,6 +426,14 @@ int main(int argc, char **argv) {
 			}
 		} else if (strncmp(command, "PING ", 5) == 0 && command[5] != '\0') {
 			send_ping(command + 5);
+		} else if (strncmp(command, "TARGET ", 7) == 0 && command[7] != '\0') {
+			uint32_t peer_ip;
+			if (InetPtonA(AF_INET, command + 7, &peer_ip) == 1) {
+				notify_hook_peer(command + 7);
+				output_line("TARGET_SET %s", command + 7);
+			} else {
+				output_line("ERROR target");
+			}
 		} else if (strncmp(command, "PING_RELAY_PEER ", 16) == 0 && command[16] != '\0') {
 			char *space = strchr(command + 16, ' ');
 			if (space != NULL && space[1] != '\0') {

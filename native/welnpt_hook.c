@@ -17,6 +17,8 @@
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
+#define WELNPT_ICE_PEER_PREFIX "WELICEPEER:"
+#define WELNPT_GAME_PEER_PREFIX "WELGAMEPEER:"
 
 typedef SOCKET (WSAAPI *wel_socket_fn)(int, int, int);
 typedef SOCKET (WSAAPI *wel_wsasocketa_fn)(int, int, int, LPWSAPROTOCOL_INFOA, GROUP, DWORD);
@@ -76,6 +78,8 @@ static wel_recvfrom_fn g_real_recvfrom;
 static wel_wsasendto_fn g_real_wsasendto;
 static wel_wsarecvfrom_fn g_real_wsarecvfrom;
 static wel_closesocket_fn g_real_closesocket;
+
+static void report_game_peer(uint32_t target_ip);
 
 static void log_line(const char *format, ...) {
     char message[768];
@@ -238,6 +242,13 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
 		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
+	/* WE8's confirmed join request is a 64-byte datagram to host port 5739.
+	   Search uses 24-byte broadcast and 136-byte reply, so it must not choose
+	   a direct game peer. */
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && payload_length == 64 &&
+		ntohs(header->target_port) == 5739 && g_direct_peer_ip == 0) {
+		report_game_peer(header->source_ip);
+	}
 	if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
 		log_line("\"api\":\"transport-drop\",\"path\":\"%s\",\"targetPort\":%u,\"length\":%d",
 			path, (unsigned)ntohs(header->target_port), payload_length);
@@ -257,6 +268,19 @@ static int send_register_packet(void) {
     if (!welnpt_auth_sign(&g_auth, (char *)&header, sizeof(header))) return SOCKET_ERROR;
     return g_real_sendto(g_transport, (const char *)&header, sizeof(header), 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+}
+
+static void report_game_peer(uint32_t target_ip) {
+    char target[INET_ADDRSTRLEN];
+    char message[96];
+    int length;
+    if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || target_ip == 0) return;
+    if (InetNtopA(AF_INET, &target_ip, target, sizeof(target)) == NULL) return;
+    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WELNPT_GAME_PEER_PREFIX, target);
+    if (length <= 0) return;
+    g_real_sendto(g_direct_transport, message, length, 0,
+        (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
+    log_line("\"api\":\"direct-target\",\"target\":\"%s\"", target);
 }
 
 static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
@@ -291,6 +315,12 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
         WSASetLastError(WSAEACCES);
         return SOCKET_ERROR;
     }
+	/* The 64-byte join request selects the opponent. Search traffic is never
+	   considered a match target, even in a crowded room. */
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && length == 64 &&
+		ntohs(target->sin_port) == 5739 && g_direct_peer_ip == 0) {
+		report_game_peer(header->target_ip);
+	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && g_direct_transport != INVALID_SOCKET &&
         header->target_ip == g_direct_peer_ip && InterlockedCompareExchange(&g_direct_connected, 0, 0) != 0) {
         sent = g_real_sendto(g_direct_transport, packet, (int)sizeof(*header) + length, 0,
@@ -653,6 +683,21 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"", received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
             continue;
         }
+		if (received > (int)strlen(WELNPT_ICE_PEER_PREFIX) &&
+			memcmp(packet, WELNPT_ICE_PEER_PREFIX, strlen(WELNPT_ICE_PEER_PREFIX)) == 0) {
+			const char *peer = packet + strlen(WELNPT_ICE_PEER_PREFIX);
+			char peer_text[INET_ADDRSTRLEN];
+			int peer_length = received - (int)strlen(WELNPT_ICE_PEER_PREFIX);
+			if (peer_length > 0 && peer_length < (int)sizeof(peer_text)) {
+				CopyMemory(peer_text, peer, (size_t)peer_length);
+				peer_text[peer_length] = '\0';
+			}
+			if (peer_length > 0 && peer_length < (int)sizeof(peer_text) &&
+				InetPtonA(AF_INET, peer_text, &g_direct_peer_ip) == 1) {
+				log_line("\"api\":\"direct-peer\",\"target\":\"%s\"", peer_text);
+			}
+			continue;
+		}
         handle_transport_packet(packet, received, "direct");
     }
     return 0;
@@ -703,18 +748,19 @@ static int load_configuration(void) {
     CopyMemory(&g_relay_address, addresses->ai_addr, sizeof(g_relay_address));
     freeaddrinfo(addresses);
 
-    if (GetEnvironmentVariableA("WEL_NOTAP_DIRECT_PEER_IP", direct_peer_ip, sizeof(direct_peer_ip)) > 0 &&
-        GetEnvironmentVariableA("WEL_NOTAP_DIRECT_AGENT_PORT", direct_agent_port, sizeof(direct_agent_port)) > 0 &&
+    if (GetEnvironmentVariableA("WEL_NOTAP_DIRECT_AGENT_PORT", direct_agent_port, sizeof(direct_agent_port)) > 0 &&
         GetEnvironmentVariableA("WEL_NOTAP_DIRECT_HOOK_PORT", direct_hook_port, sizeof(direct_hook_port)) > 0) {
         unsigned long agent_port = strtoul(direct_agent_port, NULL, 10);
         unsigned long hook_port = strtoul(direct_hook_port, NULL, 10);
-        if (agent_port > 0 && agent_port <= 65535 && hook_port > 0 && hook_port <= 65535 &&
-            InetPtonA(AF_INET, direct_peer_ip, &g_direct_peer_ip) == 1) {
+        if (agent_port > 0 && agent_port <= 65535 && hook_port > 0 && hook_port <= 65535) {
             ZeroMemory(&g_direct_agent_address, sizeof(g_direct_agent_address));
             g_direct_agent_address.sin_family = AF_INET;
             g_direct_agent_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
             g_direct_agent_address.sin_port = htons((u_short)agent_port);
             g_direct_hook_port = (unsigned short)hook_port;
+			if (GetEnvironmentVariableA("WEL_NOTAP_DIRECT_PEER_IP", direct_peer_ip, sizeof(direct_peer_ip)) > 0) {
+				InetPtonA(AF_INET, direct_peer_ip, &g_direct_peer_ip);
+			}
         } else {
             g_direct_peer_ip = 0;
         }
@@ -762,7 +808,7 @@ static int initialize_hook(void) {
     local_address.sin_port = 0;
     if (g_real_bind(g_transport, (const struct sockaddr *)&local_address, sizeof(local_address)) == SOCKET_ERROR) return 0;
     setsockopt(g_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-	if (g_direct_peer_ip != 0 && g_direct_hook_port != 0) {
+	if (g_direct_agent_address.sin_port != 0 && g_direct_hook_port != 0) {
 		g_direct_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if (g_direct_transport != INVALID_SOCKET) {
 			ZeroMemory(&direct_address, sizeof(direct_address));

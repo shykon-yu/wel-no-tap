@@ -13,6 +13,7 @@ export type RuntimeConfig = {
   apiRoomHeartbeatPath: string
   apiRoomLeavePath: string
   apiRoomIcePath: string
+  apiRoomPeerProbesPath: string
   configFile?: string | null
 }
 
@@ -31,6 +32,7 @@ const fallback: RuntimeConfig = {
   apiRoomHeartbeatPath: '/notap/rooms/{roomId}/heartbeat',
   apiRoomLeavePath: '/notap/rooms/{roomId}/leave',
   apiRoomIcePath: '/notap/rooms/{roomId}/ice',
+  apiRoomPeerProbesPath: '/notap/rooms/{roomId}/peer-probes',
 }
 
 export const runtimeConfig: RuntimeConfig = { ...fallback, ...(window.welNoTapConfig ?? {}) }

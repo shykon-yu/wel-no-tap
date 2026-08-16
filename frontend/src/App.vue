@@ -52,6 +52,10 @@ let signingOut = false
 let leaseEpoch = 0
 let platformExitInProgress = false
 let removeBeforeQuitListener: (() => void) | undefined
+let removeGamePeerListener: (() => void) | undefined
+const incomingProbeIds = new Set<number>()
+const activeProbeKeys = new Set<string>()
+const gamePeerAttempts = new Map<string, number>()
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -100,6 +104,8 @@ function clearRoomSessionState() {
   selectedMemberId.value = null
   warningMessage.value = ''
   gameTransportSummary.value = '尚未启动游戏'
+  incomingProbeIds.clear()
+  gamePeerAttempts.clear()
 }
 
 function stopTransportStatusMonitor() {
@@ -124,10 +130,7 @@ async function loadRoomMembers() {
     const result = await roomApi.members(lease.room_id)
     if (activeLease.value?.room_id === lease.room_id) {
       roomMembers.value = result.members
-      const remoteCandidates = result.members.filter(member => !member.is_self && member.ice_description)
-      if (remoteCandidates.length === 1 && desktop()?.configureIce) {
-        try { await desktop()!.configureIce(remoteCandidates[0].ice_description!) } catch { /* Ping reports connectivity failures */ }
-      }
+      void answerIncomingPeerProbes(lease)
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) await forceSignedOut(error.message)
@@ -302,6 +305,7 @@ async function releaseActiveLease() {
   stopRoomMembersMonitor()
   let cleanupError: unknown
   try { await desktop()?.disconnect() } catch (error) { cleanupError = error }
+  activeProbeKeys.clear()
   try {
     await roomApi.leave(lease.room_id)
   } catch (error) {
@@ -368,8 +372,6 @@ async function launchGame() {
       room: activeLease.value.community,
       logicalIp: activeLease.value.logical_ip || activeLease.value.virtual_ip,
       token: activeLease.value.relay_token,
-      remoteIp: roomMembers.value.find(member => !member.is_self && member.ice_description)?.virtual_ip,
-      remoteDescription: roomMembers.value.find(member => !member.is_self && member.ice_description)?.ice_description,
     })
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
@@ -392,7 +394,7 @@ async function pingMember(member: RoomMember) {
       summary: '正在探测中继服务器、中继玩家与直连...',
       relayServer: { reachable: false, summary: '探测中...' },
       relayPeer: { reachable: false, summary: '探测中...' },
-      direct: { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' },
+      direct: { reachable: false, summary: '正在建立玩家专属直连探测...' },
     },
   }
   try {
@@ -405,45 +407,37 @@ async function pingMember(member: RoomMember) {
         .catch(() => ({ reachable: false, summary: '中继玩家探测超时' }))
       : Promise.resolve({ reachable: false, summary: member.virtual_ip ? '中继玩家探测不可用' : '对方逻辑 IP 未知' })
     const directPromise = (async () => {
-      let directResult = { reachable: false, summary: member.ice_description ? 'P2P 直连探测中...' : '对方尚未完成 candidate' }
-      if (!member.ice_description || !desktop()?.pingIce) return directResult
-      let localCandidateReady = true
       const lease = activeLease.value
-      if (lease && desktop()?.prepareIce) {
-        try {
-          const ice = await desktop()!.prepareIce({
-            stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
-            relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
-            logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
-          })
-          await roomApi.publishIce(lease.room_id, ice.localDescription)
-          directCandidateStatus.value = 'ready'
-          directCandidateMessage.value = summarizeCandidates(ice.localDescription)
-        } catch {
-          localCandidateReady = false
-          directCandidateStatus.value = 'relay-only'
-          directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
-          directResult = { reachable: false, summary: '本机直连候选收集超时' }
-        }
-      }
-      if (localCandidateReady) {
-        try {
-          directResult = { reachable: true, summary: `直连 ${await desktop()!.pingIce(member.ice_description)} ms` }
-        } catch (error) {
-          const message = messageOf(error)
-          directResult = {
-            reachable: false,
-            summary: message.includes('ICE 直连检查超时')
+      if (!lease || member.is_self || !desktop()?.createProbeIce) return { reachable: false, summary: member.is_self ? '不能探测自己' : '直连探测不可用' }
+      let probeKey = ''
+      try {
+        const local = await desktop()!.createProbeIce({ stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port })
+        probeKey = local.probeKey
+        activeProbeKeys.add(probeKey)
+        const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, local.localDescription)
+        const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id)
+        if (!answered.target_description) throw new Error('目标玩家未返回直连 candidate')
+        if (!await desktop()!.configureProbeIce(probeKey, answered.target_description)) throw new Error('临时 ICE 配置失败')
+        const milliseconds = await desktop()!.pingProbeIce(probeKey)
+        return { reachable: true, summary: `直连 ${milliseconds} ms` }
+      } catch (error) {
+        const message = messageOf(error)
+        return {
+          reachable: false,
+          summary: message.includes('直连探测应答超时')
+            ? '对方客户端未响应直连探测'
+            : message.includes('ICE 直连检查超时')
               ? 'ICE 直连检查超时'
-              : message.includes('ICE 直连检查失败')
-                ? 'ICE 直连检查失败'
-                : message.includes('直连探测超时')
-                  ? '直连 Ping 超时'
-                  : '直连不可用',
-          }
+              : message.includes('直连 Ping 超时')
+                ? '直连 Ping 超时'
+                : '直连不可用',
+        }
+      } finally {
+        if (probeKey) {
+          try { await desktop()!.stopProbeIce(probeKey) } catch {}
+          activeProbeKeys.delete(probeKey)
         }
       }
-      return directResult
     })()
     const [relayServerResult, relayPeerResult, directResult] = await Promise.all([relayServerPromise, relayPeerPromise, directPromise])
     pingResults.value = {
@@ -469,6 +463,72 @@ async function pingMember(member: RoomMember) {
         direct: { reachable: false, summary: '直连不可用' },
       },
     }
+  }
+}
+
+async function waitForPeerProbeAnswer(roomID: number, probeID: number) {
+  const deadline = Date.now() + 18000
+  while (Date.now() < deadline) {
+    const result = await roomApi.peerProbe(roomID, probeID)
+    if (result.probe.target_description) return result.probe
+    await new Promise(resolve => window.setTimeout(resolve, 400))
+  }
+  throw new Error('直连探测应答超时')
+}
+
+async function answerIncomingPeerProbes(lease: Lease) {
+  if (!desktop()?.createProbeIce || activeLease.value?.room_id !== lease.room_id) return
+  let probes
+  try { probes = (await roomApi.incomingPeerProbes(lease.room_id)).probes } catch { return }
+  for (const probe of probes) {
+    if (incomingProbeIds.has(probe.id) || !probe.requester_description) continue
+    incomingProbeIds.add(probe.id)
+    void (async () => {
+      let probeKey = ''
+      try {
+        const local = await desktop()!.createProbeIce({ stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port })
+        probeKey = local.probeKey
+        activeProbeKeys.add(probeKey)
+        if (!await desktop()!.configureProbeIce(probeKey, probe.requester_description!)) throw new Error('临时 ICE 配置失败')
+        await roomApi.answerPeerProbe(lease.room_id, probe.id, local.localDescription)
+        window.setTimeout(() => {
+          void desktop()?.stopProbeIce(probeKey)
+          activeProbeKeys.delete(probeKey)
+        }, 25000)
+      } catch {
+        if (probeKey) {
+          try { await desktop()!.stopProbeIce(probeKey) } catch {}
+          activeProbeKeys.delete(probeKey)
+        }
+        incomingProbeIds.delete(probe.id)
+      }
+    })()
+  }
+}
+
+async function configureGamePeer(logicalIp: string) {
+  const lease = activeLease.value
+  if (!lease || !desktop()?.configureIce) return
+  const previousAttempt = gamePeerAttempts.get(logicalIp) || 0
+  if (Date.now() - previousAttempt < 1000) return
+  gamePeerAttempts.set(logicalIp, Date.now())
+  try {
+    const result = await roomApi.members(lease.room_id)
+    if (activeLease.value?.room_id !== lease.room_id) return
+    roomMembers.value = result.members
+    const member = result.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
+    if (!member?.ice_description) {
+      gameTransportSummary.value = member ? `已识别对手 ${member.nickname}，等待其直连候选` : '正在确认比赛对手，当前使用云中继'
+      return
+    }
+    const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription: member.ice_description })
+    if (!configured) {
+      warningMessage.value = '比赛直连通道已锁定其他玩家，本场继续使用云中继'
+      return
+    }
+    gameTransportSummary.value = `已锁定对手 ${member.nickname}，正在建立 P2P 直连`
+  } catch {
+    gameTransportSummary.value = '对手识别暂时失败，当前使用云中继'
   }
 }
 
@@ -527,6 +587,7 @@ function summarizeCandidates(description: string) {
 
 onMounted(() => {
   removeBeforeQuitListener = desktop()?.onBeforeQuit?.(() => { void handlePlatformExit() })
+  removeGamePeerListener = desktop()?.onGamePeer?.((logicalIp) => { void configureGamePeer(logicalIp) })
   void restoreSession()
 })
 onBeforeUnmount(() => {
@@ -535,6 +596,7 @@ onBeforeUnmount(() => {
   stopRoomMembersMonitor()
   stopTransportStatusMonitor()
   removeBeforeQuitListener?.()
+  removeGamePeerListener?.()
 })
 </script>
 
@@ -605,7 +667,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <footer class="member-modal-footer">
-              <button class="secondary-button" :disabled="!selectedMember.virtual_ip || !desktop()" @click="pingMember(selectedMember)">Ping</button>
+              <button class="secondary-button" :disabled="selectedMember.is_self || !selectedMember.virtual_ip || !desktop()" @click="pingMember(selectedMember)">Ping</button>
               <button class="primary-button" @click="closeMemberDetail">关闭</button>
             </footer>
           </section>

@@ -198,10 +198,12 @@ int wmain(int argc, wchar_t **argv) {
     SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path);
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
-    if (options.direct_peer_ip != NULL && options.direct_agent_port != NULL && options.direct_hook_port != NULL) {
-        SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_PEER_IP", options.direct_peer_ip);
+    if (options.direct_agent_port != NULL && options.direct_hook_port != NULL) {
         SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_AGENT_PORT", options.direct_agent_port);
         SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_HOOK_PORT", options.direct_hook_port);
+        if (options.direct_peer_ip != NULL) {
+            SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_PEER_IP", options.direct_peer_ip);
+        }
     }
 
     command_line = quoted_command_line(game);

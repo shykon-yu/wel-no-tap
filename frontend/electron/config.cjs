@@ -15,6 +15,7 @@ const defaults = {
   WEL_API_ROOM_HEARTBEAT_PATH: '/notap/rooms/{roomId}/heartbeat',
   WEL_API_ROOM_LEAVE_PATH: '/notap/rooms/{roomId}/leave',
   WEL_API_ROOM_ICE_PATH: '/notap/rooms/{roomId}/ice',
+  WEL_API_ROOM_PEER_PROBES_PATH: '/notap/rooms/{roomId}/peer-probes',
   WEL_GAME_NAME: 'WE8',
 }
 
@@ -76,6 +77,7 @@ function publicConfig() {
     apiRoomHeartbeatPath: values.WEL_API_ROOM_HEARTBEAT_PATH,
     apiRoomLeavePath: values.WEL_API_ROOM_LEAVE_PATH,
     apiRoomIcePath: values.WEL_API_ROOM_ICE_PATH,
+    apiRoomPeerProbesPath: values.WEL_API_ROOM_PEER_PROBES_PATH,
     configFile: filePath,
   }
 }
