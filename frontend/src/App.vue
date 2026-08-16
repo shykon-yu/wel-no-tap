@@ -43,7 +43,7 @@ const gamePathLabel = computed(() => gamePath.value.trim() || `未选择 ${runti
 const desktop = () => window.welNoTapDesktop
 const heartbeatIntervalMs = 5 * 60 * 1000
 const sessionCheckIntervalMs = 30 * 1000
-const roomMembersIntervalMs = 15 * 1000
+const roomMembersIntervalMs = 3 * 1000
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let roomMembersTimer: number | undefined
@@ -124,6 +124,10 @@ async function loadRoomMembers() {
     const result = await roomApi.members(lease.room_id)
     if (activeLease.value?.room_id === lease.room_id) {
       roomMembers.value = result.members
+      const remoteCandidates = result.members.filter(member => !member.is_self && member.ice_description)
+      if (remoteCandidates.length === 1 && desktop()?.configureIce) {
+        try { await desktop()!.configureIce(remoteCandidates[0].ice_description!) } catch { /* Ping reports connectivity failures */ }
+      }
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) await forceSignedOut(error.message)
