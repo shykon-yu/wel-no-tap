@@ -59,10 +59,14 @@ let removeBeforeQuitListener: (() => void) | undefined
 let removeGamePeerListener: (() => void) | undefined
 const incomingProbeIds = new Set<number>()
 const activeProbeKeys = new Set<string>()
-const gamePeerTasks = new Map<string, Promise<void>>()
+const gamePeerTasks = new Map<string, Promise<boolean>>()
+const gamePeerTransactions = new Set<string>()
 const pingingMemberIds = ref<Set<number>>(new Set())
 let peerProbePollInFlight = false
 let activeIncomingProbeAgents = 0
+let activeGamePeerIp = ''
+let activeGamePeerTransaction = ''
+let gamePeerEpoch = 0
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -122,6 +126,10 @@ function clearRoomSessionState() {
   peerProbePollInFlight = false
   pingingMemberIds.value = new Set()
   gamePeerTasks.clear()
+  gamePeerTransactions.clear()
+  activeGamePeerIp = ''
+  activeGamePeerTransaction = ''
+  gamePeerEpoch = 0
 }
 
 function stopTransportStatusMonitor() {
@@ -392,6 +400,10 @@ async function launchGame() {
   if (!desktop()) { notice.value = '浏览器预览不会启动本机程序，请在 Windows 客户端测试'; return }
   loading.value = true
   try {
+    gamePeerTasks.clear()
+    gamePeerTransactions.clear()
+    activeGamePeerIp = ''
+    activeGamePeerTransaction = ''
     const firewall = await desktop()!.ensureFirewall({})
     if (firewall.warning) warningMessage.value = firewall.warning
     const result = await desktop()!.launchGame({
@@ -560,42 +572,78 @@ async function answerIncomingPeerProbes(lease: Lease) {
   }
 }
 
-async function configureGamePeerOnce(logicalIp: string) {
+function setGameTransportSummary(message: string) {
+  if (gameTransportSummary.value !== message) gameTransportSummary.value = message
+}
+
+async function configureGamePeerOnce(logicalIp: string, transactionKey: string, epoch: number) {
   const lease = activeLease.value
-  if (!lease || !desktop()?.configureIce) return
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  if (!lease || !desktop()?.configureIce || !desktop()?.resetIce) return false
+  let previousDescription = ''
+  try {
+    const current = await roomApi.members(lease.room_id)
+    const member = current.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
+    previousDescription = member?.ice_description || ''
+    roomMembers.value = current.members
+  } catch {}
+  const needsFreshAgent = activeGamePeerIp !== '' && activeGamePeerTransaction !== transactionKey
+  if (needsFreshAgent) {
+    try {
+      const ice = await desktop()!.resetIce()
+      if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+      await roomApi.publishIce(lease.room_id, ice.localDescription)
+    } catch {
+      setGameTransportSummary('正在重建本场直连通道，当前使用云中继')
+      return false
+    }
+  }
+  for (let attempt = 0; attempt < 24; attempt += 1) {
     try {
       const result = await roomApi.members(lease.room_id)
-      if (activeLease.value?.room_id !== lease.room_id) return
+      if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
       roomMembers.value = result.members
       const member = result.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
       if (member?.ice_description) {
+        // Both peers rebuild on a new match. Prefer the opponent's refreshed
+        // candidate instead of pairing a fresh local agent with its old match.
+        if (needsFreshAgent && member.ice_description === previousDescription && attempt < 12) {
+          await new Promise(resolve => window.setTimeout(resolve, 500))
+          continue
+        }
         const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription: member.ice_description })
         if (!configured) {
-          warningMessage.value = '比赛直连通道已锁定其他玩家，本场继续使用云中继'
-          return
+          setGameTransportSummary('本场直连协商未完成，当前使用云中继')
+          return false
         }
-        gameTransportSummary.value = `已锁定对手 ${member.nickname}，正在建立 P2P 直连`
-        return
+        activeGamePeerIp = member.virtual_ip
+        activeGamePeerTransaction = transactionKey
+        setGameTransportSummary(`已锁定对手 ${member.nickname}，正在建立 P2P 直连`)
+        return true
       }
-      gameTransportSummary.value = member ? `已识别对手 ${member.nickname}，等待其直连候选` : '正在确认比赛对手，当前使用云中继'
+      setGameTransportSummary(member ? `已识别对手 ${member.nickname}，等待其本场直连候选` : '正在确认比赛对手，当前使用云中继')
     } catch {
-      gameTransportSummary.value = '正在确认比赛对手，当前使用云中继'
+      setGameTransportSummary('正在确认比赛对手，当前使用云中继')
     }
     await new Promise(resolve => window.setTimeout(resolve, 500))
   }
-  gameTransportSummary.value = '对手直连候选未及时到达，当前使用云中继'
+  setGameTransportSummary('对手本场直连候选未及时到达，当前使用云中继')
+  return false
 }
 
-function configureGamePeer(logicalIp: string) {
-  const normalizedIp = String(logicalIp || '').trim()
-  if (!normalizedIp || gamePeerTasks.has(normalizedIp)) return
-  const task = configureGamePeerOnce(normalizedIp)
-  gamePeerTasks.set(normalizedIp, task)
-  void task.then(() => {
-    if (gamePeerTasks.get(normalizedIp) === task) gamePeerTasks.delete(normalizedIp)
+function configureGamePeer(event: { logicalIp: string; transactionKey: string }) {
+  const normalizedIp = String(event?.logicalIp || '').trim()
+  const transactionKey = String(event?.transactionKey || normalizedIp).trim()
+  if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
+  gamePeerTransactions.add(transactionKey)
+  const epoch = ++gamePeerEpoch
+  const task = configureGamePeerOnce(normalizedIp, transactionKey, epoch)
+  gamePeerTasks.set(transactionKey, task)
+  void task.then((configured) => {
+    if (gamePeerTasks.get(transactionKey) === task) gamePeerTasks.delete(transactionKey)
+    if (!configured) gamePeerTransactions.delete(transactionKey)
   }, () => {
-    if (gamePeerTasks.get(normalizedIp) === task) gamePeerTasks.delete(normalizedIp)
+    if (gamePeerTasks.get(transactionKey) === task) gamePeerTasks.delete(transactionKey)
+    gamePeerTransactions.delete(transactionKey)
   })
 }
 

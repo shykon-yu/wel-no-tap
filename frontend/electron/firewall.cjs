@@ -1,4 +1,5 @@
 const { spawn } = require('node:child_process')
+const fs = require('node:fs')
 const path = require('node:path')
 
 const RULE_PREFIX = 'WEL No-TAP'
@@ -69,7 +70,11 @@ function runNetsh(args, timeoutMs = 15000) {
 }
 
 function normalizeProgram(value) {
-  const program = String(value || '').trim().replace(/^"(.*)"$/, '$1')
+  let program = String(value || '').trim().replace(/^"(.*)"$/, '$1')
+  program = program.replace(/%([^%]+)%/g, (_match, name) => process.env[name] || `%${name}%`)
+  try {
+    if (process.platform === 'win32' && fs.existsSync(program)) program = fs.realpathSync.native(program)
+  } catch {}
   return path.normalize(program).replace(/[\\/]+$/, '').toLowerCase()
 }
 
@@ -165,21 +170,32 @@ async function inspectFirewall(options = {}) {
 }
 
 function applyScript(specs) {
-  const cleanup = [...new Set([...LEGACY_RULE_NAMES, ...specs.map((spec) => spec.name)])]
-    .map((name) => {
-      const args = ['advfirewall', 'firewall', 'delete', 'rule', `name=${name}`].map(psLiteral).join(' ')
-      return `& $netsh ${args} | Out-Null`
-    }).join('\n')
   const lines = specs.map((spec) => {
-    const args = [
-      'advfirewall', 'firewall', 'add', 'rule',
-      `name=${spec.name}`, `dir=${spec.direction}`, 'action=allow',
-      `program=${spec.program}`, 'enable=yes', 'profile=any', 'protocol=UDP',
-    ]
-    const literalArgs = args.map(psLiteral).join(' ')
-    return `& $netsh ${literalArgs}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`
+    const setArgs = [
+      'advfirewall', 'firewall', 'set', 'rule', `name=${spec.name}`, `dir=${spec.direction}`,
+      'new', 'action=allow', `program=${spec.program}`, 'enable=yes', 'profile=any', 'protocol=UDP',
+    ].map(psLiteral).join(' ')
+    const addArgs = [
+      'advfirewall', 'firewall', 'add', 'rule', `name=${spec.name}`, `dir=${spec.direction}`,
+      'action=allow', `program=${spec.program}`, 'enable=yes', 'profile=any', 'protocol=UDP',
+    ].map(psLiteral).join(' ')
+    return `& $netsh ${setArgs}\nif ($LASTEXITCODE -ne 0) { & $netsh ${addArgs}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }`
   }).join('\n')
-  return `$netsh = Join-Path $env:SystemRoot 'System32\\netsh.exe'\n${cleanup}\n${lines}`
+  return `$netsh = Join-Path $env:SystemRoot 'System32\\netsh.exe'\n${lines}`
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function inspectAfterPropagation(options) {
+  let result = await inspectFirewall(options)
+  for (const milliseconds of [300, 700, 1500, 2500]) {
+    if (result.state === 'ready') return result
+    await delay(milliseconds)
+    result = await inspectFirewall(options)
+  }
+  return result
 }
 
 async function trySilentFirewall(options = {}) {
@@ -188,8 +204,9 @@ async function trySilentFirewall(options = {}) {
   if (!specs.length) return inspectFirewall(options)
   const before = await inspectFirewall(options)
   if (before.state === 'ready' || before.blockers.length) return before
-  await runPowerShell(applyScript(specs), { timeoutMs: 15000 })
-  return inspectFirewall(options)
+  const applied = await runPowerShell(applyScript(specs), { timeoutMs: 15000 })
+  const after = await inspectAfterPropagation(options)
+  return applied.code === 0 ? after : { ...after, applyCode: applied.code }
 }
 
 async function applyElevatedFirewall(options = {}) {
@@ -197,7 +214,7 @@ async function applyElevatedFirewall(options = {}) {
   const specs = ruleSpecs(options)
   if (!specs.length) return inspectFirewall(options)
   const result = await runPowerShell(applyScript(specs), { elevated: true, timeoutMs: 60000 })
-  const checked = await inspectFirewall(options)
+  const checked = await inspectAfterPropagation(options)
   if (checked.state === 'ready') return checked
   return { ...checked, elevatedCode: result.code, elevatedOutput: result.output.slice(-1000) }
 }

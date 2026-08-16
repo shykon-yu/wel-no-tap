@@ -78,6 +78,14 @@ static void notify_hook_peer(const char *logical_ip) {
 	}
 }
 
+static void notify_hook_agent(unsigned short port) {
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%u", (unsigned)port);
+	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
+	}
+}
+
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
 	const char *name = juice_state_to_string(state);
 	(void)agent;
@@ -154,10 +162,13 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 			char peer[INET_ADDRSTRLEN];
 			int peer_length = received - (int)strlen(WEL_GAME_PEER_PREFIX);
 			uint32_t peer_ip;
-			if (peer_length > 0 && peer_length < (int)sizeof(peer)) {
-				memcpy(peer, buffer + strlen(WEL_GAME_PEER_PREFIX), (size_t)peer_length);
-				peer[peer_length] = '\0';
-				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %s", peer);
+			const char *payload = buffer + strlen(WEL_GAME_PEER_PREFIX);
+			const char *separator = memchr(payload, '|', (size_t)peer_length);
+			int ip_length = separator == NULL ? peer_length : (int)(separator - payload);
+			if (ip_length > 0 && ip_length < (int)sizeof(peer)) {
+				memcpy(peer, payload, (size_t)ip_length);
+				peer[ip_length] = '\0';
+				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %.*s", peer_length, payload);
 			}
 		} else if (received > 0 && InterlockedCompareExchange(&g_connected, 0, 0) != 0) {
 			juice_send(g_agent, buffer, (size_t)received);
@@ -396,6 +407,8 @@ int main(int argc, char **argv) {
 	g_hook_address.sin_family = AF_INET;
 	g_hook_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
 	g_hook_address.sin_port = htons(hook_port);
+	notify_hook_agent(ntohs(local_address.sin_port));
+	notify_hook("connecting");
 
 	ZeroMemory(&config, sizeof(config));
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;

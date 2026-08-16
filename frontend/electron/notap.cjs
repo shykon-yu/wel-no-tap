@@ -22,6 +22,7 @@ let pendingRelayPeerPing = null
 let lastRemoteDescription = ''
 let lastLogPath = ''
 let activeGamePeerIp = ''
+let iceOptions = null
 const gamePeerListeners = new Set()
 const probeAgents = new Map()
 
@@ -152,10 +153,11 @@ function handleIceLine(rawLine) {
   if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; return }
   if (line.startsWith('STATE ')) { iceState = line.slice(6) || 'unknown'; return }
   if (line.startsWith('GAME_PEER ')) {
-    const logicalIp = line.slice(10).trim()
-    if (logicalIp) {
+    const payload = line.slice(10).trim()
+    const [logicalIp, sourcePort = '', targetPort = ''] = payload.split('|')
+    if (logicalIp && /^\d{1,5}$/.test(sourcePort) && /^\d{1,5}$/.test(targetPort)) {
       for (const listener of gamePeerListeners) {
-        try { listener(logicalIp) } catch {}
+        try { listener({ logicalIp, transactionKey: `${logicalIp}|${sourcePort}|${targetPort}` }) } catch {}
       }
     }
     return
@@ -189,11 +191,12 @@ function handleIceLine(rawLine) {
   }
 }
 
-function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
+function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
   if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
-  iceHookPort = chooseHookPort()
+  iceHookPort = Number(hookPort) || chooseHookPort()
+  iceOptions = { stunHost, stunPort, relay, room, logicalIp, token }
   iceLocalDescription = ''
   iceAgentPort = 0
   iceState = 'gathering'
@@ -240,6 +243,21 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token }) {
 
 async function prepareIce(options) {
   await startIceAgent(options || {})
+  return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
+}
+
+async function resetIce() {
+  if (!iceOptions) throw new Error('直连组件尚未准备')
+  const previous = iceProcess
+  iceProcess = null
+  if (previous && !previous.killed) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => { try { previous.kill() } catch {}; resolve() }, 1500)
+      previous.once('close', () => { clearTimeout(timer); resolve() })
+      try { previous.stdin.write('EXIT\n') } catch { try { previous.kill() } catch {} }
+    })
+  }
+  await startIceAgent({ ...iceOptions, hookPort: iceHookPort })
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 
@@ -631,6 +649,7 @@ module.exports = {
   status,
   transportStatus,
   prepareIce,
+  resetIce,
   pingRelay,
   pingRelayPeer,
 }

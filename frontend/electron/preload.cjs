@@ -18,13 +18,14 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   completeQuit: () => ipcRenderer.invoke('platform-complete-quit'),
   pingHost: (host) => ipcRenderer.invoke('notap-ping', host),
   prepareIce: (options) => ipcRenderer.invoke('notap-prepare-ice', options),
+  resetIce: () => ipcRenderer.invoke('notap-reset-ice'),
   configureIce: (options) => ipcRenderer.invoke('notap-configure-ice', options),
   createProbeIce: (options) => ipcRenderer.invoke('notap-create-probe-ice', options),
   configureProbeIce: (probeKey, remoteDescription) => ipcRenderer.invoke('notap-configure-probe-ice', probeKey, remoteDescription),
   pingProbeIce: (probeKey) => ipcRenderer.invoke('notap-ping-probe-ice', probeKey),
   stopProbeIce: (probeKey) => ipcRenderer.invoke('notap-stop-probe-ice', probeKey),
   onGamePeer: (callback) => {
-    const listener = (_event, logicalIp) => callback(logicalIp)
+    const listener = (_event, gamePeer) => callback(gamePeer)
     ipcRenderer.on('notap-game-peer', listener)
     return () => ipcRenderer.removeListener('notap-game-peer', listener)
   },

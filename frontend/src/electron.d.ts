@@ -41,12 +41,13 @@ declare global {
       completeQuit: () => Promise<void>
       pingHost: (host: string) => Promise<PingResult>
       prepareIce: (options: { stunHost: string; stunPort: number; relay: string; room: string; logicalIp: string; token: string }) => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
+      resetIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       configureIce: (options: { remoteDescription: string; remoteIp: string }) => Promise<boolean>
       createProbeIce: (options: { stunHost: string; stunPort: number }) => Promise<{ probeKey: string; localDescription: string }>
       configureProbeIce: (probeKey: string, remoteDescription: string) => Promise<boolean>
       pingProbeIce: (probeKey: string) => Promise<number>
       stopProbeIce: (probeKey: string) => Promise<{ stopped: boolean }>
-      onGamePeer: (callback: (logicalIp: string) => void) => () => void
+      onGamePeer: (callback: (event: { logicalIp: string; transactionKey: string }) => void) => () => void
       pingRelay: () => Promise<number>
       pingRelayPeer: (remoteIp: string) => Promise<number>
     }

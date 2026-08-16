@@ -123,21 +123,16 @@ async function openWindowsSecurity() {
   } catch {}
 }
 
-function firewallResultMessage(result) {
-  const missing = (result.missing || []).map((rule) => rule.name).join('、')
-  const blockers = (result.blockers || []).map((rule) => rule.name + (rule.program ? ` (${rule.program})` : '')).join('\n')
-  if (blockers) return `发现 Windows 防火墙存在阻止规则，请删除后重新进入房间：\n${blockers}\n\n建议右键平台选择“以管理员身份运行”；也可以在平台属性的“兼容性”中勾选“以管理员身份运行此程序”。`
-  if (missing) return `以下 UDP 放行规则尚未确认：${missing}\n\n建议右键平台选择“以管理员身份运行”；也可以在平台属性的“兼容性”中勾选“以管理员身份运行此程序”。`
-  return 'Windows 防火墙规则状态无法确认，请检查系统防火墙设置。'
-}
-
 async function ensureWindowsFirewall(event, options = {}) {
   if (process.platform !== 'win32') return { state: 'not-needed', warning: '' }
   const status = notap.status()
   const paths = { icePath: status.icePath }
   const result = await firewall.trySilentFirewall(paths)
   if (result.state === 'ready' || result.state === 'not-needed') return { ...result, warning: '' }
-  return { ...result, warning: firewallResultMessage(result) + '\n当前仍可进入房间，直连失败时将继续使用中继。' }
+  // Firewall repair is best-effort. A failed check must never add UI noise or
+  // block room/game flow; relay remains available when ICE direct traffic is
+  // unavailable.
+  return { ...result, warning: '' }
 }
 
 async function launchGameWithRecovery(event, options) {
@@ -189,6 +184,7 @@ ipcMain.handle('notap-transport-status', () => notap.transportStatus())
 ipcMain.handle('notap-disconnect', () => notap.disconnect())
 ipcMain.handle('notap-ping', (_event, host) => notap.pingHost(host))
 ipcMain.handle('notap-prepare-ice', (_event, options) => notap.prepareIce(options))
+ipcMain.handle('notap-reset-ice', () => notap.resetIce())
 ipcMain.handle('notap-configure-ice', (_event, options) => notap.configureIce(options?.remoteDescription, options?.remoteIp))
 ipcMain.handle('notap-create-probe-ice', (_event, options) => notap.createProbeIce(options))
 ipcMain.handle('notap-configure-probe-ice', (_event, probeKey, remoteDescription) => notap.configureProbeIce(probeKey, remoteDescription))

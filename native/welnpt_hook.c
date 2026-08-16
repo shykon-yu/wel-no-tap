@@ -18,6 +18,7 @@
 #define WELNPT_HEARTBEAT_MS 2000
 #define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
+#define WELNPT_ICE_AGENT_PREFIX "WELICEAGENT:"
 #define WELNPT_ICE_PEER_PREFIX "WELICEPEER:"
 #define WELNPT_GAME_PEER_PREFIX "WELGAMEPEER:"
 
@@ -63,6 +64,9 @@ static struct sockaddr_in g_relay_address;
 static SOCKET g_direct_transport = INVALID_SOCKET;
 static struct sockaddr_in g_direct_agent_address;
 static uint32_t g_direct_peer_ip;
+static uint32_t g_direct_transaction_peer_ip;
+static unsigned short g_direct_transaction_source_port;
+static unsigned short g_direct_transaction_target_port;
 static unsigned short g_direct_hook_port;
 static volatile LONG g_direct_connected;
 static uint32_t g_logical_ip;
@@ -80,7 +84,7 @@ static wel_wsasendto_fn g_real_wsasendto;
 static wel_wsarecvfrom_fn g_real_wsarecvfrom;
 static wel_closesocket_fn g_real_closesocket;
 
-static void report_game_peer(uint32_t target_ip);
+static void report_game_peer(uint32_t target_ip, unsigned short source_port, unsigned short target_port);
 
 static void log_line(const char *format, ...) {
     char message[768];
@@ -248,8 +252,8 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	   than 5739. Search uses broadcast packets and a 136-byte reply, so the
 	   payload shape is the stable discriminator in both directions. */
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-		payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH && g_direct_peer_ip == 0) {
-		report_game_peer(header->source_ip);
+		payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) {
+		report_game_peer(header->source_ip, ntohs(header->source_port), ntohs(header->target_port));
 	}
 	if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
 		log_line("\"api\":\"transport-drop\",\"path\":\"%s\",\"targetPort\":%u,\"length\":%d",
@@ -272,17 +276,34 @@ static int send_register_packet(void) {
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
 
-static void report_game_peer(uint32_t target_ip) {
+static void report_game_peer(uint32_t target_ip, unsigned short source_port, unsigned short target_port) {
     char target[INET_ADDRSTRLEN];
     char message[96];
     int length;
+    int is_new_transaction;
     if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || target_ip == 0) return;
     if (InetNtopA(AF_INET, &target_ip, target, sizeof(target)) == NULL) return;
-    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WELNPT_GAME_PEER_PREFIX, target);
+    EnterCriticalSection(&g_state_lock);
+    is_new_transaction = g_direct_transaction_peer_ip != target_ip ||
+        g_direct_transaction_source_port != source_port ||
+        g_direct_transaction_target_port != target_port;
+    if (is_new_transaction) {
+        g_direct_transaction_peer_ip = target_ip;
+        g_direct_transaction_source_port = source_port;
+        g_direct_transaction_target_port = target_port;
+    }
+    LeaveCriticalSection(&g_state_lock);
+    if (!is_new_transaction) return;
+    /* A new join starts a new game transaction. Keep its handshake on the
+       relay until this transaction's ICE agent confirms a fresh connection. */
+    InterlockedExchange(&g_direct_connected, 0);
+    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s|%u|%u", WELNPT_GAME_PEER_PREFIX,
+        target, (unsigned)source_port, (unsigned)target_port);
     if (length <= 0) return;
     g_real_sendto(g_direct_transport, message, length, 0,
         (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
-    log_line("\"api\":\"direct-target\",\"target\":\"%s\"", target);
+    log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u",
+        target, (unsigned)source_port, (unsigned)target_port);
 }
 
 static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
@@ -320,8 +341,8 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 	/* The 64-byte join request selects the opponent. Do not require destination
 	   port 5739: the initiating side targets the host's dynamic game port. */
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-		length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH && g_direct_peer_ip == 0) {
-		report_game_peer(header->target_ip);
+		length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) {
+		report_game_peer(header->target_ip, source_port, ntohs(target->sin_port));
 	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && g_direct_transport != INVALID_SOCKET &&
         header->target_ip == g_direct_peer_ip && InterlockedCompareExchange(&g_direct_connected, 0, 0) != 0) {
@@ -677,6 +698,16 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
         int received = g_real_recvfrom(g_direct_transport, packet, sizeof(packet), 0,
             (struct sockaddr *)&source, &source_length);
         if (received <= 0) continue;
+        if (received > (int)strlen(WELNPT_ICE_AGENT_PREFIX) &&
+            memcmp(packet, WELNPT_ICE_AGENT_PREFIX, strlen(WELNPT_ICE_AGENT_PREFIX)) == 0) {
+            unsigned long port = strtoul(packet + strlen(WELNPT_ICE_AGENT_PREFIX), NULL, 10);
+            if (port > 0 && port <= 65535) {
+                g_direct_agent_address.sin_port = htons((u_short)port);
+                InterlockedExchange(&g_direct_connected, 0);
+                log_line("\"api\":\"direct-agent\",\"port\":%lu", port);
+            }
+            continue;
+        }
         if (received > (int)strlen(WELNPT_ICE_STATE_PREFIX) &&
             memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
             const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
