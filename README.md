@@ -7,8 +7,9 @@ system routes. It does not modify the current production client in
 
 ## Current Status
 
-`P3 - libjuice ICE direct path with relay fallback` is being integrated. P2
-authenticated cloud relay remains the default reliability path. P1 completed a real
+`P3 - libjuice ICE direct path with relay fallback` is integrated and verified in
+the real game path. P2 authenticated cloud relay remains the default reliability
+fallback. P1 completed a real
 two-computer WE8 match without a virtual adapter: all overlapping packets
 and bytes matched in both directions, and the Hook reported zero queue drops.
 The current connection GUI authenticates through the shared Go API and receives
@@ -117,8 +118,10 @@ accounts. No TAP/n2n driver, system route, or manually copied token is needed.
 Neither player needs an inbound WE8 port. Both players only send and receive
 through one outbound UDP mapping to the cloud relay.
 
-Both machines write a JSONL diagnostic log to the Desktop. Send both files
-together after each test, whether it succeeds or fails.
+Both machines write a JSONL game-session log under
+`%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl`. Send the host and client
+files together after each test, whether it succeeds or fails. The separate
+observation tool may write its own capture file to the Desktop.
 
 ## Linux Relay
 

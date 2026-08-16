@@ -55,7 +55,7 @@ let removeBeforeQuitListener: (() => void) | undefined
 let removeGamePeerListener: (() => void) | undefined
 const incomingProbeIds = new Set<number>()
 const activeProbeKeys = new Set<string>()
-const gamePeerAttempts = new Map<string, number>()
+const gamePeerTasks = new Map<string, Promise<void>>()
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -105,7 +105,7 @@ function clearRoomSessionState() {
   warningMessage.value = ''
   gameTransportSummary.value = '尚未启动游戏'
   incomingProbeIds.clear()
-  gamePeerAttempts.clear()
+  gamePeerTasks.clear()
 }
 
 function stopTransportStatusMonitor() {
@@ -416,6 +416,9 @@ async function pingMember(member: RoomMember) {
         activeProbeKeys.add(probeKey)
         const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, local.localDescription)
         const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id)
+        if (answered.requester_user_id !== user.value?.id || answered.target_user_id !== member.user_id) {
+          throw new Error('直连探测目标校验失败')
+        }
         if (!answered.target_description) throw new Error('目标玩家未返回直连 candidate')
         if (!await desktop()!.configureProbeIce(probeKey, answered.target_description)) throw new Error('临时 ICE 配置失败')
         const milliseconds = await desktop()!.pingProbeIce(probeKey)
@@ -506,30 +509,43 @@ async function answerIncomingPeerProbes(lease: Lease) {
   }
 }
 
-async function configureGamePeer(logicalIp: string) {
+async function configureGamePeerOnce(logicalIp: string) {
   const lease = activeLease.value
   if (!lease || !desktop()?.configureIce) return
-  const previousAttempt = gamePeerAttempts.get(logicalIp) || 0
-  if (Date.now() - previousAttempt < 1000) return
-  gamePeerAttempts.set(logicalIp, Date.now())
-  try {
-    const result = await roomApi.members(lease.room_id)
-    if (activeLease.value?.room_id !== lease.room_id) return
-    roomMembers.value = result.members
-    const member = result.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
-    if (!member?.ice_description) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      const result = await roomApi.members(lease.room_id)
+      if (activeLease.value?.room_id !== lease.room_id) return
+      roomMembers.value = result.members
+      const member = result.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
+      if (member?.ice_description) {
+        const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription: member.ice_description })
+        if (!configured) {
+          warningMessage.value = '比赛直连通道已锁定其他玩家，本场继续使用云中继'
+          return
+        }
+        gameTransportSummary.value = `已锁定对手 ${member.nickname}，正在建立 P2P 直连`
+        return
+      }
       gameTransportSummary.value = member ? `已识别对手 ${member.nickname}，等待其直连候选` : '正在确认比赛对手，当前使用云中继'
-      return
+    } catch {
+      gameTransportSummary.value = '正在确认比赛对手，当前使用云中继'
     }
-    const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription: member.ice_description })
-    if (!configured) {
-      warningMessage.value = '比赛直连通道已锁定其他玩家，本场继续使用云中继'
-      return
-    }
-    gameTransportSummary.value = `已锁定对手 ${member.nickname}，正在建立 P2P 直连`
-  } catch {
-    gameTransportSummary.value = '对手识别暂时失败，当前使用云中继'
+    await new Promise(resolve => window.setTimeout(resolve, 500))
   }
+  gameTransportSummary.value = '对手直连候选未及时到达，当前使用云中继'
+}
+
+function configureGamePeer(logicalIp: string) {
+  const normalizedIp = String(logicalIp || '').trim()
+  if (!normalizedIp || gamePeerTasks.has(normalizedIp)) return
+  const task = configureGamePeerOnce(normalizedIp)
+  gamePeerTasks.set(normalizedIp, task)
+  void task.then(() => {
+    if (gamePeerTasks.get(normalizedIp) === task) gamePeerTasks.delete(normalizedIp)
+  }, () => {
+    if (gamePeerTasks.get(normalizedIp) === task) gamePeerTasks.delete(normalizedIp)
+  })
 }
 
 function openMemberDetail(member: RoomMember) {
@@ -605,7 +621,7 @@ onBeforeUnmount(() => {
     <section class="auth-panel">
       <div class="brand-mark"><Gamepad2 :size="28" /></div>
       <p class="eyebrow">{{ runtimeConfig.platformShortName }} ONLINE ARENA</p>
-      <h1>{{ runtimeConfig.platformName }}</h1>
+      <h1>{{ runtimeConfig.platformName }} <span class="app-version">v{{ runtimeConfig.appVersion }}</span></h1>
       <form @submit.prevent="authenticate">
         <label>账号<input v-model.trim="form.username" autocomplete="username" placeholder="3 至 32 位账号" required /></label>
         <label>密码<input v-model="form.password" type="password" autocomplete="current-password" placeholder="至少 6 位" minlength="6" required /></label>
@@ -618,7 +634,7 @@ onBeforeUnmount(() => {
 
   <main v-else class="app-shell">
     <aside class="sidebar">
-      <div class="sidebar-brand"><span class="brand-mark"><Gamepad2 :size="22" /></span><span>{{ runtimeConfig.platformName }}</span></div>
+      <div class="sidebar-brand"><span class="brand-mark"><Gamepad2 :size="22" /></span><span>{{ runtimeConfig.platformName }}</span><span class="app-version">v{{ runtimeConfig.appVersion }}</span></div>
       <div class="user-row"><span class="avatar">{{ user.nickname.slice(0, 1) }}</span><span><strong>{{ user.nickname }}</strong><small>@{{ user.username }}</small></span></div>
       <nav><a class="active"><Users :size="18" /> 对战房间</a></nav>
       <div class="sidebar-actions"><button class="logout" @click="logout"><LogOut :size="17" /> 退出登录</button></div>

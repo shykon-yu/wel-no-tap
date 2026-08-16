@@ -16,6 +16,7 @@
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
+#define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
 #define WELNPT_ICE_PEER_PREFIX "WELICEPEER:"
 #define WELNPT_GAME_PEER_PREFIX "WELGAMEPEER:"
@@ -242,11 +243,12 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
 		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
-	/* WE8's confirmed join request is a 64-byte datagram to host port 5739.
-	   Search uses 24-byte broadcast and 136-byte reply, so it must not choose
-	   a direct game peer. */
-	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && payload_length == 64 &&
-		ntohs(header->target_port) == 5739 && g_direct_peer_ip == 0) {
+	/* WE8's confirmed join request is a 64-byte unicast datagram. The initiator
+	   sends it to the host's current game port, which is often ephemeral rather
+	   than 5739. Search uses broadcast packets and a 136-byte reply, so the
+	   payload shape is the stable discriminator in both directions. */
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
+		payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH && g_direct_peer_ip == 0) {
 		report_game_peer(header->source_ip);
 	}
 	if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
@@ -315,10 +317,10 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
         WSASetLastError(WSAEACCES);
         return SOCKET_ERROR;
     }
-	/* The 64-byte join request selects the opponent. Search traffic is never
-	   considered a match target, even in a crowded room. */
-	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && length == 64 &&
-		ntohs(target->sin_port) == 5739 && g_direct_peer_ip == 0) {
+	/* The 64-byte join request selects the opponent. Do not require destination
+	   port 5739: the initiating side targets the host's dynamic game port. */
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
+		length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH && g_direct_peer_ip == 0) {
 		report_game_peer(header->target_ip);
 	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && g_direct_transport != INVALID_SOCKET &&

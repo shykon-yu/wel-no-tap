@@ -8,7 +8,7 @@ const notap = require('./notap.cjs')
 
 if (process.platform === 'win32') app.commandLine.appendSwitch('no-sandbox')
 
-const runtime = publicConfig()
+const runtime = { ...publicConfig(), appVersion }
 const logDirectory = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'WELPlatform', 'logs')
 const logFile = path.join(logDirectory, 'main.log')
 let mainWindow = null
