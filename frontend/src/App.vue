@@ -262,8 +262,7 @@ async function joinRoom(room: Room) {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
     try {
-      // Room entry only needs the ICE process rule. Validate the game process
-      // after the user starts WE8, when the selected executable is required.
+      // The same ICE process handles direct Ping and the optional P2P game path.
       const firewall = await desktop()?.ensureFirewall({})
       firewallWarning = firewall?.warning || ''
       warningMessage.value = firewallWarning
@@ -392,7 +391,7 @@ async function launchGame() {
   if (!desktop()) { notice.value = '浏览器预览不会启动本机程序，请在 Windows 客户端测试'; return }
   loading.value = true
   try {
-    const firewall = await desktop()!.ensureFirewall({ gamePath: gamePath.value })
+    const firewall = await desktop()!.ensureFirewall({})
     if (firewall.warning) warningMessage.value = firewall.warning
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,

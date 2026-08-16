@@ -16,8 +16,9 @@ let mainWindow = null
 let tray = null
 let isQuitting = false
 let quitTimer = null
-const firewallConsentAsked = new Set()
-const firewallBlockNoticeShown = new Set()
+const firewallConsentAsked = new Map()
+const firewallBlockNoticeShown = new Map()
+const firewallPromptCooldownMs = 10000
 
 function writeLog(message, error) {
   try {
@@ -147,15 +148,16 @@ function firewallResultMessage(result) {
 async function ensureWindowsFirewall(event, options = {}) {
   if (process.platform !== 'win32') return { state: 'not-needed', warning: '' }
   const status = notap.status()
-  const paths = { icePath: status.icePath, gamePath: options.gamePath || '' }
+  const paths = { icePath: status.icePath }
   let result = await firewall.trySilentFirewall(paths)
   if (result.state === 'ready' || result.state === 'not-needed') return { ...result, warning: '' }
 
   const owner = BrowserWindow.fromWebContents(event.sender)
   const key = [paths.icePath, paths.gamePath].filter(Boolean).map((value) => String(value).toLowerCase()).join('|')
   if (result.blockers?.length) {
-    if (!firewallBlockNoticeShown.has(key)) {
-      firewallBlockNoticeShown.add(key)
+    const lastBlockNotice = firewallBlockNoticeShown.get(key) || 0
+    if (Date.now() - lastBlockNotice >= firewallPromptCooldownMs) {
+      firewallBlockNoticeShown.set(key, Date.now())
       const prompt = await dialog.showMessageBox(owner, {
         type: 'warning',
         title: '发现防火墙阻止规则',
@@ -171,12 +173,13 @@ async function ensureWindowsFirewall(event, options = {}) {
     return { ...result, warning: firewallResultMessage(result) }
   }
 
-  if (!firewallConsentAsked.has(key)) {
-    firewallConsentAsked.add(key)
+  const lastConsentPrompt = firewallConsentAsked.get(key) || 0
+  if (Date.now() - lastConsentPrompt >= firewallPromptCooldownMs) {
+    firewallConsentAsked.set(key, Date.now())
     const prompt = await dialog.showMessageBox(owner, {
       type: 'warning',
       title: '需要允许 WEL 网络规则',
-      message: 'WEL 需要为直连 ICE 和 WE8 游戏写入 Windows 防火墙 UDP 放行规则。',
+      message: 'WEL 需要为直连 ICE 组件写入 Windows 防火墙 UDP 放行规则。',
       detail: '平台已先尝试静默写入，但当前系统没有确认规则生效。点击“允许并修复”后，Windows 可能显示管理员授权提示。拒绝后仍可进入房间，但直连可能不可用。',
       buttons: ['允许并修复', '继续进入'],
       defaultId: 0,

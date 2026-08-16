@@ -4,11 +4,11 @@ const path = require('node:path')
 const RULE_PREFIX = 'WEL No-TAP'
 const RULES = [
   { kind: 'ice', suffix: 'ICE UDP', direction: 'in' },
-  { kind: 'game', suffix: 'WE8 UDP', direction: 'in' },
 ]
 const LEGACY_RULE_NAMES = [
   `${RULE_PREFIX} ICE Inbound`, `${RULE_PREFIX} ICE Outbound`,
   `${RULE_PREFIX} WE8 Inbound`, `${RULE_PREFIX} WE8 Outbound`,
+  `${RULE_PREFIX} WE8 UDP`,
 ]
 
 function psLiteral(value) {
@@ -56,11 +56,9 @@ function ruleName(rule) {
   return `${RULE_PREFIX} ${rule.suffix}`
 }
 
-function ruleSpecs({ icePath, gamePath }) {
-  const paths = [
-    { kind: 'ice', path: icePath },
-    { kind: 'game', path: gamePath },
-  ].filter((item) => item.path && String(item.path).trim())
+function ruleSpecs({ icePath }) {
+  const paths = [{ kind: 'ice', path: icePath }]
+    .filter((item) => item.path && String(item.path).trim())
   return paths.flatMap((item) => RULES
     .filter((rule) => rule.kind === item.kind)
     .map((rule) => ({ ...rule, name: ruleName(rule), program: path.normalize(String(item.path)) })))
