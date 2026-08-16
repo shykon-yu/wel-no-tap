@@ -293,17 +293,20 @@ static void report_game_peer(uint32_t target_ip, unsigned short source_port, uns
         g_direct_transaction_target_port = target_port;
     }
     LeaveCriticalSection(&g_state_lock);
-    if (!is_new_transaction) return;
-    /* A new join starts a new game transaction. Keep its handshake on the
-       relay until this transaction's ICE agent confirms a fresh connection. */
-    InterlockedExchange(&g_direct_connected, 0);
+    if (is_new_transaction) {
+        /* A new join starts a new game transaction. Keep its handshake on the
+           relay until this transaction's ICE agent confirms a fresh connection. */
+        InterlockedExchange(&g_direct_connected, 0);
+    }
     length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s|%u|%u", WELNPT_GAME_PEER_PREFIX,
         target, (unsigned)source_port, (unsigned)target_port);
     if (length <= 0) return;
     g_real_sendto(g_direct_transport, message, length, 0,
         (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
-    log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u",
-        target, (unsigned)source_port, (unsigned)target_port);
+    if (is_new_transaction) {
+        log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u",
+            target, (unsigned)source_port, (unsigned)target_port);
+    }
 }
 
 static int send_virtual_datagram(SOCKET handle, const char *payload, int length,

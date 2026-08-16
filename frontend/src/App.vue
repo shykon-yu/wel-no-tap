@@ -45,8 +45,10 @@ const heartbeatIntervalMs = 5 * 60 * 1000
 const sessionCheckIntervalMs = 30 * 1000
 const roomMembersIntervalMs = 3 * 1000
 const peerProbeIntervalMs = 1000
-const maxIncomingProbeAgents = 4
-const incomingProbeRetentionMs = 25 * 1000
+// Detail Ping is optional and must not starve ordinary room/game traffic. Keep
+// a bounded helper fan-out while still serving several concurrent requesters.
+const maxIncomingProbeAgents = 12
+const incomingProbeRetentionMs = 18 * 1000
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let peerProbeTimer: number | undefined

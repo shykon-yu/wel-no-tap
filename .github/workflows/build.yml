@@ -88,6 +88,8 @@ jobs:
           )
           & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --hook-port 49000 --validate-args
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper argument validation failed' }
+          & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --no-hook --validate-args
+          if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper no-hook validation failed' }
           Compress-Archive -Path "$output/*" -DestinationPath 'build/WEL无网卡云中继-P2-x86-完整包.zip' -Force
       - name: Upload complete Windows package
         uses: actions/upload-artifact@v4

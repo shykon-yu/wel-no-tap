@@ -372,6 +372,7 @@ int main(int argc, char **argv) {
 	char command[256];
 	int index;
 	int validate_args = 0;
+	int no_hook = 0;
 	DWORD timeout = 250;
 
 	for (index = 1; index < argc; ++index) {
@@ -382,11 +383,13 @@ int main(int argc, char **argv) {
 			if (index + 1 >= argc || !parse_port(argv[++index], &stun_port)) return 2;
 		} else if (strcmp(argv[index], "--hook-port") == 0) {
 			if (index + 1 >= argc || !parse_port(argv[++index], &hook_port)) return 2;
+		} else if (strcmp(argv[index], "--no-hook") == 0) {
+			no_hook = 1;
 		} else if (strcmp(argv[index], "--validate-args") == 0) validate_args = 1;
 		else if (strcmp(argv[index], "--self-test") == 0) return 0;
 		else return 2;
 	}
-	if (stun_host == NULL || stun_host[0] == '\0' || stun_port == 0 || hook_port == 0) return 2;
+	if (stun_host == NULL || stun_host[0] == '\0' || stun_port == 0 || (!no_hook && hook_port == 0)) return 2;
 	if (validate_args) return 0;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	InitializeCriticalSection(&g_output_lock);
@@ -404,11 +407,13 @@ int main(int argc, char **argv) {
 	index = sizeof(local_address);
 	if (getsockname(g_local_socket, (struct sockaddr *)&local_address, &index) == SOCKET_ERROR) return 6;
 	ZeroMemory(&g_hook_address, sizeof(g_hook_address));
-	g_hook_address.sin_family = AF_INET;
-	g_hook_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
-	g_hook_address.sin_port = htons(hook_port);
-	notify_hook_agent(ntohs(local_address.sin_port));
-	notify_hook("connecting");
+	if (!no_hook) {
+		g_hook_address.sin_family = AF_INET;
+		g_hook_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+		g_hook_address.sin_port = htons(hook_port);
+		notify_hook_agent(ntohs(local_address.sin_port));
+		notify_hook("connecting");
+	}
 
 	ZeroMemory(&config, sizeof(config));
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;

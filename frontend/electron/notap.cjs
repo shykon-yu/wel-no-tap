@@ -19,6 +19,8 @@ let iceExitError = ''
 let iceDiagnostics = []
 let pendingRelayPing = null
 let pendingRelayPeerPing = null
+let relayPingSequence = Date.now() >>> 0
+const relayPeerPingQueue = []
 let lastRemoteDescription = ''
 let lastLogPath = ''
 let activeGamePeerIp = ''
@@ -112,6 +114,12 @@ function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
 }
 
+function nextRelayPingNonce() {
+  relayPingSequence = (relayPingSequence + 1) >>> 0
+  if (relayPingSequence === 0) relayPingSequence = 1
+  return String(relayPingSequence)
+}
+
 function rememberIceDiagnostic(rawLine) {
   const line = String(rawLine || '').replace(/[\r\n]+/g, ' ').trim()
   if (!line || line === 'LOCAL_SDP_BEGIN' || line === 'LOCAL_SDP_END' || line.startsWith('a=')) return
@@ -167,12 +175,19 @@ function handleIceLine(rawLine) {
     if (pendingRelayPing && pendingRelayPing.nonce === nonce) {
       const pending = pendingRelayPing
       pendingRelayPing = null
+      if (pending.timer) clearTimeout(pending.timer)
       pending.resolve(Number(milliseconds) || 0)
     }
     return
   }
   if (line.startsWith('RELAY_PING_UNAVAILABLE ')) {
-    if (pendingRelayPing) { const pending = pendingRelayPing; pendingRelayPing = null; pending.reject(new Error('中继探测不可用')); }
+    const [, nonce] = line.split(' ')
+    if (pendingRelayPing && pendingRelayPing.nonce === nonce) {
+      const pending = pendingRelayPing
+      pendingRelayPing = null
+      if (pending.timer) clearTimeout(pending.timer)
+      pending.reject(new Error('中继探测不可用'))
+    }
     return
   }
   if (line.startsWith('RELAY_PEER_PING_RESULT ')) {
@@ -183,11 +198,20 @@ function handleIceLine(rawLine) {
       if (pending.retryTimer) clearInterval(pending.retryTimer)
       if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
       pending.resolve(Number(milliseconds) || 0)
+      startNextRelayPeerPing()
     }
     return
   }
   if (line.startsWith('RELAY_PEER_PING_UNAVAILABLE ')) {
-    if (pendingRelayPeerPing) { const pending = pendingRelayPeerPing; pendingRelayPeerPing = null; pending.reject(new Error('中继玩家探测不可用')); }
+    const [, nonce] = line.split(' ')
+    if (pendingRelayPeerPing && pendingRelayPeerPing.nonce === nonce) {
+      const pending = pendingRelayPeerPing
+      pendingRelayPeerPing = null
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
+      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
+      pending.reject(new Error('中继玩家探测不可用'))
+      startNextRelayPeerPing()
+    }
   }
 }
 
@@ -312,13 +336,12 @@ function createProbeIce({ stunHost, stunPort }) {
   const executable = locate(iceCandidates())
   if (!executable) return Promise.reject(new Error('缺少 welnptice.exe，请重新解压完整客户端'))
   const key = randomProbeKey()
-  const hookPort = chooseHookPort()
   const environment = { ...process.env }
   delete environment.WEL_NOTAP_RELAY
   delete environment.WEL_NOTAP_ROOM
   delete environment.WEL_NOTAP_LOGICAL_IP
   delete environment.WEL_NOTAP_TOKEN
-  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--hook-port', String(hookPort)], {
+  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--no-hook'], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
   })
   const probe = {
@@ -462,37 +485,54 @@ function pingProbeIce(probeKey) {
 
 function pingRelay() {
   if (!iceProcess) return Promise.reject(new Error('中继探测未准备'))
-  const nonce = String(Date.now() >>> 0)
-  return new Promise((resolve, reject) => {
-    pendingRelayPing = { nonce, resolve, reject }
-    iceProcess.stdin.write('PING_RELAY ' + nonce + '\n')
-    setTimeout(() => {
-      if (pendingRelayPing?.nonce !== nonce) return
+  if (pendingRelayPing) return pendingRelayPing.promise
+  const nonce = nextRelayPingNonce()
+  let pending
+  const promise = new Promise((resolve, reject) => {
+    pending = { nonce, resolve, reject, timer: null, promise: null }
+    pendingRelayPing = pending
+    pending.timer = setTimeout(() => {
+      if (pendingRelayPing !== pending) return
       pendingRelayPing = null
       reject(new Error('中继探测超时'))
     }, 5000)
+    try { iceProcess.stdin.write('PING_RELAY ' + nonce + '\n') } catch {
+      clearTimeout(pending.timer)
+      pendingRelayPing = null
+      reject(new Error('中继探测不可用'))
+    }
   })
+  pending.promise = promise
+  return promise
+}
+
+function startNextRelayPeerPing() {
+  if (pendingRelayPeerPing || !iceProcess) return
+  const pending = relayPeerPingQueue.shift()
+  if (!pending) return
+  pendingRelayPeerPing = pending
+  const send = () => {
+    if (pendingRelayPeerPing !== pending || !iceProcess) return
+    pending.nonce = nextRelayPingNonce()
+    try { iceProcess.stdin.write('PING_RELAY_PEER ' + pending.nonce + ' ' + pending.remoteIp + '\n') } catch {}
+  }
+  send()
+  pending.retryTimer = setInterval(send, 500)
+  pending.timeoutTimer = setTimeout(() => {
+    if (pendingRelayPeerPing !== pending) return
+    if (pending.retryTimer) clearInterval(pending.retryTimer)
+    pendingRelayPeerPing = null
+    pending.reject(new Error('中继玩家探测超时'))
+    startNextRelayPeerPing()
+  }, 8000)
 }
 
 function pingRelayPeer(remoteIp) {
   if (!iceProcess) return Promise.reject(new Error('中继玩家探测未准备'))
   if (!remoteIp) return Promise.reject(new Error('对方逻辑 IP 未知'))
   return new Promise((resolve, reject) => {
-    const pending = { nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, remoteIp: String(remoteIp).trim(), sequence: Date.now() >>> 0 }
-    pendingRelayPeerPing = pending
-    const send = () => {
-      if (pendingRelayPeerPing !== pending || !iceProcess) return
-      pending.nonce = String(pending.sequence = (pending.sequence + 1) >>> 0)
-      try { iceProcess.stdin.write('PING_RELAY_PEER ' + pending.nonce + ' ' + pending.remoteIp + '\n') } catch { /* timeout reports the failed probe */ }
-    }
-    send()
-    pending.retryTimer = setInterval(send, 500)
-    pending.timeoutTimer = setTimeout(() => {
-      if (pendingRelayPeerPing !== pending) return
-      if (pending.retryTimer) clearInterval(pending.retryTimer)
-      pendingRelayPeerPing = null
-      reject(new Error('中继玩家探测超时'))
-    }, 8000)
+    relayPeerPingQueue.push({ nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, remoteIp: String(remoteIp).trim() })
+    startNextRelayPeerPing()
   })
 }
 
@@ -610,13 +650,21 @@ async function disconnect() {
   iceProcess = null
   iceState = 'waiting'
   iceLocalDescription = ''
-  pendingRelayPing = null
+  if (pendingRelayPing) {
+    const pending = pendingRelayPing
+    pendingRelayPing = null
+    if (pending.timer) clearTimeout(pending.timer)
+    pending.reject(new Error('已退出房间，中继探测已取消'))
+  }
   if (pendingRelayPeerPing) {
     const pending = pendingRelayPeerPing
     pendingRelayPeerPing = null
     if (pending.retryTimer) clearInterval(pending.retryTimer)
     if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
     pending.reject(new Error('已退出房间，中继玩家探测已取消'))
+  }
+  while (relayPeerPingQueue.length) {
+    relayPeerPingQueue.shift().reject(new Error('已退出房间，中继玩家探测已取消'))
   }
   lastRemoteDescription = ''
   activeGamePeerIp = ''
