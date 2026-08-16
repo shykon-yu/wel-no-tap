@@ -262,7 +262,9 @@ async function joinRoom(room: Room) {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
     try {
-      const firewall = await desktop()?.ensureFirewall({ gamePath: gamePath.value })
+      // Room entry only needs the ICE process rule. Validate the game process
+      // after the user starts WE8, when the selected executable is required.
+      const firewall = await desktop()?.ensureFirewall({})
       firewallWarning = firewall?.warning || ''
       warningMessage.value = firewallWarning
     } catch (error) {
