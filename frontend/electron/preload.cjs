@@ -5,6 +5,7 @@ const runtimeConfig = ipcRenderer.sendSync('get-runtime-config')
 contextBridge.exposeInMainWorld('welNoTapConfig', runtimeConfig)
 contextBridge.exposeInMainWorld('welNoTapDesktop', {
   desktopStatus: () => ipcRenderer.invoke('notap-status'),
+  ensureFirewall: (options) => ipcRenderer.invoke('notap-ensure-firewall', options),
   transportStatus: () => ipcRenderer.invoke('notap-transport-status'),
   chooseGame: () => ipcRenderer.invoke('notap-choose-game'),
   launchGame: (options) => ipcRenderer.invoke('notap-launch-game', options),

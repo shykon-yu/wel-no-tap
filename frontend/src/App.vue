@@ -256,10 +256,19 @@ async function joinRoom(room: Room) {
   errorMessage.value = ''
   warningMessage.value = ''
   let lease: Lease | null = null
+  let firewallWarning = ''
   let roomNotice = '已进入房间，当前仅使用中继'
   try {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
+    try {
+      const firewall = await desktop()?.ensureFirewall({ gamePath: gamePath.value })
+      firewallWarning = firewall?.warning || ''
+      warningMessage.value = firewallWarning
+    } catch (error) {
+      firewallWarning = '无法确认 Windows 防火墙规则，直连可能不可用；当前仍可使用中继。'
+      warningMessage.value = firewallWarning
+    }
     directCandidateStatus.value = 'gathering'
     directCandidateMessage.value = '正在收集直连候选'
     notice.value = `正在连接直连服务 ${lease.ice_stun_host}:${lease.ice_stun_port} 并收集 candidate...`
@@ -278,11 +287,12 @@ async function joinRoom(room: Room) {
         directCandidateStatus.value = 'relay-only'
         directCandidateMessage.value = '直连候选收集失败，当前仅使用中继'
         const message = messageOf(error)
-        warningMessage.value = message.includes('ICE candidate 收集超时')
+        const candidateWarning = message.includes('ICE candidate 收集超时')
           ? '已尝试通过直连服务收集 candidate，但 12 秒内未完成；当前仅使用中继，稍后点击玩家 Ping 可再次尝试'
           : message.includes('ICE 辅助程序提前退出')
             ? `已尝试启动直连候选收集，但组件提前退出；当前仅使用中继：${message}`
             : `直连候选准备失败，当前仅使用中继：${message}`
+        warningMessage.value = [firewallWarning, candidateWarning].filter(Boolean).join('\n')
       }
     }
     networkStatus.value = {
@@ -380,6 +390,8 @@ async function launchGame() {
   if (!desktop()) { notice.value = '浏览器预览不会启动本机程序，请在 Windows 客户端测试'; return }
   loading.value = true
   try {
+    const firewall = await desktop()!.ensureFirewall({ gamePath: gamePath.value })
+    if (firewall.warning) warningMessage.value = firewall.warning
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,
       relay: `${activeLease.value.relay_host}:${activeLease.value.relay_port}`,
@@ -445,6 +457,10 @@ async function pingMember(member: RoomMember) {
           reachable: false,
           summary: message.includes('直连探测应答超时')
             ? '对方客户端未响应直连探测'
+            : message.includes('PING_UNAVAILABLE')
+              ? 'ICE 尚未建立，直连 Ping 未发送'
+              : message.includes('远端 candidate 无效') || message.includes('未确认远端 candidate')
+                ? '对方 candidate 无效或未确认'
             : message.includes('ICE 直连检查超时')
               ? 'ICE 直连检查超时'
               : message.includes('直连 Ping 超时')

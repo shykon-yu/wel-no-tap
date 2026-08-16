@@ -32,6 +32,7 @@ declare global {
     welNoTapConfig?: RuntimeConfig
     welNoTapDesktop?: {
       desktopStatus: () => Promise<DesktopLeaseStatus>
+      ensureFirewall: (options: { gamePath?: string }) => Promise<{ state: string; warning?: string; missing?: Array<{ name: string }>; blockers?: Array<{ name: string }> }>
       transportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct'; directState: string; summary: string }>
       chooseGame: () => Promise<string | null>
       launchGame: (options: { gamePath: string; relay: string; room: string; logicalIp: string; token: string }) => Promise<{ started: boolean; detail: string; warnings?: string[] }>

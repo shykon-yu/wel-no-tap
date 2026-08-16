@@ -70,6 +70,7 @@ function status() {
     message: helper && hook ? '无网卡联机组件已准备' : '缺少无网卡联机组件，请重新解压完整客户端',
     helper,
     hook,
+    icePath: ice,
     ice: Boolean(ice),
     directState: iceState,
   }
@@ -278,6 +279,12 @@ function stopProbeIce(probeKey) {
     probe.pendingPing = null
     pending.reject(new Error('直连探测已结束'))
   }
+  if (probe.remoteWaiter) {
+    const waiter = probe.remoteWaiter
+    probe.remoteWaiter = null
+    clearTimeout(waiter.timer)
+    waiter.reject(new Error('临时 ICE 探测已结束'))
+  }
   try { probe.child.stdin.write('EXIT\n') } catch {}
   try { probe.child.kill() } catch {}
   return { stopped: true }
@@ -298,7 +305,8 @@ function createProbeIce({ stunHost, stunPort }) {
   })
   const probe = {
     key, child, state: 'gathering', localDescription: '', localPort: 0,
-    buffer: '', sdpBuffer: '', readingSdp: false, error: '', pendingPing: null,
+    buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
+    remoteWaiter: null, pingUnavailable: false, pendingPing: null,
     retryTimer: null, timeoutTimer: null,
   }
   probeAgents.set(key, probe)
@@ -319,6 +327,29 @@ function createProbeIce({ stunHost, stunPort }) {
       if (line === 'LOCAL_SDP_BEGIN') { probe.readingSdp = true; probe.sdpBuffer = ''; continue }
       if (line.startsWith('LOCAL_PORT ')) { probe.localPort = Number(line.slice(11)) || 0; continue }
       if (line.startsWith('STATE ')) { probe.state = line.slice(6) || 'unknown'; continue }
+      if (line === 'REMOTE_SET') {
+        if (probe.remoteWaiter) {
+          const waiter = probe.remoteWaiter
+          probe.remoteWaiter = null
+          clearTimeout(waiter.timer)
+          waiter.resolve(true)
+        }
+        continue
+      }
+      if (line === 'ERROR remote-description') {
+        probe.remoteError = '远端 candidate 无效，ICE 辅助程序拒绝了远端 SDP'
+        if (probe.remoteWaiter) {
+          const waiter = probe.remoteWaiter
+          probe.remoteWaiter = null
+          clearTimeout(waiter.timer)
+          waiter.reject(new Error(probe.remoteError))
+        }
+        continue
+      }
+      if (line.startsWith('PING_UNAVAILABLE ')) {
+        probe.pingUnavailable = true
+        continue
+      }
       if (line.startsWith('PING_RESULT ') && probe.pendingPing) {
         const [, nonce, milliseconds] = line.split(' ')
         if (probe.pendingPing.nonce === nonce) {
@@ -338,6 +369,12 @@ function createProbeIce({ stunHost, stunPort }) {
   child.once('close', (code) => {
     if (probeAgents.get(key) !== probe) return
     probe.error ||= '临时 ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）'
+    if (probe.remoteWaiter) {
+      const waiter = probe.remoteWaiter
+      probe.remoteWaiter = null
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(probe.error))
+    }
     if (probe.pendingPing) {
       const pending = probe.pendingPing
       probe.pendingPing = null
@@ -361,13 +398,21 @@ function createProbeIce({ stunHost, stunPort }) {
 
 function configureProbeIce(probeKey, remoteDescription) {
   const probe = probeAgents.get(probeKey)
-  if (!probe || !remoteDescription) return false
+  if (!probe || !remoteDescription) return Promise.resolve(false)
+  if (probe.remoteWaiter) return Promise.reject(new Error('临时 ICE 正在设置远端 candidate'))
   try {
     const normalized = String(remoteDescription).replace(/\r?\n/g, '\n').replace(/\n*$/, '\n')
     probe.child.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
-    return true
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!probe.remoteWaiter) return
+        probe.remoteWaiter = null
+        reject(new Error('临时 ICE 未确认远端 candidate'))
+      }, 3000)
+      probe.remoteWaiter = { resolve, reject, timer }
+    })
   } catch {
-    return false
+    return Promise.resolve(false)
   }
 }
 
@@ -390,7 +435,9 @@ function pingProbeIce(probeKey) {
       probe.pendingPing = null
       if (probe.retryTimer) clearInterval(probe.retryTimer)
       probe.retryTimer = null
-      reject(new Error(probe.state === 'connected' || probe.state === 'completed' ? '直连 Ping 超时' : 'ICE 直连检查超时'))
+      const detail = probe.remoteError || (probe.pingUnavailable ? 'ICE 尚未建立，PING_UNAVAILABLE' : '')
+      const prefix = probe.state === 'connected' || probe.state === 'completed' ? '直连 Ping 超时' : 'ICE 直连检查超时'
+      reject(new Error(detail ? `${prefix}（${detail}）` : prefix))
     }, 12000)
   })
 }
