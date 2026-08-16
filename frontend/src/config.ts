@@ -19,7 +19,7 @@ export type RuntimeConfig = {
 }
 
 const fallback: RuntimeConfig = {
-  appVersion: '0.0.25',
+  appVersion: '0.0.26',
   platformName: 'WEL对战平台',
   platformShortName: 'WEL',
   gameName: 'WE8',

@@ -266,6 +266,9 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // The renderer answers peer-probe requests. Keep its polling alive
+      // while WE8 is foregrounded or the platform is minimized to the tray.
+      backgroundThrottling: false,
     },
   })
   mainWindow.on('close', (event) => {

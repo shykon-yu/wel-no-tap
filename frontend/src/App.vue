@@ -46,6 +46,7 @@ const sessionCheckIntervalMs = 30 * 1000
 const roomMembersIntervalMs = 3 * 1000
 const peerProbeIntervalMs = 1000
 const maxIncomingProbeAgents = 4
+const incomingProbeRetentionMs = 25 * 1000
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let peerProbeTimer: number | undefined
@@ -540,8 +541,9 @@ async function answerIncomingPeerProbes(lease: Lease) {
           window.setTimeout(() => {
             void desktop()?.stopProbeIce(probeKey)
             activeProbeKeys.delete(probeKey)
+            incomingProbeIds.delete(probe.id)
             activeIncomingProbeAgents = Math.max(0, activeIncomingProbeAgents - 1)
-          }, 25000)
+          }, incomingProbeRetentionMs)
         } catch {
           if (probeKey) {
             try { await desktop()!.stopProbeIce(probeKey) } catch {}
