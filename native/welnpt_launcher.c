@@ -14,6 +14,9 @@ typedef struct {
     const wchar_t *logical_ip;
     const wchar_t *token;
     const wchar_t *log_path;
+    const wchar_t *direct_peer_ip;
+    const wchar_t *direct_agent_port;
+    const wchar_t *direct_hook_port;
     int self_test;
 } launch_options;
 
@@ -28,6 +31,9 @@ static int parse_options(int argc, wchar_t **argv, launch_options *options) {
         else if (wcscmp(argv[index], L"--logical-ip") == 0 && index + 1 < argc) options->logical_ip = argv[++index];
         else if (wcscmp(argv[index], L"--token") == 0 && index + 1 < argc) options->token = argv[++index];
         else if (wcscmp(argv[index], L"--log") == 0 && index + 1 < argc) options->log_path = argv[++index];
+        else if (wcscmp(argv[index], L"--direct-peer-ip") == 0 && index + 1 < argc) options->direct_peer_ip = argv[++index];
+        else if (wcscmp(argv[index], L"--direct-agent-port") == 0 && index + 1 < argc) options->direct_agent_port = argv[++index];
+        else if (wcscmp(argv[index], L"--direct-hook-port") == 0 && index + 1 < argc) options->direct_hook_port = argv[++index];
         else if (wcscmp(argv[index], L"--self-test") == 0) options->self_test = 1;
         else return 0;
     }
@@ -192,6 +198,11 @@ int wmain(int argc, wchar_t **argv) {
     SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path);
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
+    if (options.direct_peer_ip != NULL && options.direct_agent_port != NULL && options.direct_hook_port != NULL) {
+        SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_PEER_IP", options.direct_peer_ip);
+        SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_AGENT_PORT", options.direct_agent_port);
+        SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_HOOK_PORT", options.direct_hook_port);
+    }
 
     command_line = quoted_command_line(game);
     working_directory = game_directory(game);

@@ -352,6 +352,56 @@ function resolveGamePath(gamePath) {
   return normalized
 }
 
+function powerShellLiteral(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'"
+}
+
+function windowsCommandArgument(value) {
+  const argument = String(value)
+  if (!/[\s"]/u.test(argument)) return argument
+  return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
+}
+
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, remoteIp }) {
+  const helper = locate(helperCandidates())
+  const hook = locate(hookCandidates())
+  const executable = resolveGamePath(gamePath)
+  if (!helper || !hook) throw new Error('缺少 welnptgame.exe 或 welnpt.dll，请重新解压完整客户端')
+  if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
+  const logPath = ensureLogPath()
+  lastLogPath = logPath
+  const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
+    '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
+  if (iceProcess && iceLocalDescription && iceAgentPort && iceHookPort && remoteIp) {
+    args.push('--direct-peer-ip', String(remoteIp), '--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
+  }
+  return { helper, args, logPath }
+}
+
+function launchElevated(options) {
+  const { helper, args, logPath } = elevatedLauncherArguments(options || {})
+  if (options?.remoteDescription) setRemoteIce(options.remoteDescription)
+  const argumentList = args.map(windowsCommandArgument).join(' ')
+  const script = `$process = Start-Process -FilePath ${powerShellLiteral(helper)} -ArgumentList ${powerShellLiteral(argumentList)} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $process.ExitCode`
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+    windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  lastProcess = child
+  const output = []
+  child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
+  child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
+  return new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code) => {
+      lastProcess = null
+      const detail = output.join('').trim()
+      if (code !== 0) reject(new Error(detail || '用户取消了管理员授权，或提权启动失败（代码 ' + (code ?? '未知') + '）'))
+      else resolve({ started: true, detail: 'WE8 已通过管理员授权启动，日志：' + logPath, warnings: [] })
+    })
+  })
+}
+
 function launch({ gamePath, relay, room, logicalIp, token, remoteIp, remoteDescription }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
@@ -438,4 +488,4 @@ function pingHost(host) {
   }
 }
 
-module.exports = { configureIce: setRemoteIce, disconnect, launch, pingHost, status, transportStatus, prepareIce, pingIce, pingRelay, pingRelayPeer }
+module.exports = { configureIce: setRemoteIce, disconnect, launch, launchElevated, pingHost, status, transportStatus, prepareIce, pingIce, pingRelay, pingRelayPeer }

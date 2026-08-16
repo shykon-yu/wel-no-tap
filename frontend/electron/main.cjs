@@ -103,6 +103,10 @@ function isHookInjectionFailure(error) {
     message.includes('CreateRemoteThread')
 }
 
+function isElevationRequired(error) {
+  return String(error instanceof Error ? error.message : error || '').includes('Windows error 740')
+}
+
 async function openWindowsSecurity() {
   try {
     await shell.openExternal('windowsdefender://threat/')
@@ -122,6 +126,21 @@ async function launchGameWithRecovery(event, options) {
   try {
     return await notap.launch(options)
   } catch (error) {
+    if (isElevationRequired(error)) {
+      const owner = BrowserWindow.fromWebContents(event.sender)
+      const result = await dialog.showMessageBox(owner, {
+        type: 'info',
+        title: '游戏需要管理员权限',
+        message: '该 WE8.exe 被 Windows 设置为必须使用管理员权限运行。',
+        detail: '点击“允许并启动”后会出现 Windows 用户账户控制提示。平台本身无需重新启动。',
+        buttons: ['允许并启动', '取消'],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true,
+      })
+      if (result.response === 0) return notap.launchElevated(options)
+      throw new Error('已取消管理员授权，游戏未启动')
+    }
     if (!isHookInjectionFailure(error)) throw error
     const owner = BrowserWindow.fromWebContents(event.sender)
     const exactError = String(error instanceof Error ? error.message : error || '未知错误')
