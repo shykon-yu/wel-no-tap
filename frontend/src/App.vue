@@ -44,8 +44,11 @@ const desktop = () => window.welNoTapDesktop
 const heartbeatIntervalMs = 5 * 60 * 1000
 const sessionCheckIntervalMs = 30 * 1000
 const roomMembersIntervalMs = 3 * 1000
+const peerProbeIntervalMs = 1000
+const maxIncomingProbeAgents = 4
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
+let peerProbeTimer: number | undefined
 let roomMembersTimer: number | undefined
 let transportStatusTimer: number | undefined
 let signingOut = false
@@ -56,6 +59,9 @@ let removeGamePeerListener: (() => void) | undefined
 const incomingProbeIds = new Set<number>()
 const activeProbeKeys = new Set<string>()
 const gamePeerTasks = new Map<string, Promise<void>>()
+const pingingMemberIds = ref<Set<number>>(new Set())
+let peerProbePollInFlight = false
+let activeIncomingProbeAgents = 0
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -83,7 +89,9 @@ function startSessionMonitor() {
 
 function stopRoomMembersMonitor() {
   if (roomMembersTimer !== undefined) window.clearInterval(roomMembersTimer)
+  if (peerProbeTimer !== undefined) window.clearInterval(peerProbeTimer)
   roomMembersTimer = undefined
+  peerProbeTimer = undefined
   roomMembers.value = []
 }
 
@@ -91,7 +99,11 @@ function startRoomMembersMonitor() {
   stopRoomMembersMonitor()
   if (!activeLease.value) return
   void loadRoomMembers()
+  void answerIncomingPeerProbes(activeLease.value)
   roomMembersTimer = window.setInterval(() => { void loadRoomMembers() }, roomMembersIntervalMs)
+  peerProbeTimer = window.setInterval(() => {
+    if (activeLease.value) void answerIncomingPeerProbes(activeLease.value)
+  }, peerProbeIntervalMs)
 }
 
 function clearRoomSessionState() {
@@ -105,6 +117,9 @@ function clearRoomSessionState() {
   warningMessage.value = ''
   gameTransportSummary.value = '尚未启动游戏'
   incomingProbeIds.clear()
+  activeIncomingProbeAgents = 0
+  peerProbePollInFlight = false
+  pingingMemberIds.value = new Set()
   gamePeerTasks.clear()
 }
 
@@ -130,7 +145,6 @@ async function loadRoomMembers() {
     const result = await roomApi.members(lease.room_id)
     if (activeLease.value?.room_id === lease.room_id) {
       roomMembers.value = result.members
-      void answerIncomingPeerProbes(lease)
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) await forceSignedOut(error.message)
@@ -386,6 +400,8 @@ async function launchGame() {
 }
 async function pingMember(member: RoomMember) {
   if (!desktop()) return
+  if (pingingMemberIds.value.has(member.user_id)) return
+  pingingMemberIds.value = new Set(pingingMemberIds.value).add(member.user_id)
   pingResults.value = {
     ...pingResults.value,
     [member.user_id]: {
@@ -466,6 +482,10 @@ async function pingMember(member: RoomMember) {
         direct: { reachable: false, summary: '直连不可用' },
       },
     }
+  } finally {
+    const next = new Set(pingingMemberIds.value)
+    next.delete(member.user_id)
+    pingingMemberIds.value = next
   }
 }
 
@@ -480,32 +500,44 @@ async function waitForPeerProbeAnswer(roomID: number, probeID: number) {
 }
 
 async function answerIncomingPeerProbes(lease: Lease) {
-  if (!desktop()?.createProbeIce || activeLease.value?.room_id !== lease.room_id) return
-  let probes
-  try { probes = (await roomApi.incomingPeerProbes(lease.room_id)).probes } catch { return }
-  for (const probe of probes) {
-    if (incomingProbeIds.has(probe.id) || !probe.requester_description) continue
-    incomingProbeIds.add(probe.id)
-    void (async () => {
-      let probeKey = ''
-      try {
-        const local = await desktop()!.createProbeIce({ stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port })
-        probeKey = local.probeKey
-        activeProbeKeys.add(probeKey)
-        if (!await desktop()!.configureProbeIce(probeKey, probe.requester_description!)) throw new Error('临时 ICE 配置失败')
-        await roomApi.answerPeerProbe(lease.room_id, probe.id, local.localDescription)
-        window.setTimeout(() => {
-          void desktop()?.stopProbeIce(probeKey)
-          activeProbeKeys.delete(probeKey)
-        }, 25000)
-      } catch {
-        if (probeKey) {
-          try { await desktop()!.stopProbeIce(probeKey) } catch {}
-          activeProbeKeys.delete(probeKey)
+  if (!desktop()?.createProbeIce || activeLease.value?.room_id !== lease.room_id || peerProbePollInFlight) return
+  peerProbePollInFlight = true
+  try {
+    let probes
+    try { probes = (await roomApi.incomingPeerProbes(lease.room_id)).probes } catch { return }
+    for (const probe of probes) {
+      if (activeIncomingProbeAgents >= maxIncomingProbeAgents) break
+      if (incomingProbeIds.has(probe.id) || !probe.requester_description) continue
+      incomingProbeIds.add(probe.id)
+      activeIncomingProbeAgents += 1
+      void (async () => {
+        let probeKey = ''
+        let retained = false
+        try {
+          const local = await desktop()!.createProbeIce({ stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port })
+          probeKey = local.probeKey
+          activeProbeKeys.add(probeKey)
+          if (!await desktop()!.configureProbeIce(probeKey, probe.requester_description!)) throw new Error('临时 ICE 配置失败')
+          await roomApi.answerPeerProbe(lease.room_id, probe.id, local.localDescription)
+          retained = true
+          window.setTimeout(() => {
+            void desktop()?.stopProbeIce(probeKey)
+            activeProbeKeys.delete(probeKey)
+            activeIncomingProbeAgents = Math.max(0, activeIncomingProbeAgents - 1)
+          }, 25000)
+        } catch {
+          if (probeKey) {
+            try { await desktop()!.stopProbeIce(probeKey) } catch {}
+            activeProbeKeys.delete(probeKey)
+          }
+          incomingProbeIds.delete(probe.id)
+        } finally {
+          if (!retained) activeIncomingProbeAgents = Math.max(0, activeIncomingProbeAgents - 1)
         }
-        incomingProbeIds.delete(probe.id)
-      }
-    })()
+      })()
+    }
+  } finally {
+    peerProbePollInFlight = false
   }
 }
 
@@ -683,7 +715,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <footer class="member-modal-footer">
-              <button class="secondary-button" :disabled="selectedMember.is_self || !selectedMember.virtual_ip || !desktop()" @click="pingMember(selectedMember)">Ping</button>
+              <button class="secondary-button" :disabled="selectedMember.is_self || !selectedMember.virtual_ip || !desktop() || pingingMemberIds.has(selectedMember.user_id)" @click="pingMember(selectedMember)">{{ pingingMemberIds.has(selectedMember.user_id) ? '检测中...' : 'Ping' }}</button>
               <button class="primary-button" @click="closeMemberDetail">关闭</button>
             </footer>
           </section>
