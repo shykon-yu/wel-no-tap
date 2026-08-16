@@ -243,8 +243,9 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 			path, (unsigned)ntohs(header->target_port), payload_length);
 		return 0;
 	}
-	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"sourcePort\":%u,\"length\":%d",
-		path, (unsigned)ntohs(header->source_port), payload_length);
+	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"broadcast\":%s,\"sourcePort\":%u,\"length\":%d",
+		path, (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
+		(unsigned)ntohs(header->source_port), payload_length);
 	return 1;
 }
 

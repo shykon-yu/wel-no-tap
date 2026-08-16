@@ -75,7 +75,6 @@ function status() {
 
 function transportStatus() {
   let pathName = 'pending'
-  let sawRelayPacket = false
   if (lastLogPath && fs.existsSync(lastLogPath)) {
     try {
       const contents = fs.readFileSync(lastLogPath, 'utf8')
@@ -89,16 +88,16 @@ function transportStatus() {
           if (line.includes('"state":"failed"') || line.includes('"state":"disconnected"')) { pathName = 'relay'; break }
           continue
         }
+        if (!line.includes('"api":"transport-recv"') || !line.includes('"broadcast":false')) continue
         if (line.includes('"path":"direct"')) { pathName = 'direct'; break }
-        if (line.includes('"path":"relay"') && line.includes('"broadcast":false')) sawRelayPacket = true
+        if (line.includes('"path":"relay"')) { pathName = 'relay'; break }
       }
-      if (pathName === 'pending' && sawRelayPacket) pathName = 'relay'
     } catch {}
   }
   const summary = pathName === 'direct'
-    ? '本场比赛单播：P2P 直连'
+    ? '当前联机：P2P 直连'
     : pathName === 'relay'
-      ? '本场比赛单播：云中继'
+      ? '当前联机：云中继'
       : iceState === 'connected' || iceState === 'completed'
         ? 'P2P 直连已建立，等待游戏单播'
         : '游戏已启动，等待网络数据'
@@ -154,12 +153,20 @@ function handleIceLine(rawLine) {
     if (pendingIcePing && pendingIcePing.nonce === nonce) {
       const pending = pendingIcePing
       pendingIcePing = null
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
+      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
       pending.resolve(Number(milliseconds) || 0)
     }
     return
   }
   if (line.startsWith('PING_UNAVAILABLE ')) {
-    if (pendingIcePing) { const pending = pendingIcePing; pendingIcePing = null; pending.reject(new Error('直连探测不可用')); }
+    if (pendingIcePing) {
+      const pending = pendingIcePing
+      pendingIcePing = null
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
+      if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
+      pending.reject(new Error('直连探测不可用'))
+    }
     return
   }
   if (line.startsWith('RELAY_PING_RESULT ')) {
@@ -285,10 +292,17 @@ async function pingIce(remoteDescription) {
   await waitForIceConnection()
   const nonce = Math.random().toString(36).slice(2, 12)
   return new Promise((resolve, reject) => {
-    pendingIcePing = { nonce, resolve, reject }
-    iceProcess.stdin.write('PING ' + nonce + '\n')
-    setTimeout(() => {
+    const pending = { nonce, resolve, reject, retryTimer: null, timeoutTimer: null }
+    pendingIcePing = pending
+    const send = () => {
+      if (pendingIcePing !== pending || !iceProcess) return
+      try { iceProcess.stdin.write('PING ' + nonce + '\n') } catch { /* timeout reports the failed probe */ }
+    }
+    send()
+    pending.retryTimer = setInterval(send, 500)
+    pending.timeoutTimer = setTimeout(() => {
       if (pendingIcePing?.nonce !== nonce) return
+      if (pending.retryTimer) clearInterval(pending.retryTimer)
       pendingIcePing = null
       reject(new Error('直连探测超时'))
     }, 8000)
@@ -389,7 +403,13 @@ async function disconnect() {
   iceProcess = null
   iceState = 'waiting'
   iceLocalDescription = ''
-  pendingIcePing = null
+  if (pendingIcePing) {
+    const pending = pendingIcePing
+    pendingIcePing = null
+    if (pending.retryTimer) clearInterval(pending.retryTimer)
+    if (pending.timeoutTimer) clearTimeout(pending.timeoutTimer)
+    pending.reject(new Error('已退出房间，直连探测已取消'))
+  }
   pendingRelayPing = null
   pendingRelayPeerPing = null
   lastRemoteDescription = ''

@@ -40,6 +40,8 @@ static LARGE_INTEGER g_relay_ping_started;
 static char g_relay_peer_ping_nonce[64];
 static LARGE_INTEGER g_relay_peer_ping_started;
 
+static void send_relay_presence(void);
+
 static double elapsed_milliseconds(LARGE_INTEGER started) {
 	LARGE_INTEGER current;
 	if (g_counter_frequency.QuadPart <= 0 || !QueryPerformanceCounter(&current)) return 0.0;
@@ -146,12 +148,17 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 
 static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 	char packet[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+	ULONGLONG next_presence = GetTickCount64() + 10000;
 	(void)unused;
 	while (InterlockedCompareExchange(&g_stopping, 0, 0) == 0) {
 		struct sockaddr_in source;
 		int source_length = sizeof(source);
 		int received = recvfrom(g_relay_socket, packet, sizeof(packet), 0, (struct sockaddr *)&source, &source_length);
 		welnpt_packet_header *header;
+		if (GetTickCount64() >= next_presence) {
+			send_relay_presence();
+			next_presence = GetTickCount64() + 10000;
+		}
 		if (received < (int)sizeof(welnpt_packet_header)) continue;
 		header = (welnpt_packet_header *)packet;
 		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
@@ -267,6 +274,20 @@ static void send_relay_peer_ping(const char *nonce, uint32_t target_ip) {
 	LeaveCriticalSection(&g_ping_lock);
 }
 
+static void send_relay_presence(void) {
+	char packet[sizeof(welnpt_packet_header)];
+	welnpt_packet_header *header = (welnpt_packet_header *)packet;
+	if (g_relay_socket == INVALID_SOCKET) return;
+	welnpt_initialize_header(header, WELNPT_PACKET_PING);
+	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
+	header->source_ip = g_logical_ip;
+	header->sequence = 0;
+	if (welnpt_auth_sign(&g_auth, packet, sizeof(packet))) {
+		sendto(g_relay_socket, packet, sizeof(packet), 0,
+			(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+	}
+}
+
 static int parse_port(const char *value, unsigned short *port) {
 	char *end = NULL;
 	unsigned long parsed = strtoul(value, &end, 10);
@@ -304,6 +325,7 @@ static int initialize_relay(void) {
 	g_relay_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (g_relay_socket == INVALID_SOCKET) return 0;
 	setsockopt(g_relay_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+	send_relay_presence();
 	return 1;
 }
 

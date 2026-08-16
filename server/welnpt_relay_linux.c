@@ -42,6 +42,7 @@ typedef struct relay_stats {
 } relay_stats;
 
 static relay_peer g_peers[WELNPT_MAX_PEERS];
+static relay_peer g_diagnostic_peers[WELNPT_MAX_PEERS];
 static relay_stats g_stats;
 static char g_secret[WELNPT_SECRET_MAX];
 static volatile sig_atomic_t g_stopping;
@@ -97,14 +98,14 @@ static int sign_packet(char *packet, size_t packet_length) {
     return 1;
 }
 
-static relay_peer *upsert_peer(const welnpt_packet_header *header,
-    const struct sockaddr_in *endpoint, uint64_t now) {
+static relay_peer *upsert_peer_in(relay_peer peers[WELNPT_MAX_PEERS],
+    const welnpt_packet_header *header, const struct sockaddr_in *endpoint, uint64_t now) {
     relay_peer *free_peer = NULL;
     relay_peer *oldest_peer = NULL;
     size_t index;
 
     for (index = 0; index < WELNPT_MAX_PEERS; ++index) {
-        relay_peer *peer = &g_peers[index];
+        relay_peer *peer = &peers[index];
         if (peer->active && now - peer->last_seen > WELNPT_PEER_TIMEOUT_MS) peer->active = 0;
         if (peer->active && peer->logical_ip == header->source_ip && same_room(peer->room, header->room)) {
             peer->endpoint = *endpoint;
@@ -127,15 +128,15 @@ static relay_peer *upsert_peer(const welnpt_packet_header *header,
     return free_peer;
 }
 
-static int forward_packet(int socket_handle, const char *packet, size_t packet_length,
-    const welnpt_packet_header *header, uint64_t now) {
+static int forward_packet_in(relay_peer peers[WELNPT_MAX_PEERS], int socket_handle,
+    const char *packet, size_t packet_length, const welnpt_packet_header *header, uint64_t now) {
     int delivered = 0;
     int is_broadcast = (header->flags & WELNPT_FLAG_BROADCAST) != 0 ||
         header->target_ip == INADDR_BROADCAST;
     size_t index;
 
     for (index = 0; index < WELNPT_MAX_PEERS; ++index) {
-        relay_peer *peer = &g_peers[index];
+        relay_peer *peer = &peers[index];
         ssize_t sent;
         if (!peer->active) continue;
         if (now - peer->last_seen > WELNPT_PEER_TIMEOUT_MS) {
@@ -186,6 +187,10 @@ static void log_stats(uint64_t now) {
 static int self_test(void) {
     char packet[sizeof(welnpt_packet_header) + 4];
     welnpt_packet_header *header = (welnpt_packet_header *)packet;
+    struct sockaddr_in game_endpoint;
+    struct sockaddr_in diagnostic_endpoint;
+    relay_peer *game_peer;
+    relay_peer *diagnostic_peer;
     strcpy(g_secret, "local-test-token");
     welnpt_initialize_header(header, WELNPT_PACKET_DATA);
     header->payload_length = htons(4);
@@ -194,6 +199,19 @@ static int self_test(void) {
         !sign_packet(packet, sizeof(packet)) || !authenticate_packet(packet, sizeof(packet))) return 1;
     packet[sizeof(*header)] ^= 1;
     if (authenticate_packet(packet, sizeof(packet))) return 1;
+    memset(g_peers, 0, sizeof(g_peers));
+    memset(g_diagnostic_peers, 0, sizeof(g_diagnostic_peers));
+    memset(&game_endpoint, 0, sizeof(game_endpoint));
+    memset(&diagnostic_endpoint, 0, sizeof(diagnostic_endpoint));
+    memcpy(header->room, "self-test", 9);
+    header->source_ip = htonl(0x0a7a0101UL);
+    game_endpoint.sin_port = htons(30001);
+    diagnostic_endpoint.sin_port = htons(30002);
+    game_peer = upsert_peer_in(g_peers, header, &game_endpoint, 1);
+    diagnostic_peer = upsert_peer_in(g_diagnostic_peers, header, &diagnostic_endpoint, 2);
+    if (game_peer == NULL || diagnostic_peer == NULL ||
+        game_peer->endpoint.sin_port != htons(30001) ||
+        diagnostic_peer->endpoint.sin_port != htons(30002)) return 1;
     puts("SELF-TEST OK");
     return 0;
 }
@@ -283,18 +301,27 @@ int main(int argc, char **argv) {
             ++g_stats.authentication_drops;
             continue;
         }
-        peer = upsert_peer(header, &source, now);
-        if (peer == NULL) {
-            ++g_stats.route_drops;
-            continue;
+        if (header->type == WELNPT_PACKET_REGISTER || header->type == WELNPT_PACKET_DATA) {
+            peer = upsert_peer_in(g_peers, header, &source, now);
+            if (peer == NULL) {
+                ++g_stats.route_drops;
+                continue;
+            }
+        } else if (header->type == WELNPT_PACKET_PING || header->type == WELNPT_PACKET_PONG) {
+            peer = upsert_peer_in(g_diagnostic_peers, header, &source, now);
+            if (peer == NULL) {
+                ++g_stats.route_drops;
+                continue;
+            }
         }
         if (header->type == WELNPT_PACKET_DATA) {
-            delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
+            delivered = forward_packet_in(g_peers, socket_handle, packet, (size_t)received, header, now);
             if (delivered == 0) ++g_stats.route_drops;
         } else if (header->type == WELNPT_PACKET_PING) {
             if (header->target_ip != 0 && header->target_ip != htonl(INADDR_BROADCAST)) {
-                /* 转发式 PING：目标玩家在房间内则转过去，中继只当中转，不回包 */
-                delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
+                /* Diagnostic endpoints are isolated from game routing endpoints. */
+                delivered = forward_packet_in(g_diagnostic_peers, socket_handle,
+                    packet, (size_t)received, header, now);
                 if (delivered == 0) ++g_stats.route_drops;
             } else {
                 /* 到中继服务器的 PING：就地回 PONG，保持链路健康检查语义 */
@@ -310,7 +337,8 @@ int main(int argc, char **argv) {
             }
         } else if (header->type == WELNPT_PACKET_PONG) {
             /* 转发式 PING 的回包：按 target_ip 转发回发起方 */
-            delivered = forward_packet(socket_handle, packet, (size_t)received, header, now);
+            delivered = forward_packet_in(g_diagnostic_peers, socket_handle,
+                packet, (size_t)received, header, now);
             if (delivered == 0) ++g_stats.route_drops;
         }
         if (now - last_stats >= 60000) {
