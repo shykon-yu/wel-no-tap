@@ -23,6 +23,9 @@ let relayPingSequence = Date.now() >>> 0
 const relayPeerPingQueue = []
 let lastRemoteDescription = ''
 let lastLogPath = ''
+let transportLogOffset = 0
+let transportLogRemainder = ''
+let transportPath = 'pending'
 let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
@@ -79,34 +82,52 @@ function status() {
   }
 }
 
-function transportStatus() {
-  let pathName = 'pending'
-  if (lastLogPath && fs.existsSync(lastLogPath)) {
-    try {
-      const contents = fs.readFileSync(lastLogPath, 'utf8')
-      const lines = contents.trim().split(/\r?\n/).slice(-500).reverse()
-      let latestDirectStateSeen = false
-      for (const line of lines) {
-        if (line.includes('"api":"direct-fallback"')) { pathName = 'relay'; break }
-        if (line.includes('"api":"direct-state"')) {
-          if (latestDirectStateSeen) continue
-          latestDirectStateSeen = true
-          if (line.includes('"state":"failed"') || line.includes('"state":"disconnected"')) { pathName = 'relay'; break }
-          continue
-        }
-        if (!line.includes('"api":"transport-recv"') || !line.includes('"broadcast":false')) continue
-        if (line.includes('"path":"direct"')) { pathName = 'direct'; break }
-        if (line.includes('"path":"relay"')) { pathName = 'relay'; break }
+function resetTransportTracking(logPath = '') {
+  lastLogPath = logPath
+  transportLogOffset = 0
+  transportLogRemainder = ''
+  transportPath = 'pending'
+}
+
+function updateTransportPathFromLog() {
+  if (!lastLogPath || !fs.existsSync(lastLogPath)) return
+  try {
+    const contents = fs.readFileSync(lastLogPath, 'utf8')
+    if (contents.length < transportLogOffset) {
+      transportLogOffset = 0
+      transportLogRemainder = ''
+      transportPath = 'pending'
+    }
+    const chunk = transportLogRemainder + contents.slice(transportLogOffset)
+    transportLogOffset = contents.length
+    const lines = chunk.split(/\r?\n/)
+    transportLogRemainder = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let event
+      try { event = JSON.parse(line) } catch { continue }
+      if (event.api === 'direct-target') {
+        // A new game transaction starts on relay and may upgrade later.
+        transportPath = 'relay'
+      } else if (event.api === 'direct-fallback' ||
+          (event.api === 'direct-state' && (event.state === 'failed' || event.state === 'disconnected'))) {
+        transportPath = 'relay'
+      } else if (event.api === 'transport-recv' && event.broadcast === false) {
+        if (event.path === 'direct') transportPath = 'direct'
+        else if (event.path === 'relay' && transportPath === 'pending') transportPath = 'relay'
       }
-    } catch {}
-  }
+    }
+  } catch {}
+}
+
+function transportStatus() {
+  updateTransportPathFromLog()
+  const pathName = transportPath
   const summary = pathName === 'direct'
     ? '当前联机：P2P 直连'
     : pathName === 'relay'
       ? '当前联机：云中继'
-      : iceState === 'connected' || iceState === 'completed'
-        ? 'P2P 直连已建立，等待游戏单播'
-        : '游戏已启动，等待网络数据'
+      : '游戏已启动，等待网络数据'
   return { path: pathName, directState: iceState, summary }
 }
 
@@ -581,7 +602,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) 
   if (!helper || !hook) throw new Error('缺少 welnptgame.exe 或 welnpt.dll，请重新解压完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureLogPath()
-  lastLogPath = logPath
+  resetTransportTracking(logPath)
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
   if (iceProcess && iceAgentPort && iceHookPort) {
@@ -630,7 +651,7 @@ async function launch({ gamePath, relay, room, logicalIp, token }) {
   await waitForIceAgent()
 
   const logPath = ensureLogPath()
-  lastLogPath = logPath
+  resetTransportTracking(logPath)
   const environment = {
     ...process.env,
     WEL_NOTAP_RELAY: String(relay),
@@ -694,7 +715,7 @@ async function disconnect() {
   }
   lastRemoteDescription = ''
   activeGamePeerIp = ''
-  lastLogPath = ''
+  resetTransportTracking()
   iceExitError = ''
   iceDiagnostics = []
   for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)

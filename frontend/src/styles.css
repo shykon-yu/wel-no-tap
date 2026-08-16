@@ -23,6 +23,17 @@
 .mini-button { height: 28px; min-width: 54px; padding: 0 10px; border: 1px solid #cbd7da; border-radius: 5px; color: #345058; background: #fff; font-size: 12px; }
 .mini-button:disabled { opacity: .55; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 24px; background: rgba(23, 33, 40, .42); }
+.room-entry-backdrop { z-index: 40; }
+.room-entry-modal, .launch-choice-modal { width: min(410px, 100%); padding: 22px; color: #263d43; background: #fff; border: 1px solid #d7e0e3; border-radius: 8px; box-shadow: 0 18px 48px rgba(23, 33, 40, .22); }
+.room-entry-modal { display: grid; justify-items: center; gap: 9px; text-align: center; }
+.room-entry-modal h3, .launch-choice-modal h3 { font-size: 18px; }
+.room-entry-modal p, .launch-choice-modal > p { margin: 0; color: #4d6065; font-size: 13px; line-height: 1.6; }
+.room-entry-modal span { color: #75858a; font-size: 12px; }
+.room-entry-spinner { color: #18676a; animation: rotate .8s linear infinite; }
+.launch-choice-modal { display: grid; gap: 16px; }
+.launch-choice-modal header { display: flex; align-items: center; gap: 11px; }
+.launch-choice-modal header .eyebrow { margin-bottom: 4px; }
+.launch-choice-modal footer { display: flex; justify-content: flex-end; gap: 10px; }
 .member-modal { width: min(500px, 100%); padding: 18px; background: #fff; border: 1px solid #d7e0e3; border-radius: 8px; box-shadow: 0 18px 48px rgba(23, 33, 40, .22); }
 .member-modal-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
 .member-modal-header h3 { max-width: 310px; overflow: hidden; color: #20393f; font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
