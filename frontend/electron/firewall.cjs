@@ -47,6 +47,27 @@ function runPowerShell(script, { elevated = false, timeoutMs = 30000 } = {}) {
   })
 }
 
+function runNetsh(args, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const child = spawn('netsh.exe', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const output = []
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      resolve({ code: 124, output: output.join('') })
+    }, timeoutMs)
+    child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
+    child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
+    child.once('error', (error) => {
+      clearTimeout(timer)
+      resolve({ code: 1, output: String(error.message || error) })
+    })
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      resolve({ code: code ?? 1, output: output.join('') })
+    })
+  })
+}
+
 function normalizeProgram(value) {
   const program = String(value || '').trim().replace(/^"(.*)"$/, '$1')
   return path.normalize(program).replace(/[\\/]+$/, '').toLowerCase()
@@ -67,40 +88,80 @@ function ruleSpecs({ icePath }) {
 function queryScript() {
   return `
 $policy = New-Object -ComObject HNetCfg.FwPolicy2
+$encode = {
+  param([string]$value)
+  [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($value))
+}
 foreach ($rule in $policy.Rules) {
   $program = [string]$rule.ApplicationName
   $name = [string]$rule.Name
   $enabled = if ($rule.Enabled) { '1' } else { '0' }
-  Write-Output ('WELFW|' + [int]$rule.Direction + '|' + [int]$rule.Action + '|' + $enabled + '|' + $program + '|' + $name)
+  # Windows PowerShell may emit Chinese paths in the active console code page.
+  # Keep the Node boundary ASCII-only so a rule under a localized directory
+  # compares to the current executable path correctly.
+  Write-Output ('WELFW|' + [int]$rule.Direction + '|' + [int]$rule.Action + '|' + $enabled + '|' + (& $encode $program) + '|' + (& $encode $name))
 }
 `
+}
+
+function decodePsUnicode(value) {
+  try {
+    return Buffer.from(String(value || ''), 'base64').toString('utf16le')
+  } catch {
+    return ''
+  }
 }
 
 async function queryRules() {
   if (process.platform !== 'win32') return []
   const result = await runPowerShell(queryScript(), { timeoutMs: 15000 })
-  if (result.code !== 0) return []
-  return result.output.split(/\r?\n/).filter((line) => line.startsWith('WELFW|')).map((line) => {
-    const [, direction, action, enabled, program, ...nameParts] = line.split('|')
+  if (result.code !== 0) return null
+  const entries = result.output.split(/\r?\n/).filter((line) => line.startsWith('WELFW|'))
+  // A normal policy has built-in rules. No records means the COM query did
+  // not return usable data, so let the netsh fallback answer instead.
+  if (entries.length === 0) return null
+  return entries.map((line) => {
+    const [, direction, action, enabled, program, name] = line.split('|')
     return {
       direction: Number(direction),
       action: Number(action),
       enabled: enabled === '1',
-      program: normalizeProgram(program),
-      name: nameParts.join('|'),
+      program: normalizeProgram(decodePsUnicode(program)),
+      name: decodePsUnicode(name),
     }
   })
+}
+
+async function netshConfirmsRule(spec) {
+  const result = await runNetsh([
+    'advfirewall', 'firewall', 'show', 'rule', `name=${spec.name}`, `dir=${spec.direction}`, 'verbose',
+  ])
+  if (result.code !== 0) return false
+  const output = result.output.replace(/"/g, '').toLowerCase()
+  const program = String(spec.program).replace(/"/g, '').toLowerCase()
+  // This path is used only when the structured COM query is unavailable.
+  // netsh localizes status labels (and may use a legacy console code page),
+  // but the queried name and executable path are exact ASCII-safe evidence
+  // that the canonical rule is already present.
+  return output.includes(program)
 }
 
 async function inspectFirewall(options = {}) {
   if (process.platform !== 'win32') return { state: 'not-needed', missing: [], blockers: [], rules: [] }
   const specs = ruleSpecs(options)
-  const rules = await queryRules()
+  const queriedRules = await queryRules()
+  const rules = queriedRules || []
   const wantedPrograms = new Set(specs.map((spec) => normalizeProgram(spec.program)))
   const blockers = rules.filter((rule) => rule.enabled && rule.direction === 1 && rule.action === 0 && wantedPrograms.has(rule.program))
-  const missing = specs.filter((spec) => !rules.some((rule) => rule.enabled && rule.direction === (spec.direction === 'in' ? 1 : 2) && rule.action === 1 && rule.program === normalizeProgram(spec.program) && rule.name === spec.name))
+  const missing = []
+  for (const spec of specs) {
+    const direction = spec.direction === 'in' ? 1 : 2
+    const confirmedByCOM = rules.some((rule) => rule.enabled && rule.direction === direction && rule.action === 1 && rule.program === normalizeProgram(spec.program) && rule.name === spec.name)
+    const confirmedByNetsh = queriedRules === null && await netshConfirmsRule(spec)
+    if (!confirmedByCOM && !confirmedByNetsh) missing.push(spec)
+  }
   const legacy = rules.filter((rule) => LEGACY_RULE_NAMES.includes(rule.name))
-  return { state: missing.length === 0 && blockers.length === 0 && legacy.length === 0 ? 'ready' : 'needs-fix', missing, blockers, legacy, rules }
+  return { state: missing.length === 0 && blockers.length === 0 ? 'ready' : 'needs-fix', missing, blockers, legacy, rules }
 }
 
 function applyScript(specs) {
