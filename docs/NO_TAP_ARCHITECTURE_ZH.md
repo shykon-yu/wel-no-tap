@@ -2,7 +2,7 @@
 
 > 更新日期：2026-08-18
 > 适用仓库：`wel-no-tap`
-> 当前阶段：P2 鉴权云中继已完成搜索、加入、开赛和至少 10 分钟比赛验证；P3 libjuice ICE 已按真实比赛对手建立直连，并保留中继回退
+> 当前阶段：P2 鉴权云中继已完成搜索、加入、开赛和至少 10 分钟比赛验证；P3 libjuice ICE 已按真实比赛对手建立直连，并保留中继回退；当前正在使用每场全新 agent 和 A/B 预热切换逻辑
 > 现网关系：本项目独立于 `welopenvpn-clean`，不会替换或改动当前 TAP/n2n 平台
 
 ## 1. 文档用途
@@ -374,11 +374,14 @@ systemd：welnpt-notap-relay.service
 当前构建基准：
 
 ```text
-Git commit：a53f0db
-GitHub Actions：31934011145
-Windows 工件：WEL无网卡对战平台-安装包（v0.0.23）
+Git commit：f1736c3
+Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.36）
 Linux 工件：WEL无网卡云中继-P2-linux-x64
 ```
+
+`f1736c3` 已推送到 `shykon-yu/wel-no-tap` 的 `main`。native standby 改动必须以
+Windows CI 编译成功的安装包为准；macOS 本机只能完成 Electron/TypeScript 静态检查，
+不能替代 x86 Windows native 编译。
 
 ## 9. 诊断日志判读
 
@@ -591,7 +594,75 @@ transport 和虚拟 Socket 队列不重启、不清空，保证协商期间比�
 黄色阻塞提示，也不阻止进入房间、启动游戏或中继联机；用户以管理员权限运行客户端可
 提高规则写入成功率，但不应成为使用中继的前置条件。
 
-## 12. 已踩过的坑与处理规则
+## 12. 每场全新 ICE agent 与 A/B 预热切换
+
+这是当前 P3 直连逻辑的关键生命周期，必须和“进房间时的候选准备”区分开。房间阶段
+启动的 `welnptice.exe` 只用于确认本机 ICE 组件、STUN 和 candidate 收集可用；它不
+直接承载任何比赛的旧 remote SDP。真正识别到 WE8 的比赛对手后，才为本场准备正式
+agent。
+
+```text
+进入直连房间
+  -> 房间 agent 收集本机 candidate，发布到 Go
+  -> 允许进入房间；中继始终可用
+
+第一次识别真实对手
+  -> 清理/结束房间 agent
+  -> 创建全新的 agent A
+  -> 交换本场双方 SDP并执行 ICE connectivity check
+  -> 成功则游戏单播升级 direct，失败则本场锁定 relay
+  -> 本场协商完成后后台启动全新的 standby agent B
+
+下一场识别真实对手
+  -> 等待 B candidate 已完整收集
+  -> 先结束上一场 active agent A
+  -> 向 B 发送 ACTIVATE，使 B 首次向 Hook 报告 agent 端口和状态
+  -> 用 B 的新 SDP 与新对手协商
+  -> 协商完成后清理旧引用并后台预热新的 agent A
+  -> A/B 交替循环
+```
+
+实现边界：
+
+1. **每一场都必须使用新 agent。** 同一对手主场、客场、换对手，以及同一个
+   `WE8.exe` 进程连续进行的多场比赛，都不能复用上一场的 remote SDP、目标 IP、ICE
+   状态或 agent 进程。
+2. **standby 不得提前影响 Hook。** standby 可以收集 candidate 和建立自己的
+   STUN/UDP 状态，但在 `ACTIVATE` 之前不得发送 `WELICEAGENT` 或连接状态通知，否则
+   Hook 可能提前切到没有对应比赛的端口。
+3. **切换顺序必须先停旧、再激活新。** 旧 agent 退出并从客户端状态中移除后，才把
+   standby 提升为 active。激活失败时销毁该 standby，重新创建 fresh agent，并保留
+   中继路径。
+4. **预热失败不能阻塞比赛。** 下一场若 standby 尚未完成，客户端可以在有效时间内
+   等待；最终失败后创建新的正式 agent 尝试，直连仍失败则由 Hook 锁定中继。不能
+   因为 standby 或 STUN 超时阻止搜索、进入房间或中继联机。
+5. **重启和重进房间必须清空池。** `disconnect`、退出房间、平台重启时要结束 active
+   agent、standby agent 和临时 probe，清空 standby key、remote SDP、目标 IP 和比赛
+   事务状态。下一次进入房间必须从新的 agent 开始。
+6. **多场比赛在单机上串行切换。** 房间可以有很多人、不同玩家可以同时进行不同场
+   比赛，但同一台客户端的一个 WE8 游戏进程在任一时刻只有一个正式比赛对手。Hook
+   事务仍按“对手逻辑 IP + 加入端口 + generation”精确识别，旧事务等待必须在对手
+   改变时取消。
+
+直连判断不是“candidate 存在就算成功”：
+
+```text
+candidate 未完成 / SDP 未确认 / 临时启动错误
+  -> 继续等待或重试，不能立即判定 NAT 失败
+
+ICE connected/completed
+  -> Hook 收到连接状态，游戏单播才允许切到 path:"direct"
+
+有效检查窗口结束，确认 connectivity check 失败或 NAT 不可穿透
+  -> 本场 path 锁定 relay，不再在 direct/relay 之间反复闪烁
+```
+
+中继是功能底线，直连是延迟和服务器带宽优化。搜索广播、加入包、接受包和直连尚未
+完成期间的游戏包都必须能通过 `22333/UDP` 继续工作。判断最终比赛路径时，优先查看
+JSONL 中的 `transport-lock`、`direct-state`、`direct-fallback` 和实际单播
+`path:"direct"`，不能只看“candidate 已就绪”或日志最后一行。
+
+## 13. 已踩过的坑与处理规则
 
 ### 12.1 `Start-Process -Wait` 会把游戏子进程一起等住
 
@@ -664,7 +735,7 @@ Laravel 用户管理固定以 `admin`（可由 `SUPER_ADMIN_USERNAME` 配置）�
 运行后再观察 1.5 秒，期间退出同样判定为失败，并记录 `WE8.exe` 的实际进程退出码。
 正常游戏不受影响，客户端只会在“游戏组件加载中”状态多等待这段稳定性确认时间。
 
-## 13. 日志与问题定位顺序
+## 14. 日志与问题定位顺序
 
 Windows 客户端的比赛会话日志默认在：
 
@@ -685,7 +756,7 @@ Windows 客户端的比赛会话日志默认在：
 “候选已就绪”“中继服务器 Ping 通”“最后一行 failed”都不能单独证明比赛
 线路。必须把 Hook 日志、ICE 状态和实际游戏单播合并判断。
 
-## 14. 生产使用边界
+## 15. 生产使用边界
 
 目前已验证：
 
