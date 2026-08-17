@@ -200,6 +200,27 @@ function waitForIceAgent(timeoutMs = 1500) {
   })
 }
 
+function hasUsableIceCandidate(description) {
+  return String(description || '').split(/\r?\n/).some((line) => line.startsWith('a=candidate:'))
+}
+
+function activeIceAgentIsReadyAndClean() {
+  return Boolean(
+    iceProcess && !iceProcess.killed && iceAgentPort && iceHookPort &&
+    hasUsableIceCandidate(iceLocalDescription) &&
+    !lastRemoteDescription && !activeGamePeerIp && iceState !== 'failed',
+  )
+}
+
+function activeIceAgentSnapshot() {
+  return {
+    localDescription: iceLocalDescription,
+    directState: iceState,
+    agentPort: iceAgentPort,
+    hookPort: iceHookPort,
+  }
+}
+
 function handleIceLine(rawLine) {
   const line = rawLine.replace(/[\r\n]+$/, '')
   if (readingIceSdp) {
@@ -215,7 +236,14 @@ function handleIceLine(rawLine) {
   if (line === 'LOCAL_SDP_BEGIN') { readingIceSdp = true; iceSdpBuffer = ''; return }
   if (line.startsWith('LOCAL_PORT ')) { iceAgentPort = Number(line.slice(11)) || 0; return }
   if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; return }
-  if (line.startsWith('STATE ')) { iceState = line.slice(6) || 'unknown'; return }
+  if (line.startsWith('STATE ')) {
+    iceState = line.slice(6) || 'unknown'
+    // A standby is useful only after this match has really established ICE.
+    // Before that, a quick game exit must leave the next launch to create a
+    // fresh clean agent instead of promoting a speculative standby.
+    if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
+    return
+  }
   if (line.startsWith('GAME_PEER ')) {
     const payload = line.slice(10).trim()
     const [logicalIp, sourcePort = '', targetPort = '', generation = '0'] = payload.split('|')
@@ -357,6 +385,21 @@ async function resetIce() {
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 
+async function prepareGameIce() {
+  if (!iceOptions) throw new Error('直连组件尚未准备')
+  if (activeIceAgentIsReadyAndClean()) return activeIceAgentSnapshot()
+
+  // Prefer a fully gathered standby from the previous match. If none exists,
+  // create a fresh active agent and wait for its candidate in the existing
+  // game-launch loading state.
+  const activated = await activateIce()
+  if (activated && activeIceAgentIsReadyAndClean()) return activeIceAgentSnapshot()
+
+  const fresh = await resetIce()
+  if (!activeIceAgentIsReadyAndClean()) throw new Error('直连组件未返回可用 candidate')
+  return fresh
+}
+
 function attachActiveIceProcess(child) {
   let buffer = ''
   const consume = (chunk) => {
@@ -404,7 +447,6 @@ async function prewarmIce() {
 
 async function activateIce() {
   if (!iceOptions) return null
-  if (!standbyAgentKey || !probeAgents.has(standbyAgentKey)) await prewarmIce()
   const key = standbyAgentKey
   const standby = key ? probeAgents.get(key) : null
   if (!standby || !standby.localDescription || !standby.localPort) return null
@@ -451,6 +493,7 @@ function setRemoteIce(remoteDescription, remoteIp = '') {
   }
   iceProcess.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
   lastRemoteDescription = normalized
+  if (iceState === 'connected' || iceState === 'completed') void prewarmIce()
   return true
 }
 
@@ -740,11 +783,10 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
 }
 
 async function launchElevated(options) {
-  // Match the normal launch path: provide the direct agent when it is ready,
-  // but never wait for full ICE gathering before starting the Hook.
+  // Match the normal launch path: validate or rotate to a clean direct agent
+  // before the elevated helper injects the Hook.
   if (options?.direct !== false) {
-    await waitForIceAgent()
-    if (!iceLocalDescription) throw new Error('直连组件 candidate 尚未准备完成，请稍候再启动游戏')
+    await prepareGameIce()
   }
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
   const argumentList = args.map(windowsCommandArgument).join(' ')
@@ -779,8 +821,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
   if (direct) {
-    await waitForIceAgent()
-    if (!iceLocalDescription) throw new Error('直连组件 candidate 尚未准备完成，请稍候再启动游戏')
+    await prepareGameIce()
   }
 
   const logPath = ensureLogPath()
@@ -874,6 +915,7 @@ module.exports = {
   status,
   transportStatus,
   prepareIce,
+  prepareGameIce,
   resetIce,
   prewarmIce,
   activateIce,

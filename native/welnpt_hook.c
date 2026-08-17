@@ -762,11 +762,18 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
             const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
             int connected = strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0;
+            int failed = strncmp(state, "failed", 6) == 0;
             LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             if (connected && selected == WELNPT_GAME_PATH_PENDING) {
                 if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT,
                     WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
                     log_line("\"api\":\"transport-lock\",\"path\":\"direct\",\"reason\":\"ice-connected\"");
+                }
+                selected = InterlockedCompareExchange(&g_game_path, 0, 0);
+            } else if (failed && selected == WELNPT_GAME_PATH_PENDING) {
+                if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_RELAY,
+                    WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
+                    log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"ice-failed\"");
                 }
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             } else if (!connected && selected == WELNPT_GAME_PATH_DIRECT) {

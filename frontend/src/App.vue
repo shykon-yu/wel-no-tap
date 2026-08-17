@@ -431,6 +431,15 @@ async function launchGameNow() {
   try {
     gamePeerTasks.clear()
     gamePeerTransactions.clear()
+    activeGamePeerIp = ''
+    activeGamePeerTransaction = ''
+    activeGamePeerAgentUsed = false
+    gamePeerEpoch += 1
+    gamePeerOperation = Promise.resolve(true)
+    if (activeLease.value.connection_mode === 'direct' && desktop()?.prepareGameIce) {
+      const ice = await desktop()!.prepareGameIce()
+      localIceDescription.value = ice.localDescription
+    }
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,
       relay: `${activeLease.value.relay_host}:${activeLease.value.relay_port}`,
@@ -553,21 +562,16 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   } catch { return false }
   if (!member || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
 
-  // The lower user ID is the single offerer for this match. Both peers still
-  // rebuild their formal ICE agent, but only one creates the signaling row.
+  // The lower user ID is the single offerer for this match. Both peers use
+  // their current clean agent for the first match, then rotate A/B slots.
   const isOfferer = user.value.id < member.user_id
   const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
     // Once a real game peer has been observed, this agent belongs to that
-    // match even if signaling later fails. The next transaction must rebuild
-    // it instead of reusing an agent with a stale remote SDP.
+    // match even if signaling later fails. The next transaction must rotate
+    // to a clean standby or fresh agent instead of reusing its remote SDP.
     activeGamePeerAgentUsed = true
-    // The room agent is only a readiness/candidate collector. Every real
-    // match gets a fresh agent, and later matches consume the prewarmed one.
-    if (!needsFreshAgent) {
-      const ice = await desktop()!.resetIce()
-      localIceDescription.value = ice.localDescription
-    } else {
+    if (needsFreshAgent) {
       const activated = await desktop()!.activateIce()
       const ice = activated || await desktop()!.resetIce()
       localIceDescription.value = ice.localDescription
@@ -593,9 +597,6 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
     if (!configured) return false
     activeGamePeerIp = member.virtual_ip
     activeGamePeerTransaction = transactionKey
-    // Do not let the next match reuse this agent or its remote SDP. The
-    // standby process never talks to Hook until activateIce() promotes it.
-    void desktop()?.prewarmIce()
     return true
   } catch {
     return false
@@ -734,7 +735,7 @@ onBeforeUnmount(() => {
       </section>
 
       <div class="room-workspace">
-        <section class="room-section"><div class="section-heading"><h3>可用房间</h3><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
+        <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">直连房间需要准备直连组件，进入房间和启动游戏可能比中继房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
           <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'direct' ? 'P2P 优先' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>

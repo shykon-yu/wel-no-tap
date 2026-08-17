@@ -374,8 +374,8 @@ systemd：welnpt-notap-relay.service
 当前构建基准：
 
 ```text
-Git commit：f1736c3
-Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.36）
+Git commit：f1736c3（架构基准）
+Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.37）
 Linux 工件：WEL无网卡云中继-P2-linux-x64
 ```
 
@@ -596,22 +596,22 @@ transport 和虚拟 Socket 队列不重启、不清空，保证协商期间比�
 
 ## 12. 每场全新 ICE agent 与 A/B 预热切换
 
-这是当前 P3 直连逻辑的关键生命周期，必须和“进房间时的候选准备”区分开。房间阶段
-启动的 `welnptice.exe` 只用于确认本机 ICE 组件、STUN 和 candidate 收集可用；它不
-直接承载任何比赛的旧 remote SDP。真正识别到 WE8 的比赛对手后，才为本场准备正式
-agent。
+这是当前 P3 直连逻辑的关键生命周期。房间阶段启动的 `welnptice.exe` 直接定义为首场
+active agent A。A 只收集本机 ICE candidate 并向 Hook 提供 agent 端口，不写入任何
+比赛对手的 remote SDP。真正识别到 WE8 的比赛对手后，首场直接在干净的 A 上交换 SDP；
+A 只有在写入本场 remote SDP 后才成为已使用 agent。
 
 ```text
 进入直连房间
-  -> 房间 agent 收集本机 candidate，发布到 Go
+  -> 启动首场 active agent A，收集本机 candidate，发布到 Go
   -> 允许进入房间；中继始终可用
 
 第一次识别真实对手
-  -> 清理/结束房间 agent
-  -> 创建全新的 agent A
+  -> 检查 A 仍存活、candidate 完整且没有 remote SDP
+  -> 直接使用 A
   -> 交换本场双方 SDP并执行 ICE connectivity check
   -> 成功则游戏单播升级 direct，失败则本场锁定 relay
-  -> 本场协商完成后后台启动全新的 standby agent B
+  -> ICE connected/completed 后后台启动全新的 standby agent B
 
 下一场识别真实对手
   -> 等待 B candidate 已完整收集
@@ -624,18 +624,20 @@ agent。
 
 实现边界：
 
-1. **每一场都必须使用新 agent。** 同一对手主场、客场、换对手，以及同一个
-   `WE8.exe` 进程连续进行的多场比赛，都不能复用上一场的 remote SDP、目标 IP、ICE
-   状态或 agent 进程。
+1. **每一场都必须使用未污染的 agent。** 首场使用进房时创建的干净 A；同一对手
+   主场、客场、换对手，以及同一个 `WE8.exe` 进程连续进行的多场比赛，都不能复用
+   已写入上一场 remote SDP、目标 IP 或 ICE 状态的 agent。后续优先激活已预热的
+   standby，备用不存在或预热未完成时创建 fresh agent。
 2. **standby 不得提前影响 Hook。** standby 可以收集 candidate 和建立自己的
    STUN/UDP 状态，但在 `ACTIVATE` 之前不得发送 `WELICEAGENT` 或连接状态通知，否则
    Hook 可能提前切到没有对应比赛的端口。
 3. **切换顺序必须先停旧、再激活新。** 旧 agent 退出并从客户端状态中移除后，才把
    standby 提升为 active。激活失败时销毁该 standby，重新创建 fresh agent，并保留
    中继路径。
-4. **预热失败不能阻塞比赛。** 下一场若 standby 尚未完成，客户端可以在有效时间内
-   等待；最终失败后创建新的正式 agent 尝试，直连仍失败则由 Hook 锁定中继。不能
-   因为 standby 或 STUN 超时阻止搜索、进入房间或中继联机。
+4. **预热失败不能阻塞比赛。** ICE 尚未 connected/completed 时不启动 standby。
+   下一场若 standby 尚未完成，客户端创建 fresh agent 作为当前 active 尝试，直连仍
+   失败则由 Hook 锁定中继。不能因为 standby 或 STUN 超时阻止搜索、进入房间或中继
+   联机。
 5. **重启和重进房间必须清空池。** `disconnect`、退出房间、平台重启时要结束 active
    agent、standby agent 和临时 probe，清空 standby key、remote SDP、目标 IP 和比赛
    事务状态。下一次进入房间必须从新的 agent 开始。
@@ -643,6 +645,10 @@ agent。
    比赛，但同一台客户端的一个 WE8 游戏进程在任一时刻只有一个正式比赛对手。Hook
    事务仍按“对手逻辑 IP + 加入端口 + generation”精确识别，旧事务等待必须在对手
    改变时取消。
+
+每次启动游戏前都要检查当前 active agent 是否干净且满足直连条件：进程存活、Hook
+端口有效、candidate 完整，并且没有 remote SDP、旧目标或失败状态。检查或创建 agent
+期间沿用游戏启动的等待动画；只有检查通过才把 agent 端口传给 Hook 启动 WE8。
 
 直连判断不是“candidate 存在就算成功”：
 
