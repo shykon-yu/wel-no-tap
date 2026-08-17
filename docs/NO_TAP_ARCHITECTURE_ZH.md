@@ -149,7 +149,8 @@ candidate，向 Go 发布 SDP，最后才显示正式进入并启动成员轮询
 不能仅凭长度判定加入、接受或开始比赛，也不能因此重建 ICE。当前会话由对手逻辑 IP 和
 客机加入 Socket 的逻辑端口组成；其中任一项改变才开始新的 `SESSION_NEGOTIATING`，旧比赛
 的 remote SDP、target 和 agent 状态不得复用。ICE 成功后进入 `SESSION_ACTIVE`，同一会话内
-包括准备、开始和比赛数据在内的所有单播都优先走直连；只有 ICE 失败或直连断开才锁定中继。
+包括准备、开始和比赛数据在内的所有单播都优先走直连；首次 ICE 失败或临时直连断开才锁定
+本场中继，已直连会话的终态失败则回到 `WAIT_JOIN`。
 后续 A/B/C 预热池的边界是：A 服务当前场，B 后台收集，下一场激活 B 后再准备 C；备用
 agent 在显式激活前不得向 Hook 发送控制消息。
 
@@ -157,6 +158,11 @@ Hook 日志的 `session-signal` 会记录方向、协议序号、端口、长度
 和 FNV-1a 指纹。`possible-join`/`possible-accept` 只是长度候选名，不代表协议语义；结合
 玩家实际操作时间和 `payloadHead`/`payloadHash` 才能在后续版本确认真实加入、接受、准备和
 比赛包。
+
+本机比赛 Socket 关闭，或已经成功直连的会话收到终态 `failed`（对端已经消失）时，Hook 会
+清空对手和加入端口并回到 `WAIT_JOIN`。首次协商中的 `failed` 不清空会话，而是本场锁定中继，
+避免 NAT 打洞失败时反复重建 ICE。临时 `disconnected` 继续按本场中继兜底处理，避免短暂
+网络波动被误判为比赛结束。
 
 ```text
 WE8.exe
@@ -383,7 +389,7 @@ systemd：welnpt-notap-relay.service
 
 ```text
 Git commit：f1736c3（架构基准）
-Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.38）
+Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.39）
 Linux 工件：WEL无网卡云中继-P2-linux-x64
 ```
 
@@ -563,6 +569,10 @@ WE8 进程生命周期：启动 WE8 -> 关闭 WE8
 代次；因此不关闭 WE8 而联机下一位玩家时，会重新协商。若未来同一对手复用相同端口连续
 开新场，须根据本次新增日志确认真实的结束/下一场包特征后再增加精确规则，不能继续使用
 “出现比赛数据后再遇到 64 字节”的旧猜测。
+
+比赛结束回到主界面时，客机关闭本场加入 Socket 会使 Hook 回到 `WAIT_JOIN`；对方直接关闭
+游戏后，已经直连的一侧在 ICE 终态 `failed` 时也会回到 `WAIT_JOIN`。主机随后接收新的加入
+Socket 端口时同样会创建新会话，因此主客互换或再次加入不会沿用上一场的会话键。
 
 当前 Hook 把以下事务标识交给 ICE 控制层：
 

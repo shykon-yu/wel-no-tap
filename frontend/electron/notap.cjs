@@ -124,6 +124,8 @@ function updateTransportPathFromLog() {
       try { event = JSON.parse(line) } catch { continue }
       if (event.api === 'direct-target') {
         transportPath = 'pending'
+      } else if (event.api === 'session-state' && event.state === 'WAIT_JOIN') {
+        transportPath = 'pending'
       } else if (event.api === 'transport-lock') {
         if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
       } else if (event.api === 'direct-fallback') {

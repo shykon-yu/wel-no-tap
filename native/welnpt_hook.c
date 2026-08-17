@@ -93,6 +93,23 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     unsigned short observed_source_port, unsigned short observed_target_port);
 static void log_line(const char *format, ...);
 
+static void reset_game_session(const char *reason) {
+    LONG generation;
+    int had_session;
+    EnterCriticalSection(&g_state_lock);
+    had_session = g_direct_transaction_peer_ip != 0 || g_direct_transaction_join_port != 0;
+    generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
+    g_direct_peer_ip = 0;
+    g_direct_transaction_peer_ip = 0;
+    g_direct_transaction_join_port = 0;
+    LeaveCriticalSection(&g_state_lock);
+    if (!had_session) return;
+    InterlockedExchange(&g_direct_connected, 0);
+    InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
+    log_line("\"api\":\"session-state\",\"state\":\"WAIT_JOIN\",\"generation\":%lu,\"reason\":\"%s\"",
+        (unsigned long)generation, reason);
+}
+
 static const char *packet_kind(int length) {
     if (length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) return "possible-join";
     if (length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH) return "possible-accept";
@@ -221,12 +238,14 @@ static void free_queue(virtual_socket *state) {
     state->queued = 0;
 }
 
-static int remove_socket(SOCKET handle) {
+static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     virtual_socket *state;
     int found = 0;
+    if (logical_port != NULL) *logical_port = 0;
     EnterCriticalSection(&g_state_lock);
     state = find_socket_locked(handle);
     if (state != NULL) {
+        if (logical_port != NULL) *logical_port = state->logical_port;
         free_queue(state);
         ZeroMemory(state, sizeof(*state));
         found = 1;
@@ -652,7 +671,11 @@ static int WSAAPI wel_wsarecvfrom(SOCKET handle, LPWSABUF buffers, DWORD buffer_
 }
 
 static int WSAAPI wel_closesocket(SOCKET handle) {
-    remove_socket(handle);
+    unsigned short logical_port = 0;
+    if (remove_socket(handle, &logical_port) && logical_port != 0 &&
+        logical_port == g_direct_transaction_join_port) {
+        reset_game_session("match-socket-closed");
+    }
     return g_real_closesocket(handle);
 }
 
@@ -798,6 +821,7 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
             int connected = strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0;
             int failed = strncmp(state, "failed", 6) == 0;
+            int disconnected = strncmp(state, "disconnected", 12) == 0;
             LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             if (connected && selected == WELNPT_GAME_PATH_PENDING) {
                 if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT,
@@ -815,7 +839,11 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                         (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
                 }
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-            } else if (!connected && selected == WELNPT_GAME_PATH_DIRECT) {
+            } else if (failed && selected == WELNPT_GAME_PATH_DIRECT) {
+                log_line("\"api\":\"direct-fallback\",\"reason\":\"peer-ice-failed\"");
+                reset_game_session("peer-ice-failed");
+                selected = WELNPT_GAME_PATH_PENDING;
+            } else if (disconnected && selected == WELNPT_GAME_PATH_DIRECT) {
                 InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
                 selected = WELNPT_GAME_PATH_RELAY;
                 log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"direct-disconnected\"");
