@@ -25,7 +25,6 @@
 #define WELNPT_GAME_PATH_PENDING 0
 #define WELNPT_GAME_PATH_DIRECT 1
 #define WELNPT_GAME_PATH_RELAY 2
-#define WELNPT_DIRECT_DECISION_MS 2500
 
 typedef SOCKET (WSAAPI *wel_socket_fn)(int, int, int);
 typedef SOCKET (WSAAPI *wel_wsasocketa_fn)(int, int, int, LPWSAPROTOCOL_INFOA, GROUP, DWORD);
@@ -71,10 +70,11 @@ static struct sockaddr_in g_direct_agent_address;
 static uint32_t g_direct_peer_ip;
 static uint32_t g_direct_transaction_peer_ip;
 static unsigned short g_direct_transaction_join_port;
+static volatile LONG g_direct_transaction_generation;
+static volatile LONG g_direct_transaction_has_data;
 static unsigned short g_direct_hook_port;
 static volatile LONG g_direct_connected;
 static volatile LONG g_game_path;
-static volatile LONG g_game_path_deadline;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
 static welnpt_auth_context g_auth;
@@ -91,25 +91,8 @@ static wel_wsarecvfrom_fn g_real_wsarecvfrom;
 static wel_closesocket_fn g_real_closesocket;
 
 static void report_game_peer(uint32_t target_ip, unsigned short join_port,
-    unsigned short observed_source_port, unsigned short observed_target_port);
+    unsigned short observed_source_port, unsigned short observed_target_port, int is_join);
 static void log_line(const char *format, ...);
-
-static LONG wait_for_game_path(void) {
-    LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-    while (selected == WELNPT_GAME_PATH_PENDING) {
-        DWORD now = GetTickCount();
-        DWORD deadline = (DWORD)InterlockedCompareExchange(&g_game_path_deadline, 0, 0);
-        if ((LONG)(deadline - now) <= 0) break;
-        Sleep(20);
-        selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-    }
-    if (selected == WELNPT_GAME_PATH_PENDING &&
-        InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_RELAY,
-            WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
-        log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"direct-decision-timeout\"");
-    }
-    return InterlockedCompareExchange(&g_game_path, 0, 0);
-}
 
 static void log_line(const char *format, ...) {
     char message[768];
@@ -282,23 +265,15 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		unsigned short source_port = ntohs(header->source_port);
 		unsigned short target_port = ntohs(header->target_port);
 		unsigned short join_port = payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ? source_port : target_port;
-		report_game_peer(header->source_ip, join_port, source_port, target_port);
+		report_game_peer(header->source_ip, join_port, source_port, target_port,
+			payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH);
 	}
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		header->source_ip == g_direct_transaction_peer_ip &&
 		payload_length != WELNPT_GAME_JOIN_PAYLOAD_LENGTH &&
 		payload_length != WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH) {
 		LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-		if (selected == WELNPT_GAME_PATH_PENDING && strcmp(path, "direct") == 0) {
-			if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT,
-				WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
-				InterlockedExchange(&g_direct_connected, 1);
-				log_line("\"api\":\"transport-lock\",\"path\":\"direct\",\"reason\":\"direct-packet-received\"");
-			}
-			selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-		} else if (selected == WELNPT_GAME_PATH_PENDING) {
-			selected = wait_for_game_path();
-		}
+		InterlockedExchange(&g_direct_transaction_has_data, 1);
 		if ((strcmp(path, "relay") == 0 && selected == WELNPT_GAME_PATH_DIRECT) ||
 			(strcmp(path, "direct") == 0 && selected != WELNPT_GAME_PATH_DIRECT)) {
 			log_line("\"api\":\"transport-ignore\",\"path\":\"%s\",\"reason\":\"match-path-locked\"", path);
@@ -327,35 +302,42 @@ static int send_register_packet(void) {
 }
 
 static void report_game_peer(uint32_t target_ip, unsigned short join_port,
-    unsigned short observed_source_port, unsigned short observed_target_port) {
+    unsigned short observed_source_port, unsigned short observed_target_port, int is_join) {
     char target[INET_ADDRSTRLEN];
-    char message[96];
+    char message[112];
     int length;
     int is_new_transaction;
+    LONG generation;
     if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || target_ip == 0) return;
     if (InetNtopA(AF_INET, &target_ip, target, sizeof(target)) == NULL) return;
     EnterCriticalSection(&g_state_lock);
 	is_new_transaction = g_direct_transaction_peer_ip != target_ip ||
-		g_direct_transaction_join_port != join_port;
+		g_direct_transaction_join_port != join_port ||
+		(is_join && InterlockedCompareExchange(&g_direct_transaction_has_data, 0, 0) != 0);
 	if (is_new_transaction) {
 		g_direct_transaction_peer_ip = target_ip;
 		g_direct_transaction_join_port = join_port;
+		InterlockedExchange(&g_direct_transaction_has_data, 0);
+		InterlockedIncrement(&g_direct_transaction_generation);
     }
+    generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
     LeaveCriticalSection(&g_state_lock);
     if (is_new_transaction) {
-        /* Handshake stays on relay while this match selects one data path. */
+        /* Every confirmed join gets a fresh ICE transaction. Relay carries the
+           handshake and protects gameplay until that transaction connects. */
+        g_direct_peer_ip = 0;
         InterlockedExchange(&g_direct_connected, 0);
         InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
-        InterlockedExchange(&g_game_path_deadline, (LONG)(GetTickCount() + WELNPT_DIRECT_DECISION_MS));
     }
-	length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s|%u|%u", WELNPT_GAME_PEER_PREFIX,
-		target, (unsigned)join_port, (unsigned)join_port);
+	length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s|%u|%u|%lu", WELNPT_GAME_PEER_PREFIX,
+		target, (unsigned)join_port, (unsigned)join_port, (unsigned long)generation);
     if (length <= 0) return;
     g_real_sendto(g_direct_transport, message, length, 0,
         (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
     if (is_new_transaction) {
-		log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"joinPort\":%u,\"observedSourcePort\":%u,\"observedTargetPort\":%u",
-			target, (unsigned)join_port, (unsigned)observed_source_port, (unsigned)observed_target_port);
+		log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"joinPort\":%u,\"generation\":%lu,\"observedSourcePort\":%u,\"observedTargetPort\":%u",
+			target, (unsigned)join_port, (unsigned long)generation,
+			(unsigned)observed_source_port, (unsigned)observed_target_port);
     }
 }
 
@@ -399,14 +381,14 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 		(length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH || length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH)) {
 		unsigned short target_port = ntohs(target->sin_port);
 		unsigned short join_port = length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ? source_port : target_port;
-		report_game_peer(header->target_ip, join_port, source_port, target_port);
+		report_game_peer(header->target_ip, join_port, source_port, target_port,
+			length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH);
 	}
     is_game_handshake = length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ||
         length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH;
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && !is_game_handshake &&
-        header->target_ip == g_direct_transaction_peer_ip &&
-        InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_PENDING) {
-        wait_for_game_path();
+        header->target_ip == g_direct_transaction_peer_ip) {
+        InterlockedExchange(&g_direct_transaction_has_data, 1);
     }
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && !is_game_handshake &&
         g_direct_transport != INVALID_SOCKET && header->target_ip == g_direct_peer_ip &&

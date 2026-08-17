@@ -215,10 +215,10 @@ function handleIceLine(rawLine) {
   if (line.startsWith('STATE ')) { iceState = line.slice(6) || 'unknown'; return }
   if (line.startsWith('GAME_PEER ')) {
     const payload = line.slice(10).trim()
-    const [logicalIp, sourcePort = '', targetPort = ''] = payload.split('|')
-    if (logicalIp && /^\d{1,5}$/.test(sourcePort) && /^\d{1,5}$/.test(targetPort)) {
+    const [logicalIp, sourcePort = '', targetPort = '', generation = '0'] = payload.split('|')
+    if (logicalIp && /^\d{1,5}$/.test(sourcePort) && /^\d{1,5}$/.test(targetPort) && /^\d+$/.test(generation)) {
       for (const listener of gamePeerListeners) {
-        try { listener({ logicalIp, transactionKey: `${logicalIp}|${sourcePort}|${targetPort}` }) } catch {}
+        try { listener({ logicalIp, transactionKey: `${logicalIp}|${sourcePort}|${targetPort}|${generation}` }) } catch {}
       }
     }
     return
