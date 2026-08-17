@@ -32,6 +32,7 @@ static welnpt_auth_context g_auth;
 static struct sockaddr_in g_hook_address;
 static volatile LONG g_stopping;
 static volatile LONG g_connected;
+static volatile LONG g_hook_active;
 static CRITICAL_SECTION g_output_lock;
 static CRITICAL_SECTION g_ping_lock;
 static char g_ping_nonce[64];
@@ -92,7 +93,9 @@ static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *us
 	(void)user_ptr;
 	InterlockedExchange(&g_connected, state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED);
 	output_line("STATE %s", name == NULL ? "unknown" : name);
-	notify_hook(name == NULL ? "unknown" : name);
+	if (InterlockedCompareExchange(&g_hook_active, 0, 0) != 0) {
+		notify_hook(name == NULL ? "unknown" : name);
+	}
 }
 
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr) {
@@ -156,7 +159,9 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 		int source_length = sizeof(source);
 		int received = recvfrom(g_local_socket, buffer, sizeof(buffer), 0, (struct sockaddr *)&source, &source_length);
 		if (received == 12 && memcmp(buffer, "WELICESTATE?", 12) == 0) {
-			notify_hook(InterlockedCompareExchange(&g_connected, 0, 0) != 0 ? "connected" : "connecting");
+			if (InterlockedCompareExchange(&g_hook_active, 0, 0) != 0) {
+				notify_hook(InterlockedCompareExchange(&g_connected, 0, 0) != 0 ? "connected" : "connecting");
+			}
 		} else if (received > (int)strlen(WEL_GAME_PEER_PREFIX) &&
 			memcmp(buffer, WEL_GAME_PEER_PREFIX, strlen(WEL_GAME_PEER_PREFIX)) == 0) {
 			char peer[INET_ADDRSTRLEN];
@@ -373,6 +378,7 @@ int main(int argc, char **argv) {
 	int index;
 	int validate_args = 0;
 	int no_hook = 0;
+	int standby = 0;
 	DWORD timeout = 250;
 
 	for (index = 1; index < argc; ++index) {
@@ -385,6 +391,8 @@ int main(int argc, char **argv) {
 			if (index + 1 >= argc || !parse_port(argv[++index], &hook_port)) return 2;
 		} else if (strcmp(argv[index], "--no-hook") == 0) {
 			no_hook = 1;
+		} else if (strcmp(argv[index], "--standby") == 0) {
+			standby = 1;
 		} else if (strcmp(argv[index], "--validate-args") == 0) validate_args = 1;
 		else if (strcmp(argv[index], "--self-test") == 0) return 0;
 		else return 2;
@@ -411,8 +419,11 @@ int main(int argc, char **argv) {
 		g_hook_address.sin_family = AF_INET;
 		g_hook_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
 		g_hook_address.sin_port = htons(hook_port);
-		notify_hook_agent(ntohs(local_address.sin_port));
-		notify_hook("connecting");
+		InterlockedExchange(&g_hook_active, standby ? 0 : 1);
+		if (!standby) {
+			notify_hook_agent(ntohs(local_address.sin_port));
+			notify_hook("connecting");
+		}
 	}
 
 	ZeroMemory(&config, sizeof(config));
@@ -479,6 +490,10 @@ int main(int argc, char **argv) {
 			send_relay_ping(command + 11);
 		} else if (strcmp(command, "EXIT") == 0) {
 			break;
+		} else if (strcmp(command, "ACTIVATE") == 0 && !no_hook) {
+			InterlockedExchange(&g_hook_active, 1);
+			notify_hook_agent(ntohs(local_address.sin_port));
+			notify_hook("connecting");
 		}
 	}
 

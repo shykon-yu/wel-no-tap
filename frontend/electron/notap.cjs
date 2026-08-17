@@ -30,6 +30,9 @@ let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
 const probeAgents = new Map()
+let standbyAgentKey = ''
+let standbyPromise = null
+let standbyGeneration = 0
 
 function helperCandidates() {
   return [
@@ -318,6 +321,27 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hook
   return waitForIceCandidate(child)
 }
 
+function stopIceChild(child) {
+  if (!child || child.killed) return Promise.resolve()
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = () => { if (!settled) { settled = true; resolve() } }
+    const timer = setTimeout(() => { try { child.kill() } catch {}; finish() }, 1500)
+    child.once('close', () => { clearTimeout(timer); finish() })
+    try { child.stdin.write('EXIT\n') } catch { try { child.kill() } catch {} }
+  })
+}
+
+async function clearStandbyAgent() {
+  standbyGeneration += 1
+  const key = standbyAgentKey
+  standbyAgentKey = ''
+  const pendingKey = standbyPromise?.probeKey
+  standbyPromise = null
+  if (key) stopProbeIce(key)
+  if (pendingKey && pendingKey !== key) stopProbeIce(pendingKey)
+}
+
 async function prepareIce(options) {
   await startIceAgent(options || {})
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
@@ -325,16 +349,93 @@ async function prepareIce(options) {
 
 async function resetIce() {
   if (!iceOptions) throw new Error('直连组件尚未准备')
+  await clearStandbyAgent()
   const previous = iceProcess
   iceProcess = null
-  if (previous && !previous.killed) {
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { try { previous.kill() } catch {}; resolve() }, 1500)
-      previous.once('close', () => { clearTimeout(timer); resolve() })
-      try { previous.stdin.write('EXIT\n') } catch { try { previous.kill() } catch {} }
-    })
-  }
+  await stopIceChild(previous)
   await startIceAgent({ ...iceOptions, hookPort: iceHookPort })
+  return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
+}
+
+function attachActiveIceProcess(child) {
+  let buffer = ''
+  const consume = (chunk) => {
+    buffer += chunk.toString('utf8')
+    let newline
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline + 1)
+      buffer = buffer.slice(newline + 1)
+      rememberIceDiagnostic(line)
+      handleIceLine(line)
+    }
+  }
+  child.stdout.on('data', consume)
+  child.stderr.on('data', (chunk) => { rememberIceDiagnostic('stderr: ' + chunk.toString('utf8')) })
+  child.once('close', (code) => {
+    if (iceProcess !== child) return
+    iceProcess = null
+    iceState = 'failed'
+    const detail = iceDiagnostics.length ? '：' + iceDiagnostics.slice(-3).join(' | ') : ''
+    iceExitError = 'ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）' + detail
+  })
+}
+
+async function prewarmIce() {
+  if (!iceOptions) return { ready: false, state: 'waiting' }
+  if (standbyAgentKey && probeAgents.has(standbyAgentKey)) return { ready: true, state: 'ready' }
+  if (standbyPromise) return standbyPromise
+  const generation = standbyGeneration
+  const options = { ...iceOptions, hookPort: iceHookPort }
+  const gathering = createProbeIce({ ...options, standby: true, hookPort: iceHookPort })
+  standbyPromise = gathering
+    .then((result) => {
+      if (generation !== standbyGeneration) {
+        stopProbeIce(result.probeKey)
+        return { ready: false, state: 'cancelled' }
+      }
+      standbyAgentKey = result.probeKey
+      return { ready: true, state: 'ready', localDescription: result.localDescription }
+    })
+    .catch((error) => ({ ready: false, state: 'failed', error: String(error?.message || error) }))
+    .finally(() => { if (generation === standbyGeneration) standbyPromise = null })
+  standbyPromise.probeKey = gathering.probeKey
+  return standbyPromise
+}
+
+async function activateIce() {
+  if (!iceOptions) return null
+  if (!standbyAgentKey || !probeAgents.has(standbyAgentKey)) await prewarmIce()
+  const key = standbyAgentKey
+  const standby = key ? probeAgents.get(key) : null
+  if (!standby || !standby.localDescription || !standby.localPort) return null
+
+  const previous = iceProcess
+  iceProcess = null
+  await stopIceChild(previous)
+  probeAgents.delete(key)
+  standbyAgentKey = ''
+  standbyPromise = null
+
+  iceProcess = standby.child
+  iceLocalDescription = standby.localDescription
+  iceAgentPort = standby.localPort
+  iceHookPort = standby.hookPort || iceHookPort
+  iceOptions = standby.options || iceOptions
+  iceState = 'gathering'
+  iceExitError = ''
+  iceDiagnostics = []
+  iceLineBuffer = ''
+  iceSdpBuffer = ''
+  readingIceSdp = false
+  lastRemoteDescription = ''
+  activeGamePeerIp = ''
+  attachActiveIceProcess(iceProcess)
+  try { iceProcess.stdin.write('ACTIVATE\n') } catch {
+    await stopIceChild(iceProcess)
+    iceProcess = null
+    iceState = 'failed'
+    return null
+  }
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 
@@ -385,23 +486,34 @@ function stopProbeIce(probeKey) {
   return { stopped: true }
 }
 
-function createProbeIce({ stunHost, stunPort }) {
+function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '' }) {
   const executable = locate(iceCandidates())
   if (!executable) return Promise.reject(new Error('缺少 welnptice.exe，请重新解压完整客户端'))
   const key = randomProbeKey()
   const environment = { ...process.env }
-  delete environment.WEL_NOTAP_RELAY
-  delete environment.WEL_NOTAP_ROOM
-  delete environment.WEL_NOTAP_LOGICAL_IP
-  delete environment.WEL_NOTAP_TOKEN
-  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--no-hook'], {
+  if (standby && relay && room && logicalIp && token) {
+    environment.WEL_NOTAP_RELAY = String(relay)
+    environment.WEL_NOTAP_ROOM = String(room)
+    environment.WEL_NOTAP_LOGICAL_IP = String(logicalIp)
+    environment.WEL_NOTAP_TOKEN = String(token)
+  } else {
+    delete environment.WEL_NOTAP_RELAY
+    delete environment.WEL_NOTAP_ROOM
+    delete environment.WEL_NOTAP_LOGICAL_IP
+    delete environment.WEL_NOTAP_TOKEN
+  }
+  const args = ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0)]
+  if (standby) args.push('--hook-port', String(hookPort || 0), '--standby')
+  else args.push('--no-hook')
+  const child = spawn(executable, args, {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
   })
   const probe = {
     key, child, state: 'gathering', localDescription: '', localPort: 0,
     buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
     remoteWaiter: null, pingUnavailable: false, pendingPing: null,
-    retryTimer: null, timeoutTimer: null,
+    retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0,
+    options: { stunHost, stunPort, relay, room, logicalIp, token },
   }
   probeAgents.set(key, probe)
   const consume = (chunk) => {
@@ -475,8 +587,8 @@ function createProbeIce({ stunHost, stunPort }) {
       pending.reject(new Error(probe.error))
     }
   })
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + 12000
+  const gatheringPromise = new Promise((resolve, reject) => {
+    const deadline = Date.now() + (standby ? 26000 : 12000)
     const timer = setInterval(() => {
       if (probe.localDescription && probe.localPort && probeAgents.get(key) === probe) {
         clearInterval(timer)
@@ -488,6 +600,8 @@ function createProbeIce({ stunHost, stunPort }) {
       }
     }, 100)
   })
+  gatheringPromise.probeKey = key
+  return gatheringPromise
 }
 
 function configureProbeIce(probeKey, remoteDescription) {
@@ -714,6 +828,7 @@ async function disconnect() {
     try { iceProcess.kill() } catch {}
   }
   iceProcess = null
+  await clearStandbyAgent()
   iceState = 'waiting'
   iceLocalDescription = ''
   if (pendingRelayPing) {
@@ -760,6 +875,8 @@ module.exports = {
   transportStatus,
   prepareIce,
   resetIce,
+  prewarmIce,
+  activateIce,
   pingRelay,
   pingRelayPeer,
 }

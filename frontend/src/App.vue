@@ -562,11 +562,15 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
     // match even if signaling later fails. The next transaction must rebuild
     // it instead of reusing an agent with a stale remote SDP.
     activeGamePeerAgentUsed = true
-    if (needsFreshAgent) {
+    // The room agent is only a readiness/candidate collector. Every real
+    // match gets a fresh agent, and later matches consume the prewarmed one.
+    if (!needsFreshAgent) {
       const ice = await desktop()!.resetIce()
       localIceDescription.value = ice.localDescription
     } else {
-      localIceDescription.value = await waitForFormalIceDescription(lease, epoch)
+      const activated = await desktop()!.activateIce()
+      const ice = activated || await desktop()!.resetIce()
+      localIceDescription.value = ice.localDescription
     }
     if (!localIceDescription.value || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
 
@@ -589,6 +593,9 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
     if (!configured) return false
     activeGamePeerIp = member.virtual_ip
     activeGamePeerTransaction = transactionKey
+    // Do not let the next match reuse this agent or its remote SDP. The
+    // standby process never talks to Hook until activateIce() promotes it.
+    void desktop()?.prewarmIce()
     return true
   } catch {
     return false
