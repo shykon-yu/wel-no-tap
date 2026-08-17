@@ -20,6 +20,7 @@ const launchChoiceOpen = ref(false)
 const launchingGame = ref(false)
 const directCandidateStatus = ref<'waiting' | 'gathering' | 'ready' | 'relay-only'>('waiting')
 const directCandidateMessage = ref('尚未收集直连候选')
+const localIceDescription = ref('')
 const pingResults = ref<Record<number, PingResult | undefined>>({})
 const selectedMemberId = ref<number | null>(null)
 const form = ref({ username: '', password: '' })
@@ -124,6 +125,7 @@ function clearRoomSessionState() {
   networkStatus.value = null
   directCandidateStatus.value = 'waiting'
   directCandidateMessage.value = '尚未收集直连候选'
+  localIceDescription.value = ''
   roomEntryPreparing.value = false
   launchChoiceOpen.value = false
   roomPreparationTask = null
@@ -291,6 +293,7 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
       logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
     })
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
+    localIceDescription.value = ice.localDescription
     await roomApi.publishIce(lease.room_id, ice.localDescription)
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
     if (candidateCount(ice.localDescription) > 0) {
@@ -458,8 +461,6 @@ async function launchGameNow(waitForDirect = false) {
   try {
     gamePeerTasks.clear()
     gamePeerTransactions.clear()
-    activeGamePeerIp = ''
-    activeGamePeerTransaction = ''
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,
       relay: `${activeLease.value.relay_host}:${activeLease.value.relay_port}`,
@@ -579,8 +580,8 @@ async function pingMember(member: RoomMember) {
   }
 }
 
-async function waitForPeerProbeAnswer(roomID: number, probeID: number) {
-  const deadline = Date.now() + 18000
+async function waitForPeerProbeAnswer(roomID: number, probeID: number, timeoutMs = 18000) {
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await roomApi.peerProbe(roomID, probeID)
     if (result.probe.target_description) return result.probe
@@ -632,49 +633,78 @@ async function answerIncomingPeerProbes(lease: Lease) {
   }
 }
 
+async function waitForFormalIceDescription(lease: Lease, epoch: number) {
+  if (localIceDescription.value) return localIceDescription.value
+  if (roomPreparationTask) {
+    try { await roomPreparationTask } catch { return '' }
+  }
+  if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return ''
+  return localIceDescription.value
+}
+
+async function waitForIncomingGameProbe(roomID: number, requesterUserID: number, epoch: number) {
+  const deadline = Date.now() + 30000
+  while (Date.now() < deadline) {
+    if (epoch !== gamePeerEpoch || !activeLease.value || activeLease.value.room_id !== roomID) return null
+    try {
+      const result = await roomApi.incomingPeerProbes(roomID, 'game')
+      const probe = result.probes.find(item => item.requester_user_id === requesterUserID && item.requester_description)
+      if (probe) return probe
+    } catch {
+      // The relay path remains available while game signaling retries.
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 500))
+  }
+  return null
+}
+
 async function configureGamePeerOnce(logicalIp: string, transactionKey: string, epoch: number) {
   const lease = activeLease.value
-  if (!lease || !desktop()?.configureIce || !desktop()?.resetIce) return false
-  let previousDescription = ''
+  if (!lease || !desktop()?.configureIce || !desktop()?.resetIce || !user.value) return false
+  let member: RoomMember | undefined
   try {
     const current = await roomApi.members(lease.room_id)
-    const member = current.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
-    previousDescription = member?.ice_description || ''
+    member = current.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
     roomMembers.value = current.members
-  } catch {}
-  const needsFreshAgent = activeGamePeerIp !== '' && activeGamePeerTransaction !== transactionKey
-  if (needsFreshAgent) {
-    try {
+  } catch { return false }
+  if (!member || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+
+  // The lower user ID is the single offerer for this match. Both peers still
+  // rebuild their formal ICE agent, but only one creates the signaling row.
+  const isOfferer = user.value.id < member.user_id
+  const needsFreshAgent = activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
+  try {
+    if (needsFreshAgent) {
       const ice = await desktop()!.resetIce()
-      if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
-      await roomApi.publishIce(lease.room_id, ice.localDescription)
-    } catch { return false }
-  }
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    try {
-      const result = await roomApi.members(lease.room_id)
-      if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
-      roomMembers.value = result.members
-      const member = result.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
-      if (member?.ice_description) {
-        // Both peers rebuild on a new match. Prefer the opponent's refreshed
-        // candidate instead of pairing a fresh local agent with its old match.
-        if (needsFreshAgent && member.ice_description === previousDescription && attempt < 12) {
-          await new Promise(resolve => window.setTimeout(resolve, 1000))
-          continue
-        }
-        const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription: member.ice_description })
-        if (!configured) return false
-        activeGamePeerIp = member.virtual_ip
-        activeGamePeerTransaction = transactionKey
-        return true
-      }
-    } catch {
-      // Transport status comes only from actual Hook traffic.
+      localIceDescription.value = ice.localDescription
+    } else {
+      localIceDescription.value = await waitForFormalIceDescription(lease, epoch)
     }
-    await new Promise(resolve => window.setTimeout(resolve, 1000))
+    if (!localIceDescription.value || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+
+    let remoteDescription = ''
+    if (isOfferer) {
+      const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, localIceDescription.value, {
+        purpose: 'game', sessionKey: transactionKey,
+      })
+      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, 30000)
+      if (answered.requester_user_id !== user.value.id || answered.target_user_id !== member.user_id || !answered.target_description) return false
+      remoteDescription = answered.target_description
+    } else {
+      const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, epoch)
+      if (!incoming?.requester_description) return false
+      remoteDescription = incoming.requester_description
+      await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value)
+    }
+    if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+    const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription })
+    if (!configured) return false
+    activeGamePeerIp = member.virtual_ip
+    activeGamePeerTransaction = transactionKey
+    return true
+  } catch {
+    return false
   }
-  return false
 }
 
 function configureGamePeer(event: { logicalIp: string; transactionKey: string }) {

@@ -8,7 +8,7 @@ export type User = { id: number; username: string; nickname: string }
 export type Room = { id: number; code: string; name: string; region: string; subnet_cidr: string; capacity: number; members: number; status: 'open' | 'maintenance' | 'closed' }
 export type RoomMember = { user_id: number; username: string; nickname: string; virtual_ip: string; real_ip?: string; is_self: boolean; ice_description?: string; ice_state: 'waiting' | 'ready' }
 export type Lease = { room_id: number; virtual_ip: string; logical_ip?: string; username: string; expires_at: string; subnet_cidr: string; community: string; relay_host: string; relay_port: number; relay_token: string; ice_stun_host: string; ice_stun_port: number }
-export type PeerProbe = { id: number; requester_user_id: number; target_user_id: number; requester_description?: string; target_description?: string; expires_at: string }
+export type PeerProbe = { id: number; requester_user_id: number; target_user_id: number; purpose?: 'ping' | 'game'; session_key?: string; requester_description?: string; target_description?: string; expires_at: string }
 
 let token = localStorage.getItem(ACCESS_TOKEN_KEY) ?? ''
 
@@ -58,8 +58,8 @@ export const roomApi = {
   heartbeat: (roomID: number) => request<{ expires_at: string }>(route(runtimeConfig.apiRoomHeartbeatPath, roomID), { method: 'POST', body: '{}' }),
   leave: (roomID: number) => request<{ ok: boolean }>(route(runtimeConfig.apiRoomLeavePath, roomID), { method: 'POST', body: '{}' }),
   publishIce: (roomID: number, localDescription: string) => request<{ state: string }>(route(runtimeConfig.apiRoomIcePath, roomID), { method: 'POST', body: JSON.stringify({ local_description: localDescription }) }),
-  createPeerProbe: (roomID: number, targetUserID: number, localDescription: string) => request<{ probe: PeerProbe }>(route(runtimeConfig.apiRoomPeerProbesPath, roomID), { method: 'POST', body: JSON.stringify({ target_user_id: targetUserID, local_description: localDescription }) }),
-  incomingPeerProbes: (roomID: number) => request<{ probes: PeerProbe[] }>(`${route(runtimeConfig.apiRoomPeerProbesPath, roomID)}/incoming`),
+  createPeerProbe: (roomID: number, targetUserID: number, localDescription: string, options: { purpose?: 'ping' | 'game'; sessionKey?: string } = {}) => request<{ probe: PeerProbe }>(route(runtimeConfig.apiRoomPeerProbesPath, roomID), { method: 'POST', body: JSON.stringify({ target_user_id: targetUserID, purpose: options.purpose ?? 'ping', session_key: options.sessionKey ?? '', local_description: localDescription }) }),
+  incomingPeerProbes: (roomID: number, purpose: 'ping' | 'game' = 'ping') => request<{ probes: PeerProbe[] }>(`${route(runtimeConfig.apiRoomPeerProbesPath, roomID)}/incoming?purpose=${purpose}`),
   peerProbe: (roomID: number, probeID: number) => request<{ probe: PeerProbe }>(`${route(runtimeConfig.apiRoomPeerProbesPath, roomID)}/${probeID}`),
   answerPeerProbe: (roomID: number, probeID: number, localDescription: string) => request<{ state: string }>(`${route(runtimeConfig.apiRoomPeerProbesPath, roomID)}/${probeID}/answer`, { method: 'POST', body: JSON.stringify({ local_description: localDescription }) }),
 }
