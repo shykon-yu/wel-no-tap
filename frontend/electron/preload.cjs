@@ -20,10 +20,6 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   prepareIce: (options) => ipcRenderer.invoke('notap-prepare-ice', options),
   resetIce: () => ipcRenderer.invoke('notap-reset-ice'),
   configureIce: (options) => ipcRenderer.invoke('notap-configure-ice', options),
-  createProbeIce: (options) => ipcRenderer.invoke('notap-create-probe-ice', options),
-  configureProbeIce: (probeKey, remoteDescription) => ipcRenderer.invoke('notap-configure-probe-ice', probeKey, remoteDescription),
-  pingProbeIce: (probeKey) => ipcRenderer.invoke('notap-ping-probe-ice', probeKey),
-  stopProbeIce: (probeKey) => ipcRenderer.invoke('notap-stop-probe-ice', probeKey),
   onGamePeer: (callback) => {
     const listener = (_event, gamePeer) => callback(gamePeer)
     ipcRenderer.on('notap-game-peer', listener)

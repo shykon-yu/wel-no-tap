@@ -148,7 +148,7 @@ function rememberIceDiagnostic(rawLine) {
   if (iceDiagnostics.length > 12) iceDiagnostics.shift()
 }
 
-function waitForIceCandidate(child, timeoutMs = 12000) {
+function waitForIceCandidate(child, timeoutMs = 26000) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs
     const timer = setInterval(() => {
@@ -733,10 +733,6 @@ function pingHost(host) {
 module.exports = {
   configureIce: setRemoteIce,
   onGamePeer,
-  createProbeIce,
-  configureProbeIce,
-  pingProbeIce,
-  stopProbeIce,
   disconnect,
   launch,
   launchElevated,

@@ -417,6 +417,9 @@ int main(int argc, char **argv) {
 
 	ZeroMemory(&config, sizeof(config));
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;
+	/* WE8 is IPv4 UDP. Binding the ICE socket to an IPv4 wildcard prevents
+	 * Win7's IPv6 tunnel adapters from becoming part of candidate gathering. */
+	config.bind_address = "0.0.0.0";
 	config.stun_server_host = stun_host;
 	config.stun_server_port = stun_port;
 	config.cb_state_changed = on_state_changed;
