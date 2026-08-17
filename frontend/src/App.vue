@@ -60,9 +60,11 @@ const gamePeerTransactions = new Set<string>()
 const pingingMemberIds = ref<Set<number>>(new Set())
 let activeGamePeerIp = ''
 let activeGamePeerTransaction = ''
+let activeGamePeerAgentUsed = false
 let gamePeerEpoch = 0
 let roomPreparationEpoch = 0
 let roomPreparationTask: Promise<'ready' | 'relay-only'> | null = null
+let gamePeerOperation: Promise<boolean> = Promise.resolve(true)
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -118,7 +120,9 @@ function clearRoomSessionState() {
   gamePeerTransactions.clear()
   activeGamePeerIp = ''
   activeGamePeerTransaction = ''
+  activeGamePeerAgentUsed = false
   gamePeerEpoch = 0
+  gamePeerOperation = Promise.resolve(true)
   roomPreparationEpoch += 1
 }
 
@@ -489,9 +493,10 @@ async function pingMember(member: RoomMember) {
   }
 }
 
-async function waitForPeerProbeAnswer(roomID: number, probeID: number, timeoutMs = 18000) {
+async function waitForPeerProbeAnswer(roomID: number, probeID: number, timeoutMs = 18000, epoch?: number) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    if (epoch !== undefined && epoch !== gamePeerEpoch) throw new Error('比赛对手已切换，取消旧直连协商')
     const result = await roomApi.peerProbe(roomID, probeID)
     if (result.probe.target_description) return result.probe
     await new Promise(resolve => window.setTimeout(resolve, 400))
@@ -539,8 +544,12 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   // The lower user ID is the single offerer for this match. Both peers still
   // rebuild their formal ICE agent, but only one creates the signaling row.
   const isOfferer = user.value.id < member.user_id
-  const needsFreshAgent = activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
+  const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
+    // Once a real game peer has been observed, this agent belongs to that
+    // match even if signaling later fails. The next transaction must rebuild
+    // it instead of reusing an agent with a stale remote SDP.
+    activeGamePeerAgentUsed = true
     if (needsFreshAgent) {
       const ice = await desktop()!.resetIce()
       localIceDescription.value = ice.localDescription
@@ -554,7 +563,7 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
       const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, localIceDescription.value, {
         purpose: 'game', sessionKey: transactionKey,
       })
-      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, 30000)
+      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, 30000, epoch)
       if (answered.requester_user_id !== user.value.id || answered.target_user_id !== member.user_id || !answered.target_description) return false
       remoteDescription = answered.target_description
     } else {
@@ -580,7 +589,13 @@ function configureGamePeer(event: { logicalIp: string; transactionKey: string })
   if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
   gamePeerTransactions.add(transactionKey)
   const epoch = ++gamePeerEpoch
-  const task = configureGamePeerOnce(normalizedIp, transactionKey, epoch)
+  // Only one operation may reset/configure the formal agent at a time. A
+  // newer game transaction advances the epoch, causing an older poll to abort
+  // before the queued operation starts.
+  const task = gamePeerOperation
+    .catch(() => false)
+    .then(() => configureGamePeerOnce(normalizedIp, transactionKey, epoch))
+  gamePeerOperation = task
   gamePeerTasks.set(transactionKey, task)
   void task.then((configured) => {
     if (gamePeerTasks.get(transactionKey) === task) gamePeerTasks.delete(transactionKey)

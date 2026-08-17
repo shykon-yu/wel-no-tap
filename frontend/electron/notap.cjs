@@ -619,7 +619,7 @@ async function launchElevated(options) {
   const argumentList = args.map(windowsCommandArgument).join(' ')
   // Start-Process -Wait also follows WE8.exe, which the helper launches. Wait for
   // the helper process itself so the UI can resume as soon as Hook injection ends.
-  const script = `$process = Start-Process -FilePath ${powerShellLiteral(helper)} -ArgumentList ${powerShellLiteral(argumentList)} -Verb RunAs -WindowStyle Hidden -PassThru; if (-not $process.WaitForExit(15000)) { exit 124 }; exit $process.ExitCode`
+  const script = `$process = Start-Process -FilePath ${powerShellLiteral(helper)} -ArgumentList ${powerShellLiteral(argumentList)} -Verb RunAs -WindowStyle Hidden -PassThru; if (-not $process.WaitForExit(30000)) { exit 124 }; exit $process.ExitCode`
   const encoded = Buffer.from(script, 'utf16le').toString('base64')
   const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],

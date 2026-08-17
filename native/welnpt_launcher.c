@@ -248,7 +248,7 @@ int wmain(int argc, wchar_t **argv) {
         }
         resumed_for_apc = 1;
     }
-    if (WaitForSingleObject(ready_event, 5000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(ready_event, 15000) != WAIT_OBJECT_0) {
         fputs(apc_remote_path != NULL
             ? "Hook module did not initialize through QueueUserAPC\n"
             : "Hook module did not initialize through CreateRemoteThread\n", stderr);
