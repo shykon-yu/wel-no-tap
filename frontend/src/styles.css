@@ -45,5 +45,10 @@
 .game-path { display: block; max-width: min(720px, 62vw); overflow: hidden; color: #33484f; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .game-path.empty { color: #8a989d; font-family: inherit; }
 .secondary-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.preparation-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; background: rgba(23, 52, 56, .58); }
+.preparation-panel { width: min(360px, calc(100vw - 40px)); display: grid; justify-items: center; gap: 12px; padding: 30px 24px; color: #20393f; background: #fff; border-radius: 8px; box-shadow: 0 20px 60px rgba(0, 0, 0, .2); text-align: center; }
+.preparation-panel svg { color: #18676a; }
+.preparation-panel h3 { margin: 0; font-size: 18px; }
+.preparation-panel p { margin: 0; color: #75858a; font-size: 13px; }
 @media (max-width: 760px) { .game-path-panel { align-items: flex-start; flex-direction: column; } .game-path { max-width: 100%; } }
 @media (max-width: 760px) { .room-workspace { grid-template-columns: 1fr; } .room-members-panel { padding: 18px 0 0; border-top: 1px solid #d7e0e3; border-left: 0; } }

@@ -608,7 +608,7 @@ function windowsCommandArgument(value) {
   return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
 }
 
-function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) {
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
@@ -619,7 +619,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) 
   resetTransportTracking(logPath)
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
-  if (iceProcess && iceAgentPort && iceHookPort) {
+  if (direct && iceProcess && iceAgentPort && iceHookPort) {
     args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
   }
   return { helper, args, logPath }
@@ -628,7 +628,10 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) 
 async function launchElevated(options) {
   // Match the normal launch path: provide the direct agent when it is ready,
   // but never wait for full ICE gathering before starting the Hook.
-  await waitForIceAgent()
+  if (options?.direct !== false) {
+    await waitForIceAgent()
+    if (!iceLocalDescription) throw new Error('直连组件 candidate 尚未准备完成，请稍候再启动游戏')
+  }
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
   const argumentList = args.map(windowsCommandArgument).join(' ')
   // Start-Process -Wait also follows WE8.exe, which the helper launches. Wait for
@@ -653,7 +656,7 @@ async function launchElevated(options) {
   })
 }
 
-async function launch({ gamePath, relay, room, logicalIp, token }) {
+async function launch({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
@@ -661,9 +664,10 @@ async function launch({ gamePath, relay, room, logicalIp, token }) {
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
-  // Give the background ICE process a short chance to expose its local UDP
-  // port. Never wait for the 12-second candidate gathering deadline here.
-  await waitForIceAgent()
+  if (direct) {
+    await waitForIceAgent()
+    if (!iceLocalDescription) throw new Error('直连组件 candidate 尚未准备完成，请稍候再启动游戏')
+  }
 
   const logPath = ensureLogPath()
   resetTransportTracking(logPath)
@@ -675,7 +679,7 @@ async function launch({ gamePath, relay, room, logicalIp, token }) {
     WEL_NOTAP_TOKEN: String(token),
     WEL_NOTAP_LOG_PATH: logPath,
   }
-  if (iceProcess && iceAgentPort && iceHookPort) {
+  if (direct && iceProcess && iceAgentPort && iceHookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
   }

@@ -5,9 +5,10 @@ const ACCESS_TOKEN_KEY = `wel.no-tap.access-token:${apiBase}`
 const LEGACY_ACCESS_TOKEN_KEY = 'pes8.access-token'
 
 export type User = { id: number; username: string; nickname: string }
-export type Room = { id: number; code: string; name: string; region: string; subnet_cidr: string; capacity: number; members: number; status: 'open' | 'maintenance' | 'closed' }
+export type ConnectionMode = 'direct' | 'relay'
+export type Room = { id: number; code: string; name: string; region: string; connection_mode: ConnectionMode; subnet_cidr: string; capacity: number; members: number; status: 'open' | 'maintenance' | 'closed' }
 export type RoomMember = { user_id: number; username: string; nickname: string; virtual_ip: string; real_ip?: string; is_self: boolean; ice_description?: string; ice_state: 'waiting' | 'ready' }
-export type Lease = { room_id: number; virtual_ip: string; logical_ip?: string; username: string; expires_at: string; subnet_cidr: string; community: string; relay_host: string; relay_port: number; relay_token: string; ice_stun_host: string; ice_stun_port: number }
+export type Lease = { room_id: number; virtual_ip: string; logical_ip?: string; username: string; expires_at: string; subnet_cidr: string; community: string; relay_host: string; relay_port: number; relay_token: string; ice_stun_host: string; ice_stun_port: number; connection_mode: ConnectionMode }
 export type PeerProbe = { id: number; requester_user_id: number; target_user_id: number; purpose?: 'ping' | 'game'; session_key?: string; requester_description?: string; target_description?: string; expires_at: string }
 
 let token = localStorage.getItem(ACCESS_TOKEN_KEY) ?? ''

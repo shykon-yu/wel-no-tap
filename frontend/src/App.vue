@@ -16,6 +16,8 @@ const warningMessage = ref('')
 const notice = ref('')
 const gameTransportSummary = ref('尚未启动游戏')
 const launchingGame = ref(false)
+const roomPreparing = ref(false)
+const roomPreparationMessage = ref('')
 const directCandidateStatus = ref<'waiting' | 'gathering' | 'ready' | 'relay-only'>('waiting')
 const directCandidateMessage = ref('尚未收集直连候选')
 const localIceDescription = ref('')
@@ -27,11 +29,12 @@ const LEGACY_GAME_PATH_KEY = 'pes8.game-path'
 const gamePath = ref(localStorage.getItem(GAME_PATH_KEY) ?? localStorage.getItem(LEGACY_GAME_PATH_KEY) ?? '')
 const totalOnline = computed(() => rooms.value.reduce((total, room) => total + room.members, 0))
 const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => room.id === activeLease.value?.room_id) ?? null : null)
-const displayRoomName = (room: Room) => `房间 ${String(room.id).padStart(2, '0')}`
+const displayRoomName = (room: Room) => `${room.connection_mode === 'direct' ? '直连' : '中继'} ${String(room.id).padStart(2, '0')}`
 const activeRoomName = computed(() => activeRoom.value ? displayRoomName(activeRoom.value) : (activeLease.value ? `房间 ${String(activeLease.value.room_id).padStart(2, '0')}` : '未进入房间'))
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
+  if (activeLease.value.connection_mode === 'relay') return `${activeRoomName.value} · 仅使用云中继`
   if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 直连组件准备中，中继已连接`
   if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
   if (directCandidateStatus.value === 'relay-only') return `${activeRoomName.value} · 未发现直连候选 · 仅使用中继`
@@ -109,6 +112,8 @@ function clearRoomSessionState() {
   networkStatus.value = null
   directCandidateStatus.value = 'waiting'
   directCandidateMessage.value = '尚未收集直连候选'
+  roomPreparing.value = false
+  roomPreparationMessage.value = ''
   localIceDescription.value = ''
   roomPreparationTask = null
   pingResults.value = {}
@@ -260,12 +265,12 @@ function isCurrentRoomPreparation(lease: Lease, epoch: number) {
 
 async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 'relay-only'> {
   const desktopApi = desktop()
-  if (!desktopApi) return 'relay-only'
+  if (!desktopApi) throw new Error('直连组件不可用：当前不是 Windows 客户端')
 
-  // Firewall rules are only an optimization for ICE/Ping. They are deliberately
-  // best-effort and must never hold the room entry or relay fallback hostage.
+  // Firewall rules are only needed by the direct room. Relay rooms must not
+  // start ICE or touch the ICE firewall policy at all.
   void desktopApi.ensureFirewall({}).catch(() => undefined)
-  if (!desktopApi.prepareIce) return 'relay-only'
+  if (!desktopApi.prepareIce) throw new Error('直连组件不可用：welnptice.exe 接口缺失')
 
   try {
     const ice = await desktopApi.prepareIce({
@@ -284,18 +289,15 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
       return 'ready'
     }
     directCandidateStatus.value = 'relay-only'
-    directCandidateMessage.value = '未发现可用直连候选，当前使用中继'
-    notice.value = `已进入房间，${directCandidateMessage.value}`
-    return 'relay-only'
+    directCandidateMessage.value = '未发现可用直连候选'
+    throw new Error('welnptice.exe 未返回可用 candidate')
   } catch (error) {
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
     directCandidateStatus.value = 'relay-only'
     directCandidateMessage.value = '直连候选暂未就绪，当前使用中继'
     notice.value = `已进入房间，${directCandidateMessage.value}`
-    // Do not turn an optional ICE failure into a room-entry error. Keep the
-    // detail in the local session log and leave relay/search fully usable.
-    console.warn('直连工具准备失败，继续使用中继', messageOf(error))
-    return 'relay-only'
+    console.warn('直连组件准备失败', messageOf(error))
+    throw new Error(`直连组件准备失败：${messageOf(error)}`)
   }
 }
 
@@ -308,22 +310,27 @@ async function joinRoom(room: Room) {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
     const preparationEpoch = ++roomPreparationEpoch
-    directCandidateStatus.value = 'gathering'
-    directCandidateMessage.value = '直连组件准备中，中继已可用'
+    const directRoom = lease.connection_mode === 'direct'
+    directCandidateStatus.value = directRoom ? 'gathering' : 'relay-only'
+    directCandidateMessage.value = directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
     networkStatus.value = {
       ready: true,
       connected: true,
-      message: '房间已准备，中继兜底可用；直连工具正在后台准备',
+      message: directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
       actualIp: lease.logical_ip || lease.virtual_ip,
+    }
+    roomPreparationTask = directRoom ? prepareRoomTools(lease, preparationEpoch) : Promise.resolve<'relay-only'>('relay-only')
+    if (directRoom) {
+      roomPreparing.value = true
+      roomPreparationMessage.value = '直连组件准备中，请稍候'
+      const result = await roomPreparationTask
+      if (result !== 'ready') throw new Error('直连候选未收集完成，未进入直连房间')
     }
     startLeaseHeartbeat()
     startRoomMembersMonitor()
-    notice.value = '已进入房间，中继兜底可用；直连组件正在后台准备'
-    // ICE is an optimization. Joining the room and relay search must not wait
-    // for STUN or an old Windows adapter to finish gathering candidates.
-    const preparationTask = prepareRoomTools(lease, preparationEpoch)
-    roomPreparationTask = preparationTask
-    void preparationTask.catch(() => undefined)
+    roomPreparing.value = false
+    roomPreparationMessage.value = ''
+    notice.value = directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       await forceSignedOut(error.message)
@@ -336,6 +343,8 @@ async function joinRoom(room: Room) {
     }
     if (lease) try { await roomApi.leave(room.id) } catch { /* the lease reaper will clean it up */ }
     activeLease.value = null
+    roomPreparing.value = false
+    roomPreparationMessage.value = ''
     networkStatus.value = null
     errorMessage.value = messageOf(error)
   } finally {
@@ -428,6 +437,7 @@ async function launchGameNow() {
       room: activeLease.value.community,
       logicalIp: activeLease.value.logical_ip || activeLease.value.virtual_ip,
       token: activeLease.value.relay_token,
+      direct: activeLease.value.connection_mode === 'direct',
     })
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
@@ -534,7 +544,7 @@ async function waitForIncomingGameProbe(roomID: number, requesterUserID: number,
 
 async function configureGamePeerOnce(logicalIp: string, transactionKey: string, epoch: number) {
   const lease = activeLease.value
-  if (!lease || !desktop()?.configureIce || !desktop()?.resetIce || !user.value) return false
+  if (!lease || lease.connection_mode !== 'direct' || !desktop()?.configureIce || !desktop()?.resetIce || !user.value) return false
   let member: RoomMember | undefined
   try {
     const current = await roomApi.members(lease.room_id)
@@ -586,6 +596,7 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
 }
 
 function configureGamePeer(event: { logicalIp: string; transactionKey: string }) {
+  if (activeLease.value?.connection_mode !== 'direct') return
   const normalizedIp = String(event?.logicalIp || '').trim()
   const transactionKey = String(event?.transactionKey || normalizedIp).trim()
   if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
@@ -717,10 +728,20 @@ onBeforeUnmount(() => {
 
       <div class="room-workspace">
         <section class="room-section"><div class="section-heading"><h3>可用房间</h3><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="{ unavailable: room.status !== 'open' }"><div class="room-card-top"><span class="region">云中继</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'direct' ? 'P2P 优先' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>
+
+      <teleport to="body">
+        <div v-if="roomPreparing || launchingGame" class="preparation-backdrop" role="status" aria-live="polite">
+          <section class="preparation-panel">
+            <LoaderCircle :size="34" class="spinning" />
+            <h3>{{ roomPreparing ? '直连组件准备中' : '游戏组件准备中' }}</h3>
+            <p>{{ roomPreparing ? roomPreparationMessage : '正在检查并加载游戏联机组件' }}</p>
+          </section>
+        </div>
+      </teleport>
 
       <teleport to="body">
         <div v-if="selectedMember" class="modal-backdrop" @click.self="closeMemberDetail">
