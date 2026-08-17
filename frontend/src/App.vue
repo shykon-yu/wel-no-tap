@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { FolderOpen, Gamepad2, LogOut, Play, RefreshCw, Router, ShieldCheck, Users } from 'lucide-vue-next'
+import { FolderOpen, Gamepad2, LoaderCircle, LogOut, Play, RefreshCw, Router, ShieldCheck, Users } from 'lucide-vue-next'
 import { ApiError, authApi, clearToken, hasToken, roomApi, setToken, type Lease, type Room, type RoomMember, type User } from './api'
 import type { DesktopLeaseStatus, PingResult } from './electron'
 import { runtimeConfig } from './config'
@@ -416,6 +416,7 @@ async function launchGameNow() {
   if (!activeLease.value || launchingGame.value) return
   launchingGame.value = true
   loading.value = true
+  notice.value = '游戏组件加载中，请稍候'
   stopTransportStatusMonitor()
   gameTransportSummary.value = '尚未启动游戏'
   try {
@@ -434,7 +435,8 @@ async function launchGameNow() {
     gameTransportSummary.value = '游戏已启动，等待网络数据'
     startTransportStatusMonitor()
   } catch (error) {
-    errorMessage.value = messageOf(error)
+    notice.value = ''
+    errorMessage.value = `游戏组件加载失败：${messageOf(error)}`
   } finally {
     launchingGame.value = false
     loading.value = false
@@ -710,7 +712,7 @@ onBeforeUnmount(() => {
 
       <section class="connection-strip room-status-strip" :class="{ connected: activeLease }">
         <div><p class="eyebrow">房间信息</p><h3>{{ roomInfoTitle }}</h3><span><Router :size="15" /> {{ roomInfoSubtitle }}</span></div>
-        <div class="connection-actions"><span class="secure"><ShieldCheck :size="17" /> 逻辑 IP：{{ virtualIpLabel }}</span><span class="transport-status"><Router :size="17" /> {{ gameTransportSummary }}</span><button class="primary-button launch" @click="launchGame" :disabled="launchingGame || loading || !activeLease || !networkStatus?.connected"><Play :size="17" /> {{ launchingGame ? '正在启动...' : `启动 ${runtimeConfig.gameName}` }}</button><button v-if="activeLease" class="secondary-button" @click="leaveRoom" :disabled="loading">退出房间</button></div>
+        <div class="connection-actions"><span class="secure"><ShieldCheck :size="17" /> 逻辑 IP：{{ virtualIpLabel }}</span><span class="transport-status"><Router :size="17" /> {{ gameTransportSummary }}</span><button class="primary-button launch" @click="launchGame" :disabled="launchingGame || loading || !activeLease || !networkStatus?.connected"><LoaderCircle v-if="launchingGame" :size="17" class="spinning" /><Play v-else :size="17" /> {{ launchingGame ? '游戏组件加载中...' : `启动 ${runtimeConfig.gameName}` }}</button><button v-if="activeLease" class="secondary-button" @click="leaveRoom" :disabled="loading">退出房间</button></div>
       </section>
 
       <div class="room-workspace">

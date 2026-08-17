@@ -59,6 +59,18 @@ function locate(candidates) {
   return candidates.find((candidate) => fs.existsSync(candidate)) || null
 }
 
+function describeLaunchFailure(detail, code) {
+  const raw = String(detail || '').trim()
+  if (code === 3 || raw.includes('Game executable not found')) return '游戏程序 WE8.exe 不存在或路径无法访问。' + (raw ? '\n' + raw : '')
+  if (code === 4 || raw.includes('Hook module not found')) return '游戏网络组件 welnpt.dll 缺失或无法读取。' + (raw ? '\n' + raw : '')
+  if (code === 6 || raw.includes('CreateProcess failed')) return '游戏程序 WE8.exe 启动失败。' + (raw ? '\n' + raw : '')
+  if (code === 7 || raw.includes('Hook module injection failed')) return '游戏网络组件 welnpt.dll 加载失败。' + (raw ? '\n' + raw : '')
+  if (code === 8 || raw.includes('Hook module did not initialize')) return '游戏网络组件 welnpt.dll 初始化超时。' + (raw ? '\n' + raw : '')
+  if (code === 9 || raw.includes('ResumeThread')) return '游戏程序 WE8.exe 恢复运行失败。' + (raw ? '\n' + raw : '')
+  if (code === 124) return '管理员权限启动器等待游戏组件超时。' + (raw ? '\n' + raw : '')
+  return raw || '游戏启动辅助程序 welnptgame.exe 未能完成启动'
+}
+
 function ensureLogPath() {
   fs.mkdirSync(logDirectory, { recursive: true })
   const now = new Date()
@@ -107,14 +119,14 @@ function updateTransportPathFromLog() {
       let event
       try { event = JSON.parse(line) } catch { continue }
       if (event.api === 'direct-target') {
-        // A new game transaction starts on relay and may upgrade later.
-        transportPath = 'relay'
-      } else if (event.api === 'direct-fallback' ||
-          (event.api === 'direct-state' && (event.state === 'failed' || event.state === 'disconnected'))) {
+        transportPath = 'pending'
+      } else if (event.api === 'transport-lock') {
+        if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
+      } else if (event.api === 'direct-fallback') {
         transportPath = 'relay'
       } else if (event.api === 'transport-recv' && event.broadcast === false) {
         if (event.path === 'direct') transportPath = 'direct'
-        else if (event.path === 'relay' && transportPath === 'pending') transportPath = 'relay'
+        else if (event.path === 'relay' && event.length !== 64 && event.length !== 84 && transportPath === 'pending') transportPath = 'relay'
       }
     }
   } catch {}
@@ -127,7 +139,7 @@ function transportStatus() {
     ? '当前联机：P2P 直连'
     : pathName === 'relay'
       ? '当前联机：云中继'
-      : '游戏已启动，等待网络数据'
+      : '游戏已启动，正在选择本场连接'
   return { path: pathName, directState: iceState, summary }
 }
 
@@ -599,7 +611,8 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token }) 
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
-  if (!helper || !hook) throw new Error('缺少 welnptgame.exe 或 welnpt.dll，请重新解压完整客户端')
+  if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
+  if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureLogPath()
   resetTransportTracking(logPath)
@@ -629,11 +642,11 @@ async function launchElevated(options) {
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    child.once('error', reject)
+    child.once('error', (error) => reject(new Error('管理员权限启动器 powershell.exe 无法运行：' + error.message)))
     child.once('close', (code) => {
       lastProcess = null
       const detail = output.join('').trim()
-      if (code !== 0) reject(new Error(detail || '用户取消了管理员授权，或提权启动失败（代码 ' + (code ?? '未知') + '）'))
+      if (code !== 0) reject(new Error(describeLaunchFailure(detail || '用户取消了管理员授权，或提权启动失败', code)))
       else resolve({ started: true, detail: 'WE8 已通过管理员授权启动，日志：' + logPath, warnings: [] })
     })
   })
@@ -643,7 +656,8 @@ async function launch({ gamePath, relay, room, logicalIp, token }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const executable = resolveGamePath(gamePath)
-  if (!helper || !hook) throw new Error('缺少 welnptgame.exe 或 welnpt.dll，请重新解压完整客户端')
+  if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
+  if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
   // Give the background ICE process a short chance to expose its local UDP
@@ -675,11 +689,11 @@ async function launch({ gamePath, relay, room, logicalIp, token }) {
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    child.once('error', reject)
+    child.once('error', (error) => reject(new Error('游戏启动辅助程序 welnptgame.exe 无法运行：' + error.message)))
     child.once('close', (code) => {
       lastProcess = null
       const detail = output.join('').trim()
-      if (code !== 0) reject(new Error(detail || '无网卡联机启动失败（代码 ' + (code ?? '未知') + '）'))
+      if (code !== 0) reject(new Error(describeLaunchFailure(detail, code)))
       else resolve({ started: true, detail: detail || 'WE8 已启动，日志：' + logPath, warnings: [] })
     })
   })
