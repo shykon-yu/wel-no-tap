@@ -67,6 +67,7 @@ function describeLaunchFailure(detail, code) {
   if (code === 7 || raw.includes('Hook module injection failed')) return '游戏网络组件 welnpt.dll 加载失败。' + (raw ? '\n' + raw : '')
   if (code === 8 || raw.includes('Hook module did not initialize')) return '游戏网络组件 welnpt.dll 初始化超时。' + (raw ? '\n' + raw : '')
   if (code === 9 || raw.includes('ResumeThread')) return '游戏程序 WE8.exe 恢复运行失败。' + (raw ? '\n' + raw : '')
+  if (code === 10 || raw.includes('Game executable exited')) return '游戏程序 WE8.exe 启动后立即退出。' + (raw ? '\n' + raw : '')
   if (code === 124) return '管理员权限启动器等待游戏组件超时。' + (raw ? '\n' + raw : '')
   return raw || '游戏启动辅助程序 welnptgame.exe 未能完成启动'
 }

@@ -139,6 +139,17 @@ static int inject_hook(HANDLE process, HANDLE primary_thread, const wchar_t *hoo
     return 1;
 }
 
+static void report_game_exit(HANDLE process, const char *phase) {
+    DWORD exit_code = STILL_ACTIVE;
+    if (GetExitCodeProcess(process, &exit_code)) {
+        fprintf(stderr, "Game executable exited %s: process exit code %lu\n",
+            phase, (unsigned long)exit_code);
+    } else {
+        fprintf(stderr, "Game executable exited %s; GetExitCodeProcess failed: Windows error %lu\n",
+            phase, (unsigned long)GetLastError());
+    }
+}
+
 int wmain(int argc, wchar_t **argv) {
     launch_options options;
     wchar_t game[MAX_PATH];
@@ -155,8 +166,11 @@ int wmain(int argc, wchar_t **argv) {
     PROCESS_INFORMATION process;
     HANDLE ready_event;
     DWORD injection_error;
+    DWORD ready_wait;
+    DWORD stability_wait;
     const char *injection_stage;
     LPVOID apc_remote_path;
+    HANDLE ready_handles[2];
     int resumed_for_apc = 0;
 
     if (!parse_options(argc, argv, &options)) {
@@ -248,7 +262,18 @@ int wmain(int argc, wchar_t **argv) {
         }
         resumed_for_apc = 1;
     }
-    if (WaitForSingleObject(ready_event, 15000) != WAIT_OBJECT_0) {
+    ready_handles[0] = ready_event;
+    ready_handles[1] = process.hProcess;
+    ready_wait = WaitForMultipleObjects(ARRAYSIZE(ready_handles), ready_handles, FALSE, 15000);
+    if (ready_wait == WAIT_OBJECT_0 + 1) {
+        report_game_exit(process.hProcess, "before the game network component became ready");
+        if (apc_remote_path != NULL) VirtualFreeEx(process.hProcess, apc_remote_path, 0, MEM_RELEASE);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(ready_event);
+        return 10;
+    }
+    if (ready_wait != WAIT_OBJECT_0) {
         fputs(apc_remote_path != NULL
             ? "Hook module did not initialize through QueueUserAPC\n"
             : "Hook module did not initialize through CreateRemoteThread\n", stderr);
@@ -266,6 +291,13 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         return 9;
+    }
+    stability_wait = WaitForSingleObject(process.hProcess, 1500);
+    if (stability_wait == WAIT_OBJECT_0) {
+        report_game_exit(process.hProcess, "immediately after startup");
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 10;
     }
     printf("STARTED pid=%lu injection=%s\n", (unsigned long)process.dwProcessId,
         apc_remote_path != NULL ? "apc" : "remote-thread");
