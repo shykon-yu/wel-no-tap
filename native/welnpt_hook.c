@@ -110,9 +110,37 @@ static void reset_game_session(const char *reason) {
         (unsigned long)generation, reason);
 }
 
-static const char *packet_kind(int length) {
-    if (length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) return "possible-join";
-    if (length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH) return "possible-accept";
+static int payload_has_prefix(const char *payload, int length, const unsigned char *prefix, size_t prefix_length) {
+    return payload != NULL && length >= (int)prefix_length && memcmp(payload, prefix, prefix_length) == 0;
+}
+
+static int is_game_join_payload(const char *payload, int length) {
+    static const unsigned char prefix[] = { 0xe7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    return length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH && payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static int is_game_accept_payload(const char *payload, int length) {
+    static const unsigned char prefix[] = { 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00 };
+    return length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH && payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static int is_search_payload(const char *payload, int length) {
+    static const unsigned char prefix[] = { 0xe7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    return length == 24 && payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static int is_game_payload(const char *payload, int length) {
+    static const unsigned char prefix[] = { 0xe7, 0x03, 0x02, 0x00 };
+    return payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static const char *packet_kind(const char *payload, int length) {
+    if (is_game_join_payload(payload, length)) return "join";
+    if (is_game_accept_payload(payload, length)) return "accept";
+    if (is_game_payload(payload, length)) return "game-data";
+    if (length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) return "data-64";
+    if (length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH) return "data-84";
+    if (is_search_payload(payload, length)) return "search";
     return "data";
 }
 
@@ -295,6 +323,8 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	welnpt_packet_header *header;
 	int payload_length;
 	int session_signal;
+	int is_join;
+	int is_accept;
 	int new_session = 0;
 	char payload_head[49];
 	char peer_ip[INET_ADDRSTRLEN];
@@ -307,18 +337,23 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
 		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
+	is_join = is_game_join_payload(packet + sizeof(*header), payload_length);
+	is_accept = is_game_accept_payload(packet + sizeof(*header), payload_length);
+	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_search_payload(packet + sizeof(*header), payload_length) &&
+		header->source_ip == g_direct_transaction_peer_ip) {
+		reset_game_session("peer-search-broadcast");
+	}
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-		(payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ||
-		 payload_length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH);
+		(is_join || is_accept);
 	if (session_signal) {
 		unsigned short source_port = ntohs(header->source_port);
 		unsigned short target_port = ntohs(header->target_port);
-		unsigned short join_port = payload_length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ? source_port : target_port;
+		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->source_ip, join_port, source_port, target_port);
 		payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
 		if (InetNtopA(AF_INET, &header->source_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
 		log_line("\"api\":\"session-signal\",\"direction\":\"receive\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(payload_length), (unsigned long)ntohl(header->sequence), payload_length, new_session ? "true" : "false",
+			packet_kind(packet + sizeof(*header), payload_length), (unsigned long)ntohl(header->sequence), payload_length, new_session ? "true" : "false",
 			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
 	}
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip) {
@@ -338,7 +373,7 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"broadcast\":%s,\"sequence\":%lu,\"sourcePort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
 		path, (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
 		(unsigned long)ntohl(header->sequence), (unsigned)ntohs(header->source_port), payload_length,
-		packet_kind(payload_length), payload_head, payload_hash);
+		packet_kind(packet + sizeof(*header), payload_length), payload_head, payload_hash);
 	return 1;
 }
 
@@ -396,8 +431,10 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     welnpt_packet_header *header = (welnpt_packet_header *)packet;
     const struct sockaddr_in *target;
     unsigned short source_port;
-    int sent;
+	int sent;
 	int session_signal;
+	int is_join;
+	int is_accept;
 	int new_session = 0;
 	char payload_head[49];
 	char peer_ip[INET_ADDRSTRLEN];
@@ -423,20 +460,25 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) header->flags |= WELNPT_FLAG_BROADCAST;
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
-    if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) {
-        WSASetLastError(WSAEACCES);
-        return SOCKET_ERROR;
-    }
+	if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) {
+		WSASetLastError(WSAEACCES);
+		return SOCKET_ERROR;
+	}
+	is_join = is_game_join_payload(payload, length);
+	is_accept = is_game_accept_payload(payload, length);
+	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_search_payload(payload, length)) {
+		reset_game_session("search-broadcast");
+	}
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-		(length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH || length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH);
+		(is_join || is_accept);
 	if (session_signal) {
 		unsigned short target_port = ntohs(target->sin_port);
-		unsigned short join_port = length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH ? source_port : target_port;
+		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->target_ip, join_port, source_port, target_port);
 		payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
 		if (InetNtopA(AF_INET, &header->target_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
 		log_line("\"api\":\"session-signal\",\"direction\":\"send\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(length), (unsigned long)ntohl(header->sequence), length, new_session ? "true" : "false",
+			packet_kind(payload, length), (unsigned long)ntohl(header->sequence), length, new_session ? "true" : "false",
 			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
 	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
@@ -449,7 +491,7 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
             payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
 			log_line("\"api\":\"sendto\",\"path\":\"direct\",\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
 				(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port, (unsigned)ntohs(target->sin_port), length,
-                packet_kind(length), payload_head, payload_hash);
+				packet_kind(payload, length), payload_head, payload_hash);
             WSASetLastError(0);
             return length;
         }
@@ -466,7 +508,7 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 		(header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
 		(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port,
 		(unsigned)ntohs(target->sin_port), length,
-        packet_kind(length), payload_head, payload_hash);
+		packet_kind(payload, length), payload_head, payload_hash);
     WSASetLastError(0);
     return length;
 }
