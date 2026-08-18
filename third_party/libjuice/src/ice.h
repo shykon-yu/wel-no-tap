@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 #ifndef ICE_MAX_CANDIDATES_COUNT
-#define ICE_MAX_CANDIDATES_COUNT 30 // ~ 500B * 30 = 15KB
+#define ICE_MAX_CANDIDATES_COUNT 64 // Keep room for physical and virtual adapters plus srflx candidates.
 #endif
 
 #define ICE_CANDIDATE_PENALTY_TCP 50

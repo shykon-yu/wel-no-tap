@@ -87,12 +87,25 @@ static void notify_hook_agent(unsigned short port) {
 	}
 }
 
+static void log_selected_candidates(juice_agent_t *agent) {
+	char local[1024];
+	char remote[1024];
+	char local_address[128];
+	char remote_address[128];
+	if (juice_get_selected_candidates(agent, local, sizeof(local), remote, sizeof(remote)) != JUICE_ERR_SUCCESS) return;
+	output_line("SELECTED_CANDIDATES local=%s remote=%s", local, remote);
+	if (juice_get_selected_addresses(agent, local_address, sizeof(local_address), remote_address, sizeof(remote_address)) == JUICE_ERR_SUCCESS) {
+		output_line("SELECTED_ADDRESSES local=%s remote=%s", local_address, remote_address);
+	}
+}
+
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
 	const char *name = juice_state_to_string(state);
 	(void)agent;
 	(void)user_ptr;
 	InterlockedExchange(&g_connected, state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED);
 	output_line("STATE %s", name == NULL ? "unknown" : name);
+	if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) log_selected_candidates(agent);
 	if (InterlockedCompareExchange(&g_hook_active, 0, 0) != 0) {
 		notify_hook(name == NULL ? "unknown" : name);
 	}

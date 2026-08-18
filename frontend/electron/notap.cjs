@@ -23,9 +23,11 @@ let relayPingSequence = Date.now() >>> 0
 const relayPeerPingQueue = []
 let lastRemoteDescription = ''
 let lastLogPath = ''
+let sessionLogPath = ''
 let transportLogOffset = 0
 let transportLogRemainder = ''
 let transportPath = 'pending'
+let formalGameStarted = false
 let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
@@ -82,6 +84,54 @@ function ensureLogPath() {
   return path.join(logDirectory, 'room-session-' + stamp + '.jsonl')
 }
 
+function candidateStats(description) {
+  const text = String(description || '')
+  const stats = { total: 0, host: 0, srflx: 0, relay: 0, prflx: 0, other: 0, bytes: Buffer.byteLength(text, 'utf8'), capacityRisk: false }
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith('a=candidate:')) continue
+    stats.total += 1
+    const type = line.match(/\btyp\s+(host|srflx|relay|prflx)\b/)?.[1]
+    if (type) stats[type] += 1
+    else stats.other += 1
+  }
+  stats.capacityRisk = stats.total >= 60
+  return stats
+}
+
+function ensureSessionLogPath() {
+  if (!sessionLogPath) sessionLogPath = ensureLogPath()
+  return sessionLogPath
+}
+
+function appendAgentEvent(role, event, details = {}) {
+  const logPath = sessionLogPath || lastLogPath
+  if (!logPath) return
+  try {
+    fs.appendFileSync(logPath, JSON.stringify({
+      timestamp: new Date().toISOString(), api: 'ice-agent', role, event, ...details,
+    }) + '\n', 'utf8')
+  } catch {}
+}
+
+function rememberAgentLine(role, line) {
+  const value = String(line || '').trim()
+  if (!value || value === 'LOCAL_SDP_BEGIN' || value === 'LOCAL_SDP_END') return
+  if (value.startsWith('GATHERING_STARTED ')) {
+    const [, stunHost = '', stunPort = ''] = value.split(/\s+/)
+    appendAgentEvent(role, 'gathering-start', { stunHost, stunPort: Number(stunPort) || 0 })
+  } else if (value.startsWith('CANDIDATE ')) {
+    appendAgentEvent(role, 'candidate', { type: value.slice(10).trim() || 'unknown' })
+  } else if (value.startsWith('STATE ')) {
+    appendAgentEvent(role, 'state', { state: value.slice(6).trim() || 'unknown' })
+  } else if (value.startsWith('SELECTED_CANDIDATES ')) {
+    appendAgentEvent(role, 'selected-candidates', { value: value.slice(20) })
+  } else if (value.startsWith('SELECTED_ADDRESSES ')) {
+    appendAgentEvent(role, 'selected-addresses', { value: value.slice(19) })
+  } else {
+    appendAgentEvent(role, 'diagnostic', { value: value.slice(0, 500) })
+  }
+}
+
 function status() {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
@@ -103,6 +153,7 @@ function resetTransportTracking(logPath = '') {
   transportLogOffset = 0
   transportLogRemainder = ''
   transportPath = 'pending'
+  formalGameStarted = false
 }
 
 function updateTransportPathFromLog() {
@@ -126,6 +177,9 @@ function updateTransportPathFromLog() {
         transportPath = 'pending'
       } else if (event.api === 'session-state' && event.state === 'WAIT_JOIN') {
         transportPath = 'pending'
+        formalGameStarted = false
+      } else if (event.api === 'game-start' || (event.api === 'session-state' && event.state === 'PLAYING')) {
+        formalGameStarted = true
       } else if (event.api === 'transport-lock') {
         if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
       } else if (event.api === 'direct-fallback') {
@@ -146,7 +200,7 @@ function transportStatus() {
     : pathName === 'relay'
       ? '当前联机：云中继'
       : '游戏已启动，正在选择本场连接'
-  return { path: pathName, directState: iceState, summary }
+  return { path: pathName, directState: iceState, gameStarted: formalGameStarted, summary }
 }
 
 function chooseHookPort() {
@@ -230,20 +284,29 @@ function handleIceLine(rawLine) {
       readingIceSdp = false
       iceLocalDescription = iceSdpBuffer
       iceSdpBuffer = ''
+      appendAgentEvent('active', 'local-sdp', candidateStats(iceLocalDescription))
     } else {
       iceSdpBuffer += line + '\n'
     }
     return
   }
   if (line === 'LOCAL_SDP_BEGIN') { readingIceSdp = true; iceSdpBuffer = ''; return }
-  if (line.startsWith('LOCAL_PORT ')) { iceAgentPort = Number(line.slice(11)) || 0; return }
-  if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; return }
+  if (line.startsWith('LOCAL_PORT ')) {
+    iceAgentPort = Number(line.slice(11)) || 0
+    appendAgentEvent('active', 'local-port', { port: iceAgentPort })
+    return
+  }
+  if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; rememberAgentLine('active', line); return }
   if (line.startsWith('STATE ')) {
     iceState = line.slice(6) || 'unknown'
-    // A standby is useful only after this match has really established ICE.
-    // Before that, a quick game exit must leave the next launch to create a
-    // fresh clean agent instead of promoting a speculative standby.
+    rememberAgentLine('active', line)
+    // The next slot is prepared as soon as the active agent has a peer. This
+    // keeps a quick game exit from leaving the next launch cold.
     if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
+    return
+  }
+  if (line.startsWith('CANDIDATE ') || line.startsWith('SELECTED_CANDIDATES ') || line.startsWith('SELECTED_ADDRESSES ')) {
+    rememberAgentLine('active', line)
     return
   }
   if (line.startsWith('GAME_PEER ')) {
@@ -328,6 +391,7 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hook
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
   })
   iceProcess = child
+  appendAgentEvent('active', 'started', { stunHost, stunPort, hookPort: iceHookPort })
   const consume = (chunk) => {
     iceLineBuffer += chunk.toString('utf8')
     let newline
@@ -341,6 +405,7 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hook
   child.stdout.on('data', consume)
   child.stderr.on('data', (chunk) => { rememberIceDiagnostic('stderr: ' + chunk.toString('utf8')) })
   child.once('close', (code) => {
+    appendAgentEvent('active', 'stopped', { code: code ?? null })
     if (iceProcess === child) {
       iceProcess = null
       iceState = 'failed'
@@ -373,6 +438,7 @@ async function clearStandbyAgent() {
 }
 
 async function prepareIce(options) {
+  ensureSessionLogPath()
   await startIceAgent(options || {})
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
@@ -473,6 +539,7 @@ async function activateIce() {
   readingIceSdp = false
   lastRemoteDescription = ''
   activeGamePeerIp = ''
+  appendAgentEvent('active', 'activated', { key, port: iceAgentPort, hookPort: iceHookPort })
   attachActiveIceProcess(iceProcess)
   try { iceProcess.stdin.write('ACTIVATE\n') } catch {
     await stopIceChild(iceProcess)
@@ -495,7 +562,11 @@ function setRemoteIce(remoteDescription, remoteIp = '') {
   }
   iceProcess.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
   lastRemoteDescription = normalized
-  if (iceState === 'connected' || iceState === 'completed') void prewarmIce()
+  appendAgentEvent('active', 'remote-sdp', { ...candidateStats(normalized), remoteIp: peerIp })
+  // The active agent is now committed to this peer. Start the next slot
+  // immediately so a quick exit or first ICE failure does not leave a cold
+  // agent for the next launch.
+  void prewarmIce()
   return true
 }
 
@@ -512,6 +583,7 @@ function randomProbeKey() {
 function stopProbeIce(probeKey) {
   const probe = probeAgents.get(probeKey)
   if (!probe) return { stopped: true }
+  appendAgentEvent(probe.standby ? 'standby' : 'probe', 'stopping', { key: probeKey, reason: 'rotation-or-disconnect' })
   probeAgents.delete(probeKey)
   if (probe.timeoutTimer) clearTimeout(probe.timeoutTimer)
   if (probe.retryTimer) clearInterval(probe.retryTimer)
@@ -560,6 +632,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0,
     options: { stunHost, stunPort, relay, room, logicalIp, token },
   }
+  appendAgentEvent(standby ? 'standby' : 'probe', 'started', { key, stunHost, stunPort, hookPort: Number(hookPort) || 0 })
   probeAgents.set(key, probe)
   const consume = (chunk) => {
     probe.buffer += chunk.toString('utf8')
@@ -572,12 +645,18 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
           probe.readingSdp = false
           probe.localDescription = probe.sdpBuffer
           probe.sdpBuffer = ''
+          appendAgentEvent(standby ? 'standby' : 'probe', 'local-sdp', { key, ...candidateStats(probe.localDescription) })
         } else probe.sdpBuffer += line + '\n'
         continue
       }
       if (line === 'LOCAL_SDP_BEGIN') { probe.readingSdp = true; probe.sdpBuffer = ''; continue }
-      if (line.startsWith('LOCAL_PORT ')) { probe.localPort = Number(line.slice(11)) || 0; continue }
-      if (line.startsWith('STATE ')) { probe.state = line.slice(6) || 'unknown'; continue }
+      if (line.startsWith('LOCAL_PORT ')) {
+        probe.localPort = Number(line.slice(11)) || 0
+        appendAgentEvent(standby ? 'standby' : 'probe', 'local-port', { key, port: probe.localPort })
+        continue
+      }
+      if (line.startsWith('CANDIDATE ')) { rememberAgentLine(standby ? 'standby' : 'probe', line); continue }
+      if (line.startsWith('STATE ')) { probe.state = line.slice(6) || 'unknown'; rememberAgentLine(standby ? 'standby' : 'probe', line); continue }
       if (line === 'REMOTE_SET') {
         if (probe.remoteWaiter) {
           const waiter = probe.remoteWaiter
@@ -618,6 +697,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
   child.stdout.on('data', consume)
   child.stderr.on('data', (chunk) => { probe.error = String(chunk).trim().slice(0, 300) || probe.error })
   child.once('close', (code) => {
+    appendAgentEvent(standby ? 'standby' : 'probe', 'stopped', { key, code: code ?? null })
     if (probeAgents.get(key) !== probe) return
     probe.error ||= '临时 ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）'
     if (probe.remoteWaiter) {
@@ -655,6 +735,7 @@ function configureProbeIce(probeKey, remoteDescription) {
   if (probe.remoteWaiter) return Promise.reject(new Error('临时 ICE 正在设置远端 candidate'))
   try {
     const normalized = String(remoteDescription).replace(/\r?\n/g, '\n').replace(/\n*$/, '\n')
+    appendAgentEvent('probe', 'remote-sdp', { key: probeKey, ...candidateStats(normalized) })
     probe.child.stdin.write('REMOTE_SDP_BEGIN\n' + normalized + 'REMOTE_SDP_END\n')
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -774,7 +855,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
   if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
-  const logPath = ensureLogPath()
+  const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
@@ -800,6 +881,7 @@ async function launchElevated(options) {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
+  void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -826,7 +908,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
     await prepareGameIce()
   }
 
-  const logPath = ensureLogPath()
+  const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
   const environment = {
     ...process.env,
@@ -847,6 +929,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
+  void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -867,6 +950,7 @@ async function disconnect() {
   }
   lastProcess = null
   if (iceProcess && !iceProcess.killed) {
+    appendAgentEvent('active', 'stopping', { reason: 'disconnect' })
     try { iceProcess.stdin.write('EXIT\n') } catch {}
     try { iceProcess.kill() } catch {}
   }
@@ -893,6 +977,7 @@ async function disconnect() {
   lastRemoteDescription = ''
   activeGamePeerIp = ''
   resetTransportTracking()
+  sessionLogPath = ''
   iceExitError = ''
   iceDiagnostics = []
   for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)
