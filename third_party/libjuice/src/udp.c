@@ -17,6 +17,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <wchar.h>
+#include <wctype.h>
+#endif
+
 static struct addrinfo *find_family(struct addrinfo *ai_list, int family) {
 	struct addrinfo *ai = ai_list;
 	while (ai && ai->ai_family != family)
@@ -43,6 +48,90 @@ static uint16_t get_next_port_in_range(uint16_t begin, uint16_t end) {
 	mutex_unlock(&mutex);
 	return next;
 }
+
+#ifdef _WIN32
+
+static int wide_contains_case_insensitive(const wchar_t *text, const wchar_t *needle) {
+	const wchar_t *cursor;
+	if (!text || !needle || !needle[0]) return 0;
+	for (; *text; ++text) {
+		cursor = text;
+		const wchar_t *pattern = needle;
+		while (*cursor && *pattern && towlower(*cursor) == towlower(*pattern)) {
+			++cursor;
+			++pattern;
+		}
+		if (!*pattern) return 1;
+	}
+	return 0;
+}
+
+static int is_virtual_windows_adapter(const IP_ADAPTER_ADDRESSES *adapter) {
+	static const wchar_t *const virtual_names[] = {
+		L"softether", L"openvpn", L"tap-", L"tap ", L"zerotier",
+		L"wireguard", L"wintun", L"tailscale", L"hamachi", L"vmware",
+		L"virtualbox", L"hyper-v", L"vEthernet", L"docker", L"wsl",
+		L"npcap", L"vpn"
+	};
+	const wchar_t *fields[2];
+	unsigned int index;
+
+	if (!adapter) return 0;
+	if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->IfType == IF_TYPE_TUNNEL ||
+		adapter->IfType == IF_TYPE_PROP_VIRTUAL || adapter->IfType == IF_TYPE_PPP ||
+		adapter->IfType == IF_TYPE_SLIP) return 1;
+	fields[0] = adapter->FriendlyName;
+	fields[1] = adapter->Description;
+	for (unsigned int field = 0; field < 2; ++field) {
+		for (index = 0; index < sizeof(virtual_names) / sizeof(virtual_names[0]); ++index) {
+			if (wide_contains_case_insensitive(fields[field], virtual_names[index])) return 1;
+		}
+	}
+	return 0;
+}
+
+static size_t get_virtual_windows_ipv4_addresses(struct in_addr *addresses, size_t capacity) {
+	IP_ADAPTER_ADDRESSES *adapters = NULL;
+	IP_ADAPTER_ADDRESSES *adapter;
+	ULONG size = 0;
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_MULTICAST;
+	size_t count = 0;
+	DWORD result;
+
+	result = GetAdaptersAddresses(AF_INET, flags, NULL, NULL, &size);
+	if (result != ERROR_BUFFER_OVERFLOW || size == 0) return 0;
+	adapters = (IP_ADAPTER_ADDRESSES *)HeapAlloc(GetProcessHeap(), 0, size);
+	if (!adapters) return 0;
+	result = GetAdaptersAddresses(AF_INET, flags, NULL, adapters, &size);
+	if (result != NO_ERROR) {
+		HeapFree(GetProcessHeap(), 0, adapters);
+		return 0;
+	}
+	for (adapter = adapters; adapter; adapter = adapter->Next) {
+		IP_ADAPTER_UNICAST_ADDRESS *unicast;
+		if (!is_virtual_windows_adapter(adapter)) continue;
+		for (unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+			struct sockaddr *address = unicast->Address.lpSockaddr;
+			if (!address || address->sa_family != AF_INET || count >= capacity) continue;
+			addresses[count++] = ((struct sockaddr_in *)address)->sin_addr;
+		}
+	}
+	HeapFree(GetProcessHeap(), 0, adapters);
+	return count;
+}
+
+static int is_virtual_windows_ipv4(const struct sockaddr *address,
+	const struct in_addr *virtual_addresses, size_t count) {
+	const struct in_addr *candidate;
+	if (!address || address->sa_family != AF_INET) return 0;
+	candidate = &((const struct sockaddr_in *)address)->sin_addr;
+	for (size_t index = 0; index < count; ++index) {
+		if (candidate->S_un.S_addr == virtual_addresses[index].S_un.S_addr) return 1;
+	}
+	return 0;
+}
+
+#endif
 
 static socket_t create_socket_for_addrinfo(const udp_socket_config_t *config,
                                            const struct addrinfo *ai) {
@@ -490,6 +579,9 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 #endif
 
 #ifdef _WIN32
+	struct in_addr virtual_addresses[64];
+	size_t virtual_address_count = get_virtual_windows_ipv4_addresses(virtual_addresses,
+		sizeof(virtual_addresses) / sizeof(virtual_addresses[0]));
 	char buf[4096];
 	DWORD len = 0;
 	if (WSAIoctl(sock, SIO_ADDRESS_LIST_QUERY, NULL, 0, buf, sizeof(buf), &len, NULL, NULL)) {
@@ -501,6 +593,12 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 	for (int i = 0; i < list->iAddressCount; ++i) {
 		struct sockaddr *sa = list->Address[i].lpSockaddr;
 		socklen_t len = list->Address[i].iSockaddrLength;
+		if (is_virtual_windows_ipv4(sa, virtual_addresses, virtual_address_count)) {
+			char address[ADDR_MAX_NUMERICHOST_LEN];
+			if (addr_to_string(sa, address, sizeof(address)) >= 0)
+				JLOG_INFO("Skipping virtual adapter IPv4 host candidate %s", address);
+			continue;
+		}
 		if ((sa->sa_family == AF_INET ||
 		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
 		    !addr_is_local(sa)) {
