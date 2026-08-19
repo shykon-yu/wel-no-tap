@@ -27,7 +27,6 @@ let sessionLogPath = ''
 let transportLogOffset = 0
 let transportLogRemainder = ''
 let transportPath = 'pending'
-let formalGameStarted = false
 let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
@@ -153,7 +152,6 @@ function resetTransportTracking(logPath = '') {
   transportLogOffset = 0
   transportLogRemainder = ''
   transportPath = 'pending'
-  formalGameStarted = false
 }
 
 function updateTransportPathFromLog() {
@@ -177,9 +175,6 @@ function updateTransportPathFromLog() {
         transportPath = 'pending'
       } else if (event.api === 'session-state' && event.state === 'WAIT_JOIN') {
         transportPath = 'pending'
-        formalGameStarted = false
-      } else if (event.api === 'game-start' || (event.api === 'session-state' && event.state === 'PLAYING')) {
-        formalGameStarted = true
       } else if (event.api === 'transport-lock') {
         if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
       } else if (event.api === 'direct-fallback') {
@@ -200,7 +195,7 @@ function transportStatus() {
     : pathName === 'relay'
       ? '当前联机：云中继'
       : '游戏已启动，正在选择本场连接'
-  return { path: pathName, directState: iceState, gameStarted: formalGameStarted, summary }
+  return { path: pathName, directState: iceState, summary }
 }
 
 function chooseHookPort() {
