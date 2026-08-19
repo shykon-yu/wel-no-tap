@@ -440,6 +440,9 @@ async function clearStandbyAgent() {
 async function prepareIce(options) {
   ensureSessionLogPath()
   await startIceAgent(options || {})
+  // A is now clean and ready for the first match. Gather B immediately while
+  // the player is in the room, rather than waiting for game launch or failure.
+  void prewarmIce()
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 

@@ -73,7 +73,6 @@ static unsigned short g_direct_transaction_join_port;
 static volatile LONG g_direct_transaction_generation;
 static unsigned short g_direct_hook_port;
 static volatile LONG g_direct_connected;
-static volatile LONG g_direct_ice_failures;
 static volatile LONG g_formal_game_started;
 static volatile LONG g_game_path;
 static uint32_t g_logical_ip;
@@ -104,7 +103,6 @@ static void reset_game_session(const char *reason) {
     g_direct_peer_ip = 0;
     g_direct_transaction_peer_ip = 0;
     g_direct_transaction_join_port = 0;
-    InterlockedExchange(&g_direct_ice_failures, 0);
     InterlockedExchange(&g_formal_game_started, 0);
     LeaveCriticalSection(&g_state_lock);
     if (!had_session) return;
@@ -426,7 +424,6 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 		g_direct_transaction_peer_ip = target_ip;
 		g_direct_transaction_join_port = join_port;
 		InterlockedIncrement(&g_direct_transaction_generation);
-		InterlockedExchange(&g_direct_ice_failures, 0);
 		InterlockedExchange(&g_formal_game_started, 0);
 	}
     generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
@@ -905,17 +902,11 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                 }
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             } else if (failed && selected == WELNPT_GAME_PATH_PENDING) {
-                LONG failures = InterlockedIncrement(&g_direct_ice_failures);
-                if (failures >= 2) {
-                    if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_RELAY,
-                        WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
-                        log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"ice-failed-after-retry\"");
-                        log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"ice-failed-after-retry\"",
-                            (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
-                    }
-                } else {
-                    log_line("\"api\":\"direct-retry-pending\",\"attempt\":%ld,\"generation\":%lu",
-                        (long)failures, (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
+                if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_RELAY,
+                    WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
+                    log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"ice-failed\"");
+                    log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"ice-failed\"",
+                        (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
                 }
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             } else if (failed && selected == WELNPT_GAME_PATH_DIRECT) {

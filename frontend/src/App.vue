@@ -53,8 +53,6 @@ let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let roomMembersTimer: number | undefined
 let transportStatusTimer: number | undefined
-let directRetryInProgress = false
-let directRetryCount = 0
 let signingOut = false
 let leaseEpoch = 0
 let platformExitInProgress = false
@@ -129,8 +127,6 @@ function clearRoomSessionState() {
   activeGamePeerTransaction = ''
   activeGamePeerAgentUsed = false
   gamePeerEpoch = 0
-  directRetryInProgress = false
-  directRetryCount = 0
   gamePeerOperation = Promise.resolve(true)
   roomPreparationEpoch += 1
 }
@@ -147,39 +143,10 @@ function startTransportStatusMonitor() {
     try {
       const status = await desktop()!.transportStatus()
       gameTransportSummary.value = status.summary
-      if (status.directState === 'failed' && !status.gameStarted && activeGamePeerIp && activeGamePeerTransaction && directRetryCount < 1 && !directRetryInProgress) {
-        void retryActiveGamePeer()
-      }
     } catch { /* status is best effort */ }
   }
   void refresh()
   transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
-}
-
-async function retryActiveGamePeer() {
-  if (directRetryInProgress || directRetryCount >= 1 || !activeGamePeerIp || !activeGamePeerTransaction) return
-  const lease = activeLease.value
-  if (!lease || lease.connection_mode !== 'direct') return
-  directRetryInProgress = true
-  directRetryCount += 1
-  const retryEpoch = gamePeerEpoch
-  let retrySkipped = false
-  const retryTask = gamePeerOperation
-    .catch(() => false)
-    .then(async () => {
-      const current = await desktop()!.transportStatus()
-      if (current.gameStarted) { retrySkipped = true; return false }
-      return configureGamePeerOnce(activeGamePeerIp, activeGamePeerTransaction, retryEpoch)
-    })
-  gamePeerOperation = retryTask
-  try {
-    const configured = await retryTask
-    if (configured === false && !retrySkipped) warningMessage.value = '本场直连首次检查失败，备用组件重试仍未建立直连，将使用中继'
-  } catch {
-    warningMessage.value = '本场直连首次检查失败，备用组件重试未完成，将使用中继'
-  } finally {
-    directRetryInProgress = false
-  }
 }
 
 async function loadRoomMembers() {
@@ -637,8 +604,8 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   } catch {
     return false
   } finally {
-    // Keep the next slot warm even when signaling or the one allowed retry
-    // fails before a remote SDP is installed.
+    // Keep the next slot warm even when signaling fails before a remote SDP
+    // is installed, so the next match can rotate to a clean agent.
     void desktop()?.prewarmIce?.()
   }
 }
@@ -648,7 +615,6 @@ function configureGamePeer(event: { logicalIp: string; transactionKey: string })
   const normalizedIp = String(event?.logicalIp || '').trim()
   const transactionKey = String(event?.transactionKey || normalizedIp).trim()
   if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
-  if (activeGamePeerTransaction && activeGamePeerTransaction !== transactionKey) directRetryCount = 0
   gamePeerTransactions.add(transactionKey)
   const epoch = ++gamePeerEpoch
   // Only one operation may reset/configure the formal agent at a time. A
