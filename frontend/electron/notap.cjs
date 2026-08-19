@@ -241,7 +241,12 @@ function runPowerShell(script, timeoutMs = 1800) {
     }, timeoutMs)
     child.stdout.on('data', (chunk) => { output += chunk.toString('utf8') })
     child.once('error', (error) => finish({ ok: false, reason: error.message }))
-    child.once('close', (code) => finish({ ok: code === 0 && output.includes('WEL_UPNP_MAPPED'), reason: code === 0 ? 'unavailable' : 'exit-' + code }))
+    child.once('close', (code) => finish({
+      ok: code === 0,
+      marker: output.includes('WEL_UPNP_MAPPED'),
+      exitCode: code,
+      reason: code === 0 ? 'completed' : 'exit-' + code,
+    }))
   })
 }
 
@@ -343,7 +348,7 @@ async function requestUpnpMapping(port, key) {
     `$nat=New-Object -ComObject HNetCfg.NATUPnP; $mappings=$nat.StaticPortMappingCollection; if($null -eq $mappings){exit 3}; ` +
     `$null=$mappings.Add($port,'UDP',$port,$ip,$true,$description); Write-Output 'WEL_UPNP_MAPPED'`
   const result = await runPowerShell(script)
-  mapping.mapped = Boolean(result.ok)
+  mapping.mapped = Boolean(result.ok && result.marker)
   mapping.description = description
   mapping.reason = result.reason
   appendAgentEvent('active', 'upnp-mapping', { port: mapping.port, mapped: mapping.mapped, reason: mapping.reason })
