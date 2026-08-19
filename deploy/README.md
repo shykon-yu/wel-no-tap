@@ -3,6 +3,9 @@
 完整的无网卡平台上线组件、Laravel/Go/Relay/STUN 依赖和验收顺序见：
 [`docs/NO_TAP_DEPLOYMENT_ZH.md`](../docs/NO_TAP_DEPLOYMENT_ZH.md)。
 
+换服务器或灾难恢复请直接按：
+[`docs/NO_TAP_SERVER_RUNBOOK_ZH.md`](../docs/NO_TAP_SERVER_RUNBOOK_ZH.md)。
+
 无网卡中继与现有 TAP/n2n 平台完全隔离：
 
 | 服务 | 端口 | 管理方式 |

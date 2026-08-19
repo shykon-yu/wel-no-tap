@@ -1,5 +1,9 @@
 # WEL 无网卡平台上线部署清单
 
+> 换服务器、首次完整部署或灾难恢复时，请按
+> [`NO_TAP_SERVER_RUNBOOK_ZH.md`](NO_TAP_SERVER_RUNBOOK_ZH.md) 逐步执行；本文保留架构、
+> 配置项与验收依据。
+
 > 适用版本：`wel-no-tap` 当前 P3 直连 + P2 云中继架构
 > 更新日期：2026-08-18
 > 目标：明确 Laravel、Go、云中继、STUN、数据库和反向代理分别需要部署什么
