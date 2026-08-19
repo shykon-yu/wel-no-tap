@@ -118,10 +118,15 @@ accounts. No TAP/n2n driver, system route, or manually copied token is needed.
 Neither player needs an inbound WE8 port. Both players only send and receive
 through one outbound UDP mapping to the cloud relay.
 
-Both machines write a JSONL game-session log under
-`%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl`. Send the host and client
-files together after each test, whether it succeeds or fails. The separate
-observation tool may write its own capture file to the Desktop.
+Detailed JSONL game-session capture is disabled by default. To diagnose a test,
+set `WEL_NOTAP_DIAGNOSTIC_LOG=true` in `wel-no-tap.env`, restart the client,
+and collect `%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl` from both
+machines. The separate observation tool may write its own capture file to the
+Desktop.
+
+The client also tries a temporary UDP router mapping through UPnP, NAT-PMP, or
+PCP before ICE candidate gathering. It is optional and automatically falls back
+to normal ICE when the router does not support one of these protocols.
 
 ## Linux Relay
 

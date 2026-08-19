@@ -4,7 +4,7 @@
 >
 > 用途：新服务器上线、迁移服务器或灾难恢复时按本文执行。
 >
-> 最后更新：2026-08-19，客户端基线：`v0.0.44`
+> 最后更新：2026-08-19，客户端基线：`v0.0.45`
 
 本文是操作手册，不是架构设计。开始前先阅读
 [`NO_TAP_DEPLOYMENT_ZH.md`](NO_TAP_DEPLOYMENT_ZH.md) 了解组件边界。
@@ -288,6 +288,10 @@ WEL_API_ROOM_PEER_PROBES_PATH=/notap/rooms/{roomId}/peer-probes
 发布包必须包含：主程序、`welnptgame.exe`、`welnpt.dll`、`welnptice.exe` 和
 `wel-no-tap.env`。仅替换主 EXE 会导致无网卡组件版本不匹配。
 
+默认 `WEL_NOTAP_DIAGNOSTIC_LOG=false`，不会保存逐包 `room-session` JSONL。需要排障时
+改为 `true` 并重启客户端；正常使用不需要开启。`WEL_NOTAP_UPNP=true` 会依次尝试通过
+UPnP、NAT-PMP 或 PCP 为 ICE 建立临时 UDP 映射，失败或路由器不支持时自动继续普通 ICE。
+
 ## 9. 上线验收
 
 按顺序执行，任一步失败不得切流：
@@ -296,7 +300,8 @@ WEL_API_ROOM_PEER_PROBES_PATH=/notap/rooms/{roomId}/peer-probes
 2. 两个不同网络、不同账号的客户端能登录并进入同一个 `notap-01` 房间。
 3. 两端均能看到不同的 `10.122.*` 逻辑 IP，且成员列表与心跳正常。
 4. 主机搜索、客机加入、选队和开赛均正常。
-5. 检查双方 `%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl`：
+5. 如需检查双方 `%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl`，先将
+   `WEL_NOTAP_DIAGNOSTIC_LOG=true` 写入客户端 env 并重启；然后：
    - 直连成功：`ice-decision result:"direct"`，随后有真实比赛单播 `path:"direct"`。
    - 直连失败：`ice-decision reason:"ice-failed"` 或 `"decision-timeout"`，比赛仍有
      `path:"relay"` 的持续双向数据。

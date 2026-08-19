@@ -16,6 +16,8 @@ const defaults = {
   WEL_API_ROOM_LEAVE_PATH: '/notap/rooms/{roomId}/leave',
   WEL_API_ROOM_ICE_PATH: '/notap/rooms/{roomId}/ice',
   WEL_API_ROOM_PEER_PROBES_PATH: '/notap/rooms/{roomId}/peer-probes',
+  WEL_NOTAP_DIAGNOSTIC_LOG: 'false',
+  WEL_NOTAP_UPNP: 'true',
   WEL_GAME_NAME: 'WE8',
 }
 
@@ -78,6 +80,8 @@ function publicConfig() {
     apiRoomLeavePath: values.WEL_API_ROOM_LEAVE_PATH,
     apiRoomIcePath: values.WEL_API_ROOM_ICE_PATH,
     apiRoomPeerProbesPath: values.WEL_API_ROOM_PEER_PROBES_PATH,
+    diagnosticLog: values.WEL_NOTAP_DIAGNOSTIC_LOG,
+    upnp: values.WEL_NOTAP_UPNP,
     configFile: filePath,
   }
 }

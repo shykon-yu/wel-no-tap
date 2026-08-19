@@ -10,6 +10,7 @@ const firewall = require('./firewall.cjs')
 if (process.platform === 'win32') app.commandLine.appendSwitch('no-sandbox')
 
 const runtime = { ...publicConfig(), appVersion }
+const diagnosticLogEnabled = /^(1|true|yes|on)$/i.test(String(runtime.diagnosticLog || 'false'))
 const logDirectory = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'WELPlatform', 'logs')
 const logFile = path.join(logDirectory, 'main.log')
 let mainWindow = null
@@ -17,7 +18,8 @@ let tray = null
 let isQuitting = false
 let quitTimer = null
 
-function writeLog(message, error) {
+function writeLog(message, error, force = false) {
+  if (!diagnosticLogEnabled && !force) return
   try {
     fs.mkdirSync(logDirectory, { recursive: true })
     const detail = error instanceof Error ? error.stack || error.message : String(error || '')
@@ -26,7 +28,7 @@ function writeLog(message, error) {
 }
 
 function showFatalError(error) {
-  writeLog('应用发生致命错误', error)
+  writeLog('应用发生致命错误', error, true)
   dialog.showErrorBox(runtime.platformName + '启动失败', String(error instanceof Error ? error.message : error || '未知错误') + '\n\n错误日志：' + logFile)
 }
 

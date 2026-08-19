@@ -174,7 +174,7 @@ int wmain(int argc, wchar_t **argv) {
     int resumed_for_apc = 0;
 
     if (!parse_options(argc, argv, &options)) {
-        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> --log <file>\n", stderr);
+        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> [--log <file>]\n", stderr);
         return 2;
     }
     if (options.self_test) {
@@ -199,8 +199,9 @@ int wmain(int argc, wchar_t **argv) {
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip, ARRAYSIZE(logical_ip)) == 0) return 2;
     if (options.token != NULL) wcsncpy_s(token, ARRAYSIZE(token), options.token, _TRUNCATE);
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token, ARRAYSIZE(token)) == 0) return 2;
+    log_path[0] = L'\0';
     if (options.log_path != NULL) wcsncpy_s(log_path, ARRAYSIZE(log_path), options.log_path, _TRUNCATE);
-    else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path, ARRAYSIZE(log_path)) == 0) return 2;
+    else GetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path, ARRAYSIZE(log_path));
 
     _snwprintf_s(ready_name, ARRAYSIZE(ready_name), _TRUNCATE, L"Local\\WELNoTapReady-%lu-%lu",
         (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
@@ -210,7 +211,8 @@ int wmain(int argc, wchar_t **argv) {
     SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip);
     SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
-    SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path);
+    SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path[0] != L'\0' ? log_path : NULL);
+    SetEnvironmentVariableW(L"WEL_NOTAP_DIAGNOSTIC_LOG", log_path[0] != L'\0' ? L"true" : L"false");
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
     if (options.direct_agent_port != NULL && options.direct_hook_port != NULL) {
         SetEnvironmentVariableW(L"WEL_NOTAP_DIRECT_AGENT_PORT", options.direct_agent_port);

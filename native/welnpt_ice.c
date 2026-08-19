@@ -18,6 +18,8 @@
 #define WEL_ICE_BUFFER_SIZE 8192
 #define WEL_ICE_CONTROL_PREFIX "WELICESTATE:"
 #define WEL_ICE_PEER_PREFIX "WELICEPEER:"
+#define WEL_ICE_REMOTE_SET_PREFIX "WELICEREMOTESET"
+#define WEL_TRANSPORT_STATE_PREFIX "WELTRANSPORT:"
 #define WEL_GAME_PEER_PREFIX "WELGAMEPEER:"
 #define WEL_ICE_PING_PREFIX "WELICEPING:"
 #define WEL_ICE_PONG_PREFIX "WELICEPONG:"
@@ -84,6 +86,13 @@ static void notify_hook_agent(unsigned short port) {
 	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%u", (unsigned)port);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
+	}
+}
+
+static void notify_hook_remote_set(void) {
+	if (g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, WEL_ICE_REMOTE_SET_PREFIX, (int)strlen(WEL_ICE_REMOTE_SET_PREFIX), 0,
+			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
@@ -188,6 +197,10 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 				peer[ip_length] = '\0';
 				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %.*s", peer_length, payload);
 			}
+		} else if (received > (int)strlen(WEL_TRANSPORT_STATE_PREFIX) &&
+			memcmp(buffer, WEL_TRANSPORT_STATE_PREFIX, strlen(WEL_TRANSPORT_STATE_PREFIX)) == 0) {
+			output_line("TRANSPORT_STATE %.*s", received - (int)strlen(WEL_TRANSPORT_STATE_PREFIX),
+				buffer + strlen(WEL_TRANSPORT_STATE_PREFIX));
 		} else if (received > 0 && InterlockedCompareExchange(&g_connected, 0, 0) != 0) {
 			juice_send(g_agent, buffer, (size_t)received);
 		}
@@ -382,6 +395,7 @@ int main(int argc, char **argv) {
 	const char *stun_host = NULL;
 	unsigned short stun_port = 0;
 	unsigned short hook_port = 0;
+	unsigned short ice_port = 0;
 	struct sockaddr_in local_address;
 	juice_config_t config;
 	WSADATA winsock;
@@ -402,6 +416,8 @@ int main(int argc, char **argv) {
 			if (index + 1 >= argc || !parse_port(argv[++index], &stun_port)) return 2;
 		} else if (strcmp(argv[index], "--hook-port") == 0) {
 			if (index + 1 >= argc || !parse_port(argv[++index], &hook_port)) return 2;
+		} else if (strcmp(argv[index], "--ice-port") == 0) {
+			if (index + 1 >= argc || !parse_port(argv[++index], &ice_port)) return 2;
 		} else if (strcmp(argv[index], "--no-hook") == 0) {
 			no_hook = 1;
 		} else if (strcmp(argv[index], "--standby") == 0) {
@@ -441,9 +457,11 @@ int main(int argc, char **argv) {
 
 	ZeroMemory(&config, sizeof(config));
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;
-	/* WE8 is IPv4 UDP. Binding the ICE socket to an IPv4 wildcard prevents
-	 * Win7's IPv6 tunnel adapters from becoming part of candidate gathering. */
-	config.bind_address = "0.0.0.0";
+	/* Keep the control socket IPv4-only, but let libjuice use its dual-stack
+	 * UDP socket for ICE. IPv4 remains available when IPv6 is disabled. */
+	config.bind_address = NULL;
+	config.local_port_range_begin = ice_port;
+	config.local_port_range_end = ice_port;
 	config.stun_server_host = stun_host;
 	config.stun_server_port = stun_port;
 	config.cb_state_changed = on_state_changed;
@@ -468,6 +486,7 @@ int main(int argc, char **argv) {
 			} else {
 				juice_set_remote_gathering_done(g_agent);
 				output_line("REMOTE_SET");
+				notify_hook_remote_set();
 			}
 		} else if (strncmp(command, "PING ", 5) == 0 && command[5] != '\0') {
 			send_ping(command + 5);

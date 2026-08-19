@@ -1,10 +1,15 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const dgram = require('node:dgram')
 const { spawn } = require('node:child_process')
+const { loadConfig } = require('./config.cjs')
 
 const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform')
 const logDirectory = path.join(appData, 'logs')
+const localConfig = loadConfig().values
+const diagnosticLogEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_DIAGNOSTIC_LOG || 'false'))
+const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'true'))
 
 let lastProcess = null
 let iceProcess = null
@@ -34,6 +39,7 @@ const probeAgents = new Map()
 let standbyAgentKey = ''
 let standbyPromise = null
 let standbyGeneration = 0
+let iceUpnpMapping = null
 
 function helperCandidates() {
   return [
@@ -98,11 +104,13 @@ function candidateStats(description) {
 }
 
 function ensureSessionLogPath() {
+  if (!diagnosticLogEnabled) return ''
   if (!sessionLogPath) sessionLogPath = ensureLogPath()
   return sessionLogPath
 }
 
 function appendAgentEvent(role, event, details = {}) {
+  if (!diagnosticLogEnabled) return
   const logPath = sessionLogPath || lastLogPath
   if (!logPath) return
   try {
@@ -200,6 +208,178 @@ function transportStatus() {
 
 function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
+}
+
+function chooseIcePort() {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket('udp4')
+    socket.once('error', reject)
+    socket.bind(0, '0.0.0.0', () => {
+      const address = socket.address()
+      socket.close(() => resolve(Number(address.port) || 0))
+    })
+  })
+}
+
+function runPowerShell(script, timeoutMs = 1800) {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  return new Promise((resolve) => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-STA', '-EncodedCommand', encoded], {
+      windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ...result, output })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      finish({ ok: false, reason: 'timeout' })
+    }, timeoutMs)
+    child.stdout.on('data', (chunk) => { output += chunk.toString('utf8') })
+    child.once('error', (error) => finish({ ok: false, reason: error.message }))
+    child.once('close', (code) => finish({ ok: code === 0 && output.includes('WEL_UPNP_MAPPED'), reason: code === 0 ? 'unavailable' : 'exit-' + code }))
+  })
+}
+
+async function defaultIpv4Gateway() {
+  const result = await runPowerShell(
+    "$adapter=Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | " +
+      "Where-Object { $_.DefaultIPGateway -and $_.IPAddress } | Select-Object -First 1; " +
+      "$gateway=$adapter.DefaultIPGateway | Where-Object { $_ -match '^\\d+\\.' } | Select-Object -First 1; " +
+      "$ip=$adapter.IPAddress | Where-Object { $_ -match '^\\d+\\.' } | Select-Object -First 1; " +
+      "if($gateway -and $ip){Write-Output ('WEL_GATEWAY ' + $gateway); Write-Output ('WEL_LOCAL ' + $ip)}",
+    1200,
+  )
+  if (!result.ok) return ''
+  const output = String(result.output || '')
+  const gateway = output.match(/WEL_GATEWAY\s+(\d{1,3}(?:\.\d{1,3}){3})/)
+  const local = output.match(/WEL_LOCAL\s+(\d{1,3}(?:\.\d{1,3}){3})/)
+  return gateway && local ? { gateway: gateway[1], localIp: local[1] } : null
+}
+
+function sendUdpRequest(host, port, packet, responseLength, matcher, timeoutMs = 900) {
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket('udp4')
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { socket.close() } catch {}
+      resolve(result)
+    }
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    socket.once('error', () => finish(null))
+    socket.on('message', (message) => {
+      if (message.length < responseLength || !matcher(message)) return
+      finish(message)
+    })
+    socket.send(packet, 0, packet.length, port, host, (error) => { if (error) finish(null) })
+  })
+}
+
+async function requestNatPmpMapping(gateway, port) {
+  if (!gateway || !port) return null
+  const publicAddress = Buffer.from([0, 0])
+  const publicResponse = await sendUdpRequest(gateway, 5351, publicAddress, 12,
+    (message) => message[0] === 0 && message[1] === 128 && message.readUInt16BE(2) === 0)
+  if (!publicResponse) return null
+  const request = Buffer.alloc(12)
+  request[1] = 2 // UDP mapping
+  request.writeUInt16BE(port, 4)
+  request.writeUInt16BE(port, 6)
+  request.writeUInt32BE(7200, 8)
+  const response = await sendUdpRequest(gateway, 5351, request, 16,
+    (message) => message[0] === 0 && message[1] === 130 && message.readUInt16BE(2) === 0 && message.readUInt16BE(8) === port)
+  if (!response) return null
+  return { kind: 'nat-pmp', gateway, port, mapped: true, publicPort: response.readUInt16BE(10), lifetime: response.readUInt32BE(12) }
+}
+
+async function requestPcpMapping(gateway, localIp, port) {
+  if (!gateway || !localIp || !port) return null
+  const request = Buffer.alloc(60)
+  request[0] = 2
+  request[1] = 1 // MAP
+  request.writeUInt32BE(7200, 4)
+  const localBytes = localIp.split('.').map(Number)
+  request.fill(0, 8, 24)
+  request[18] = 0xff
+  request[19] = 0xff
+  Buffer.from(localBytes).copy(request, 20)
+  const nonce = Buffer.alloc(12)
+  for (let index = 0; index < nonce.length; index += 1) nonce[index] = Math.floor(Math.random() * 256)
+  nonce.copy(request, 24)
+  request[36] = 17 // UDP
+  request.writeUInt16BE(port, 40)
+  request.writeUInt16BE(port, 42)
+  const response = await sendUdpRequest(gateway, 5351, request, 60,
+    (message) => message[0] === 2 && (message[1] & 0x7f) === 1 && message[3] === 0 && message.readUInt16BE(40) === port)
+  if (!response) return null
+  return { kind: 'pcp', gateway, port, mapped: true, publicPort: response.readUInt16BE(42), lifetime: response.readUInt32BE(4), nonce }
+}
+
+async function requestNatMapping(port, key) {
+  const route = await defaultIpv4Gateway()
+  if (!route) return null
+  const mapping = await requestNatPmpMapping(route.gateway, port) || await requestPcpMapping(route.gateway, route.localIp, port)
+  if (mapping) {
+    mapping.key = String(key || '')
+    mapping.description = 'WEL No-TAP ICE ' + mapping.key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24)
+  }
+  return mapping
+}
+
+async function requestUpnpMapping(port, key) {
+  const mapping = { port: Number(port) || 0, key: String(key || ''), mapped: false }
+  if (!upnpEnabled || process.platform !== 'win32' || !mapping.port) return mapping
+  const description = 'WEL No-TAP ICE ' + mapping.key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24)
+  const script = `$ErrorActionPreference='Stop'; $port=${mapping.port}; $description=${powerShellLiteral(description)}; ` +
+    `$adapter=Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Where-Object { $_.DefaultIPGateway -and $_.IPAddress } | Select-Object -First 1; ` +
+    `$ip=$adapter.IPAddress | Where-Object { $_ -match '^\\d+\\.' } | Select-Object -First 1; if(-not $ip){exit 2}; ` +
+    `$nat=New-Object -ComObject HNetCfg.NATUPnP; $mappings=$nat.StaticPortMappingCollection; if($null -eq $mappings){exit 3}; ` +
+    `$null=$mappings.Add($port,'UDP',$port,$ip,$true,$description); Write-Output 'WEL_UPNP_MAPPED'`
+  const result = await runPowerShell(script)
+  mapping.mapped = Boolean(result.ok)
+  mapping.description = description
+  mapping.reason = result.reason
+  appendAgentEvent('active', 'upnp-mapping', { port: mapping.port, mapped: mapping.mapped, reason: mapping.reason })
+  if (!mapping.mapped) {
+    const fallback = await requestNatMapping(mapping.port, mapping.key)
+    if (fallback) {
+      appendAgentEvent('active', 'nat-mapping', { port: fallback.port, kind: fallback.kind, mapped: true })
+      return fallback
+    }
+  }
+  return mapping
+}
+
+function releaseUpnpMapping(mapping) {
+  if (!mapping?.mapped || process.platform !== 'win32') return
+  if (mapping.kind === 'nat-pmp' || mapping.kind === 'pcp') {
+    const request = mapping.kind === 'nat-pmp' ? Buffer.alloc(12) : Buffer.alloc(60)
+    if (mapping.kind === 'nat-pmp') {
+      request[1] = 2
+      request.writeUInt16BE(mapping.port, 4)
+      request.writeUInt16BE(mapping.publicPort || mapping.port, 6)
+    } else {
+      request[0] = 2
+      request[1] = 1
+      if (mapping.nonce) mapping.nonce.copy(request, 24)
+      request.writeUInt16BE(mapping.port, 40)
+      request.writeUInt16BE(mapping.publicPort || mapping.port, 42)
+    }
+    request.writeUInt32BE(0, mapping.kind === 'nat-pmp' ? 8 : 4)
+    void sendUdpRequest(mapping.gateway, 5351, request, mapping.kind === 'nat-pmp' ? 16 : 60, () => true, 500)
+    return
+  }
+  const script = `$ErrorActionPreference='SilentlyContinue'; $port=${Number(mapping.port) || 0}; $description=${powerShellLiteral(mapping.description || '')}; ` +
+    `$nat=New-Object -ComObject HNetCfg.NATUPnP; $mappings=$nat.StaticPortMappingCollection; if($null -eq $mappings){exit 0}; ` +
+    `$entry=$mappings.Item($port,'UDP'); if($null -ne $entry -and $entry.Description -eq $description){$mappings.Remove($port,'UDP')}`
+  void runPowerShell(script, 1200)
 }
 
 function nextRelayPingNonce() {
@@ -300,6 +480,12 @@ function handleIceLine(rawLine) {
     if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
     return
   }
+  if (line.startsWith('TRANSPORT_STATE ')) {
+    const state = line.slice(16).trim()
+    if (state === 'pending' || state === 'direct' || state === 'relay') transportPath = state
+    appendAgentEvent('active', 'transport-state', { state })
+    return
+  }
   if (line.startsWith('CANDIDATE ') || line.startsWith('SELECTED_CANDIDATES ') || line.startsWith('SELECTED_ADDRESSES ')) {
     rememberAgentLine('active', line)
     return
@@ -359,10 +545,12 @@ function handleIceLine(rawLine) {
   }
 }
 
-function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
+async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
   if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
+  const icePort = await chooseIcePort()
+  iceUpnpMapping = await requestUpnpMapping(icePort, 'active-' + Date.now().toString(36))
   iceHookPort = Number(hookPort) || chooseHookPort()
   iceOptions = { stunHost, stunPort, relay, room, logicalIp, token }
   iceLocalDescription = ''
@@ -382,7 +570,7 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hook
     environment.WEL_NOTAP_LOGICAL_IP = String(logicalIp)
     environment.WEL_NOTAP_TOKEN = String(token)
   }
-  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--hook-port', String(iceHookPort)], {
+  const child = spawn(executable, ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0), '--hook-port', String(iceHookPort), '--ice-port', String(icePort)], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
   })
   iceProcess = child
@@ -404,6 +592,8 @@ function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hook
     if (iceProcess === child) {
       iceProcess = null
       iceState = 'failed'
+      releaseUpnpMapping(iceUpnpMapping)
+      iceUpnpMapping = null
       const detail = iceDiagnostics.length ? '：' + iceDiagnostics.slice(-3).join(' | ') : ''
       iceExitError = 'ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）' + detail
     }
@@ -446,6 +636,8 @@ async function resetIce() {
   await clearStandbyAgent()
   const previous = iceProcess
   iceProcess = null
+  releaseUpnpMapping(iceUpnpMapping)
+  iceUpnpMapping = null
   await stopIceChild(previous)
   await startIceAgent({ ...iceOptions, hookPort: iceHookPort })
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
@@ -484,6 +676,8 @@ function attachActiveIceProcess(child) {
     if (iceProcess !== child) return
     iceProcess = null
     iceState = 'failed'
+    releaseUpnpMapping(iceUpnpMapping)
+    iceUpnpMapping = null
     const detail = iceDiagnostics.length ? '：' + iceDiagnostics.slice(-3).join(' | ') : ''
     iceExitError = 'ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）' + detail
   })
@@ -495,20 +689,38 @@ async function prewarmIce() {
   if (standbyPromise) return standbyPromise
   const generation = standbyGeneration
   const options = { ...iceOptions, hookPort: iceHookPort }
-  const gathering = createProbeIce({ ...options, standby: true, hookPort: iceHookPort })
-  standbyPromise = gathering
-    .then((result) => {
+  const warming = (async () => {
+    let icePort = 0
+    let mapping = null
+    try {
+      icePort = await chooseIcePort()
+      mapping = await requestUpnpMapping(icePort, 'standby-' + Date.now().toString(36))
+    } catch {
+      // A failed optional mapping must not prevent the next ICE agent from warming.
+    }
+    if (generation !== standbyGeneration) {
+      releaseUpnpMapping(mapping)
+      return { ready: false, state: 'cancelled' }
+    }
+    const gathering = createProbeIce({ ...options, standby: true, hookPort: iceHookPort, icePort, upnpMapping: mapping })
+    warming.probeKey = gathering.probeKey
+    try {
+      const result = await gathering
       if (generation !== standbyGeneration) {
         stopProbeIce(result.probeKey)
         return { ready: false, state: 'cancelled' }
       }
       standbyAgentKey = result.probeKey
       return { ready: true, state: 'ready', localDescription: result.localDescription }
-    })
-    .catch((error) => ({ ready: false, state: 'failed', error: String(error?.message || error) }))
-    .finally(() => { if (generation === standbyGeneration) standbyPromise = null })
-  standbyPromise.probeKey = gathering.probeKey
-  return standbyPromise
+    } catch (error) {
+      releaseUpnpMapping(mapping)
+      return { ready: false, state: 'failed', error: String(error?.message || error) }
+    } finally {
+      if (generation === standbyGeneration) standbyPromise = null
+    }
+  })()
+  standbyPromise = warming
+  return warming
 }
 
 async function activateIce() {
@@ -519,6 +731,8 @@ async function activateIce() {
 
   const previous = iceProcess
   iceProcess = null
+  releaseUpnpMapping(iceUpnpMapping)
+  iceUpnpMapping = null
   await stopIceChild(previous)
   probeAgents.delete(key)
   standbyAgentKey = ''
@@ -529,6 +743,8 @@ async function activateIce() {
   iceAgentPort = standby.localPort
   iceHookPort = standby.hookPort || iceHookPort
   iceOptions = standby.options || iceOptions
+  iceUpnpMapping = standby.upnpMapping
+  standby.upnpMapping = null
   iceState = 'gathering'
   iceExitError = ''
   iceDiagnostics = []
@@ -583,6 +799,7 @@ function stopProbeIce(probeKey) {
   if (!probe) return { stopped: true }
   appendAgentEvent(probe.standby ? 'standby' : 'probe', 'stopping', { key: probeKey, reason: 'rotation-or-disconnect' })
   probeAgents.delete(probeKey)
+  releaseUpnpMapping(probe.upnpMapping)
   if (probe.timeoutTimer) clearTimeout(probe.timeoutTimer)
   if (probe.retryTimer) clearInterval(probe.retryTimer)
   if (probe.pendingPing) {
@@ -601,7 +818,7 @@ function stopProbeIce(probeKey) {
   return { stopped: true }
 }
 
-function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '' }) {
+function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '', icePort = 0, upnpMapping = null }) {
   const executable = locate(iceCandidates())
   if (!executable) return Promise.reject(new Error('缺少 welnptice.exe，请重新解压完整客户端'))
   const key = randomProbeKey()
@@ -618,6 +835,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     delete environment.WEL_NOTAP_TOKEN
   }
   const args = ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0)]
+  if (icePort) args.push('--ice-port', String(icePort))
   if (standby) args.push('--hook-port', String(hookPort || 0), '--standby')
   else args.push('--no-hook')
   const child = spawn(executable, args, {
@@ -627,7 +845,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     key, child, state: 'gathering', localDescription: '', localPort: 0,
     buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
     remoteWaiter: null, pingUnavailable: false, pendingPing: null,
-    retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0,
+    retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0, upnpMapping,
     options: { stunHost, stunPort, relay, room, logicalIp, token },
   }
   appendAgentEvent(standby ? 'standby' : 'probe', 'started', { key, stunHost, stunPort, hookPort: Number(hookPort) || 0 })
@@ -855,8 +1073,10 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
+  if (!direct) transportPath = 'relay'
   const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
-    '--logical-ip', String(logicalIp), '--token', String(token), '--log', logPath]
+    '--logical-ip', String(logicalIp), '--token', String(token)]
+  if (diagnosticLogEnabled && logPath) args.push('--log', logPath)
   if (direct && iceProcess && iceAgentPort && iceHookPort) {
     args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
   }
@@ -889,7 +1109,7 @@ async function launchElevated(options) {
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail || '用户取消了管理员授权，或提权启动失败', code)))
-      else resolve({ started: true, detail: 'WE8 已通过管理员授权启动，日志：' + logPath, warnings: [] })
+      else resolve({ started: true, detail: logPath ? 'WE8 已通过管理员授权启动，日志：' + logPath : 'WE8 已通过管理员授权启动', warnings: [] })
     })
   })
 }
@@ -908,14 +1128,16 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
 
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
+  if (!direct) transportPath = 'relay'
   const environment = {
     ...process.env,
     WEL_NOTAP_RELAY: String(relay),
     WEL_NOTAP_ROOM: String(room),
     WEL_NOTAP_LOGICAL_IP: String(logicalIp),
     WEL_NOTAP_TOKEN: String(token),
-    WEL_NOTAP_LOG_PATH: logPath,
+    WEL_NOTAP_DIAGNOSTIC_LOG: diagnosticLogEnabled ? 'true' : 'false',
   }
+  if (diagnosticLogEnabled && logPath) environment.WEL_NOTAP_LOG_PATH = logPath
   if (direct && iceProcess && iceAgentPort && iceHookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
@@ -937,7 +1159,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail, code)))
-      else resolve({ started: true, detail: detail || 'WE8 已启动，日志：' + logPath, warnings: [] })
+      else resolve({ started: true, detail: detail || (logPath ? 'WE8 已启动，日志：' + logPath : 'WE8 已启动'), warnings: [] })
     })
   })
 }
@@ -953,6 +1175,8 @@ async function disconnect() {
     try { iceProcess.kill() } catch {}
   }
   iceProcess = null
+  releaseUpnpMapping(iceUpnpMapping)
+  iceUpnpMapping = null
   await clearStandbyAgent()
   iceState = 'waiting'
   iceLocalDescription = ''

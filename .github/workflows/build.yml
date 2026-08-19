@@ -86,7 +86,7 @@ jobs:
             '/Ithird_party/libjuice/include', 'native/welnpt_ice.c', "/Fe:$output/welnptice.exe",
             '/link', 'Ws2_32.lib', 'Iphlpapi.lib', 'Bcrypt.lib', "$output/juice-static.lib"
           )
-          & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --hook-port 49000 --validate-args
+          & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --hook-port 49000 --ice-port 49001 --validate-args
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper argument validation failed' }
           & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --no-hook --validate-args
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper no-hook validation failed' }
