@@ -19,6 +19,7 @@ let mainWindow = null
 let tray = null
 let isQuitting = false
 let quitTimer = null
+let transportShutdownComplete = false
 
 function writeLog(message, error, force = false) {
   if (!diagnosticLogEnabled && !force) return
@@ -255,5 +256,13 @@ app.whenReady().then(() => {
   app.quit()
 })
 
-app.on('before-quit', () => { isQuitting = true })
+app.on('before-quit', (event) => {
+  isQuitting = true
+  if (transportShutdownComplete) return
+  event.preventDefault()
+  Promise.allSettled([tap.stopConnection(), notap.disconnect()]).finally(() => {
+    transportShutdownComplete = true
+    app.quit()
+  })
+})
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
