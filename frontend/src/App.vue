@@ -765,7 +765,7 @@ onBeforeUnmount(() => {
         <div v-if="roomPreparing || launchingGame" class="preparation-backdrop" role="status" aria-live="polite">
           <section class="preparation-panel">
             <LoaderCircle :size="34" class="spinning" />
-            <h3>{{ roomPreparing ? '直连组件准备中' : '游戏组件准备中' }}</h3>
+            <h3>{{ roomPreparing ? (activeLease?.connection_mode === 'tap' ? '虚拟网卡组件准备中' : '直连组件准备中') : '游戏组件准备中' }}</h3>
             <p>{{ roomPreparing ? roomPreparationMessage : '正在检查并加载游戏联机组件' }}</p>
           </section>
         </div>
