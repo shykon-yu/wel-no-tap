@@ -486,18 +486,32 @@ async function launchGameNow() {
 async function pingMember(member: RoomMember) {
   if (!desktop()) return
   if (pingingMemberIds.value.has(member.user_id)) return
+  const tapRoom = activeLease.value?.connection_mode === 'tap'
   pingingMemberIds.value = new Set(pingingMemberIds.value).add(member.user_id)
   pingResults.value = {
     ...pingResults.value,
     [member.user_id]: {
       host: member.virtual_ip,
       reachable: false,
-      summary: '正在探测中继服务器和中继玩家...',
+      summary: tapRoom ? '正在探测 TAP 房间内地址...' : '正在探测中继服务器和中继玩家...',
       relayServer: { reachable: false, summary: '探测中...' },
       relayPeer: { reachable: false, summary: '探测中...' },
     },
   }
   try {
+    if (tapRoom) {
+      if (!desktop()!.tapPingPeer) throw new Error('TAP 房间 Ping 功能不可用，请更新完整客户端')
+      const result = await desktop()!.tapPingPeer(member.virtual_ip)
+      pingResults.value = {
+        ...pingResults.value,
+        [member.user_id]: {
+          ...result,
+          relayServer: { reachable: false, summary: '网卡房间不使用云中继探测' },
+          relayPeer: { reachable: false, summary: '网卡房间不使用云中继探测' },
+        },
+      }
+      return
+    }
     const relayServerPromise = desktop()!.pingRelay()
       .then(milliseconds => ({ reachable: true, summary: `中继服务器 ${milliseconds} ms` }))
       .catch(() => ({ reachable: false, summary: '中继服务器不可用' }))
@@ -794,8 +808,11 @@ onBeforeUnmount(() => {
               <div class="detail-row">
                 <span>Ping</span>
                 <div class="ping-results">
-                  <div><span>中继服务器</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayServer.reachable }]">{{ selectedMemberPing?.relayServer.summary || '未检测' }}</strong></div>
-                  <div><span>中继玩家</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayPeer.reachable }]">{{ selectedMemberPing?.relayPeer.summary || '未检测' }}</strong></div>
+                  <div v-if="activeLease?.connection_mode === 'tap'"><span>TAP 房间对手</span><strong :class="['ping-result', { ok: selectedMemberPing?.reachable }]">{{ selectedMemberPing?.summary || '未检测' }}</strong></div>
+                  <template v-else>
+                    <div><span>中继服务器</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayServer.reachable }]">{{ selectedMemberPing?.relayServer.summary || '未检测' }}</strong></div>
+                    <div><span>中继玩家</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayPeer.reachable }]">{{ selectedMemberPing?.relayPeer.summary || '未检测' }}</strong></div>
+                  </template>
                 </div>
               </div>
             </div>

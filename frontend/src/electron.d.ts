@@ -47,6 +47,7 @@ declare global {
       onGamePeer: (callback: (event: { logicalIp: string; transactionKey: string }) => void) => () => void
       pingRelay: () => Promise<number>
       pingRelayPeer: (remoteIp: string) => Promise<number>
+      tapPingPeer: (remoteIp: string) => Promise<PingResult>
       tapStatus: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
       tapPrepare: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
       tapConnect: (options: { host: string; port: number; roomID: number; username: string; subnetCidr: string; virtualIP: string; community: string }) => Promise<DesktopLeaseStatus>

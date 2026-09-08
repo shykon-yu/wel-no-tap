@@ -3,13 +3,14 @@ const dgram = require('node:dgram')
 const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
-const { formatProcessExitCode, inspectVpnNetwork, runPowerShell, runProcess, waitForVpnNetwork } = require('./tap-network.cjs')
+const { formatProcessExitCode, inspectVpnNetwork, isIPv4InCIDR, runPowerShell, runProcess, waitForVpnNetwork } = require('./tap-network.cjs')
 const { ensureRoomFirewall } = require('./tap-firewall.cjs')
 
 const DEFAULT_HOST = '8.155.145.132'
 const DEFAULT_PORT = 22222
 const TAP_NAME = 'TAP-Windows Adapter V9'
-const WEL_TAP_NAME = /^(?:WEL Virtual LAN|WEL TAP|TAP-Windows Adapter V9|OpenVPN TAP-Windows6|以太网|本地连接)(?: \d+| #\d+)?$/i
+const WEL_TAP_NAME = /^(?:WEL Virtual LAN|WEL TAP|TAP-Windows Adapter V9|OpenVPN TAP-Windows6|以太网|Ethernet|本地连接|Local Area Connection)(?: \d+| #\d+)?$/i
+const TAP_DESCRIPTION = /(?:TAP-Windows Adapter|OpenVPN TAP-Windows|WEL TAP|WEL Virtual LAN)/i
 const N2N_PROGRESS = /(?:supernode|register|edge|tuntap|wintap|tap|peer|packet|created local tap|successfully joined)/i
 const EDGE_MANAGEMENT_PORT = 5645
 const EDGE_MANAGEMENT_TIMEOUT_MS = 700
@@ -81,7 +82,13 @@ function parseTapctlList(output) {
       // absent and trigger another driver installation.
       // Keep the registry's original casing because n2n 3.0 compares the
       // Windows adapter ID with strcmp() when opening the device.
-      return { guid: `{${match[1]}}`, name: name || TAP_NAME }
+      return {
+        guid: `{${match[1]}}`,
+        name: name || TAP_NAME,
+        connectionName: name || null,
+        description: null,
+        isTap: true,
+      }
     })
     .filter(Boolean)
 }
@@ -103,11 +110,18 @@ function parseWmiTapAdapters(output) {
       const fields = line.trim().split('|')
       if (fields.length < 3) return null
       const guid = decodeBase64Field(fields[0]).trim()
-      const name = decodeBase64Field(fields[1]).trim() || decodeBase64Field(fields[2]).trim()
+      const connectionName = decodeBase64Field(fields[1]).trim()
+      const description = decodeBase64Field(fields[2]).trim()
       if (!guid) return null
       const exactGuid = extractTapGuid(`{${guid.replace(/[{}]/g, '')}}`)
       if (!exactGuid) return null
-      return { guid: exactGuid, name: name || TAP_NAME }
+      return {
+        guid: exactGuid,
+        name: connectionName || description || TAP_NAME,
+        connectionName: connectionName || null,
+        description: description || null,
+        isTap: true,
+      }
     })
     .filter(Boolean)
 }
@@ -161,13 +175,28 @@ function parseRegistryTapAdapters(output, connectionNames = null) {
     const guid = extractTapGuid(values.netcfginstanceid)
     const connectionName = guid ? connectionNames?.get(guid.slice(1, -1).toLowerCase()) : null
     if (!isTap || !guid || (connectionNames && !connectionName)) return null
-    return { guid, name: connectionName || description || TAP_NAME }
+    return {
+      guid,
+      name: connectionName || description || TAP_NAME,
+      connectionName: connectionName || null,
+      description: description || null,
+      isTap: true,
+    }
   }).filter(Boolean)
 }
 
 function isWelTapAdapter(name) {
   const normalized = String(name || '').trim()
   return WEL_TAP_NAME.test(normalized)
+}
+
+function isTapAdapter(adapter) {
+  if (!adapter) return false
+  if (adapter.isTap === true) return true
+  // A localized connection alias such as "以太网 2" is not enough to prove
+  // that an adapter is TAP; ordinary physical adapters can use the same alias.
+  return TAP_DESCRIPTION.test(String(adapter.description || '')) ||
+    TAP_DESCRIPTION.test(String(adapter.name || ''))
 }
 
 function extractTapGuid(output) {
@@ -204,7 +233,15 @@ async function ensureTapReady(adapter) {
   const enabledAdapter = await ensureTapEnabled(adapter)
   if (!enabledAdapter) return null
   rememberTapAdapter(enabledAdapter)
-  preparedTap = { tapName: enabledAdapter.name, tapNode: enabledAdapter.guid, tapGuid: enabledAdapter.guid }
+  // n2n on Windows matches -d against the TAP GUID or the network
+  // connection name (for example "以太网 2"), not the driver description.
+  const tapName = enabledAdapter.connectionName || enabledAdapter.name || TAP_NAME
+  preparedTap = {
+    tapName,
+    tapNode: enabledAdapter.guid,
+    tapGuid: enabledAdapter.guid,
+    tapDescription: enabledAdapter.description || null,
+  }
   return preparedTap
 }
 
@@ -213,12 +250,11 @@ function selectWelTapAdapter(adapters, excludedGuids = new Set()) {
     const normalized = parseTapGuid(guid)
     return Boolean(normalized) && !excludedGuids.has(normalized)
   })
-  const owned = candidates.filter(({ name }) => isWelTapAdapter(name))
-  return owned.find(({ name }) => name.toLowerCase() === TAP_NAME.toLowerCase())
-    || owned.find(({ name }) => /^WEL (?:Virtual LAN|TAP)(?: \d+)?$/i.test(name))
-    || owned.find(({ name }) => /^(?:以太网|本地连接)(?: \d+| #\d+)?$/i.test(name))
+  const owned = candidates.filter(isTapAdapter)
+  return owned.find(({ description, name }) => String(description || name || '').toLowerCase() === TAP_NAME.toLowerCase())
+    || owned.find(({ description, name }) => /^(?:WEL Virtual LAN|WEL TAP)(?: \d+)?$/i.test(String(description || name || '')))
+    || owned.find(({ connectionName, name }) => /^(?:以太网|Ethernet|本地连接|Local Area Connection)(?: \d+| #\d+)?$/i.test(String(connectionName || name || '')))
     || owned[0]
-    || candidates[0]
     || null
 }
 
@@ -248,7 +284,7 @@ function runTapctl(executable, args, timeoutMs = 10000) {
 async function listTapAdapters(tapctl) {
   try {
     const adapters = parseTapctlList(await runTapctl(tapctl, ['list']))
-    if (adapters.length > 0) return adapters
+    if (adapters.length > 0) return await enrichTapAdapters(adapters)
   } catch {
     // Win7 can have a healthy TAP driver while tapctl cannot enumerate it.
   }
@@ -265,6 +301,26 @@ async function listTapAdapters(tapctl) {
     // bundled TAP installer on a machine that has no adapter yet.
     return []
   }
+}
+
+async function enrichTapAdapters(adapters) {
+  // tapctl identifies the device by GUID, while n2n needs the Windows
+  // connection name when -d is used. Merge the two views so a localized name
+  // such as "以太网 2" is not confused with the driver description.
+  let metadata = []
+  try {
+    metadata = await listTapAdaptersFromRegistry()
+  } catch {
+    try { metadata = await listTapAdaptersFromWmi() } catch {}
+  }
+  if (!metadata.length) return adapters
+  const byGuid = new Map(metadata.map((adapter) => [parseTapGuid(adapter.guid), adapter]))
+  return adapters.map((adapter) => {
+    const detail = byGuid.get(parseTapGuid(adapter.guid))
+    return detail
+      ? { ...adapter, ...detail, isTap: true }
+      : adapter
+  })
 }
 
 async function listTapAdaptersFromRegistry() {
@@ -316,7 +372,9 @@ $errorCode = 0
 try { $errorCode = [int]$adapter.ConfigManagerErrorCode } catch {}
 if ($errorCode -ne 0) { [Console]::Out.WriteLine('ERROR'); exit 0 }
 $enabled = $adapter.NetEnabled
-if ($enabled -ne $true) {
+# NetEnabled can be null on older Windows/WMI even when the device is healthy.
+# Only explicitly disabled adapters need an Enable() call.
+if ($enabled -eq $false) {
   $result = $adapter.Enable()
   $returnValue = [int]$result.ReturnValue
   if (@(0, 1) -notcontains $returnValue) { [Console]::Out.WriteLine('ERROR'); exit 0 }
@@ -578,6 +636,49 @@ function status() {
 
 function activeNetwork() {
   return connection?.network ? { ...connection.network } : null
+}
+
+function parsePingSummary(host, output) {
+  const text = String(output || '').replace(/\r?\n/g, '\n')
+  const reachable = /TTL=/i.test(text)
+  const loss = text.match(/(\d+)%\s*(?:loss|丢失)/i)?.[1]
+  const average = text.match(/(?:Average|平均)\s*[=<]\s*(\d+ms)/i)?.[1]
+    || text.match(/平均\s*=\s*(\d+ms)/)?.[1]
+  const parts = [reachable ? '可达' : '不可达']
+  if (average) parts.push(`平均 ${average}`)
+  if (loss !== undefined) parts.push(`丢包 ${loss}%`)
+  return { host, reachable, summary: parts.join('，') }
+}
+
+function isValidIPv4(value) {
+  const parts = String(value || '').trim().split('.').map(Number)
+  return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+}
+
+function pingHost(host) {
+  const target = String(host || '').trim()
+  if (!isValidIPv4(target)) return Promise.reject(new Error('Ping 地址不正确'))
+  if (process.platform !== 'win32') return Promise.reject(new Error('TAP 房间 Ping 仅支持 Windows'))
+  const network = activeNetwork()
+  if (!network?.connected || !isValidIPv4(network.actualIp)) return Promise.reject(new Error('TAP 网卡尚未连接'))
+  if (!isIPv4InCIDR(target, network.subnetCidr)) return Promise.reject(new Error('对手不在当前 TAP 房间网段'))
+  const ping = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\ping.exe`
+  const source = network.actualIp
+  const args = ['-n', '4', '-w', '1000']
+  if (isValidIPv4(source)) args.push('-S', source)
+  args.push(target)
+  return new Promise((resolve) => {
+    const child = spawn(ping, args, { windowsHide: true })
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    child.once('error', (error) => resolve({ host: target, reachable: false, summary: `Ping 失败：${error.message}` }))
+    child.once('close', () => {
+      const output = Buffer.concat([...stdout, ...stderr]).toString('utf8')
+      resolve(parsePingSummary(target, output))
+    })
+  })
 }
 
 function wait(ms) {
@@ -857,6 +958,9 @@ async function connect({ host, port, roomID, username, subnetCidr, virtualIP, co
   let lastError = null
   for (let attempt = 1; attempt <= CONNECT_MAX_ATTEMPTS; attempt += 1) {
     try {
+      // Pass the GUID to n2n. It is ASCII and is the authoritative Windows
+      // adapter identity; the localized connection name is retained for
+      // diagnostics and UI only.
       const network = await connectAttempt({ executable, host, port, roomID, username, subnetCidr, virtualIP, community, transportKey, tapName: tapNode, transportBindIP })
       const result = { ...network, warnings: firewall.warnings || [] }
       if (connection) connection.network = result
@@ -897,6 +1001,8 @@ module.exports = {
   transportStatus,
   transportConfigPath,
   parseTapGuid,
+  parsePingSummary,
+  pingHost,
   parseTapctlList,
   parseRegistryConnectionNames,
   parseRegistryTapAdapters,

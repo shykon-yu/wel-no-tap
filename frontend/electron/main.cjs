@@ -7,6 +7,7 @@ const { publicConfig } = require('./config.cjs')
 const notap = require('./notap.cjs')
 const tap = require('./tap.cjs')
 const tapGame = require('./tap-game-launch.cjs')
+const { ensureWe8Firewall } = require('./tap-firewall.cjs')
 const firewall = require('./firewall.cjs')
 
 if (process.platform === 'win32') app.commandLine.appendSwitch('no-sandbox')
@@ -143,7 +144,12 @@ async function ensureWindowsFirewall(event, options = {}) {
 async function launchGameWithRecovery(event, options) {
   if (options?.mode === 'tap') {
     try {
-      return await tapGame.launchGameBound(options.gamePath, tap.activeNetwork())
+      const firewallResult = await ensureWe8Firewall(options.gamePath)
+      const launchResult = await tapGame.launchGameBound(options.gamePath, tap.activeNetwork())
+      return {
+        ...launchResult,
+        warnings: [...(firewallResult.warnings || []), ...(launchResult.warnings || [])],
+      }
     } catch (error) {
       throw error
     }
@@ -203,6 +209,7 @@ ipcMain.handle('notap-activate-ice', () => notap.activateIce())
 ipcMain.handle('notap-configure-ice', (_event, options) => notap.configureIce(options?.remoteDescription, options?.remoteIp))
 ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-ping-relay-peer', (_event, remoteIp) => notap.pingRelayPeer(remoteIp))
+ipcMain.handle('tap-ping-peer', (_event, remoteIp) => tap.pingHost(remoteIp))
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', launchGameWithRecovery)
 ipcMain.handle('tap-status', () => tap.status())
