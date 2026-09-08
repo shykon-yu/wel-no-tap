@@ -56,7 +56,7 @@ function roomFirewallWarnings(error) {
   if (code >= ROOM_WARNING_BASE && code <= ROOM_WARNING_BASE + 7) {
     const flags = code & 7
     if (flags & ROOM_UDP_WARNING) warnings.push('房间 UDP 入站放行失败；开启防火墙时，可能影响搜索或连接。')
-    if (flags & ROOM_EDGE_WARNING) warnings.push('n2n 入站放行失败；可能降低 P2P 直连成功率，但仍会继续尝试中继连接。')
+    if (flags & ROOM_EDGE_WARNING) warnings.push('网络组件入站放行失败；可能降低 P2P 直连成功率，但仍会继续尝试中继连接。')
     if (flags & ROOM_ICMP_WARNING) warnings.push('Ping 放行规则创建失败；对手可能无法 Ping 到你，但不影响进入房间。')
     return warnings
   }
@@ -91,7 +91,7 @@ function cidrToFirewallSubnet(subnetCidr) {
 
 function buildRoomFirewallArgs(edgePath, subnetCidr = WEL_ROOM_FIREWALL_SUBNET_CIDR) {
   const normalizedEdgePath = String(edgePath || '').trim()
-  if (!normalizedEdgePath) throw new Error('n2n 联机组件路径为空')
+  if (!normalizedEdgePath) throw new Error('网络组件路径为空')
   return ['--subnet', cidrToFirewallSubnet(subnetCidr), '--edge', normalizedEdgePath]
 }
 

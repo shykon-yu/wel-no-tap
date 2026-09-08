@@ -66,6 +66,43 @@ static int welnpt_auth_digest(welnpt_auth_context *context, const char *packet,
     return status >= 0;
 }
 
+/* Verification must hash the packet with auth_tag treated as zero. Hash the
+   three logical segments directly instead of copying and clearing a full
+   maximum-sized datagram for every received packet. */
+static int welnpt_auth_digest_without_tag(welnpt_auth_context *context, const char *packet,
+    int packet_length, unsigned char digest[WELNPT_SHA256_LENGTH]) {
+    BCRYPT_HASH_HANDLE hash = NULL;
+    PUCHAR object;
+    int heap_object = 0;
+    NTSTATUS status;
+    static const unsigned char zero_tag[WELNPT_AUTH_TAG_LENGTH] = { 0 };
+    const int tag_offset = (int)sizeof(welnpt_packet_header) - WELNPT_AUTH_TAG_LENGTH;
+    const int suffix_offset = tag_offset + WELNPT_AUTH_TAG_LENGTH;
+
+    if (context == NULL || context->provider == NULL || packet == NULL ||
+        packet_length < (int)sizeof(welnpt_packet_header)) return 0;
+    if (context->object_length <= sizeof(g_welnpt_auth_object)) {
+        object = g_welnpt_auth_object;
+    } else {
+        object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, context->object_length);
+        if (object == NULL) return 0;
+        heap_object = 1;
+    }
+    status = BCryptCreateHash(context->provider, &hash, object, context->object_length,
+        (PUCHAR)context->secret, (ULONG)strlen(context->secret), 0);
+    if (status >= 0) status = BCryptHashData(hash, (PUCHAR)packet, (ULONG)tag_offset, 0);
+    if (status >= 0) status = BCryptHashData(hash, (PUCHAR)zero_tag, sizeof(zero_tag), 0);
+    if (status >= 0 && packet_length > suffix_offset) {
+        status = BCryptHashData(hash, (PUCHAR)(packet + suffix_offset),
+            (ULONG)(packet_length - suffix_offset), 0);
+    }
+    if (status >= 0) status = BCryptFinishHash(hash, digest, WELNPT_SHA256_LENGTH, 0);
+    if (hash != NULL) BCryptDestroyHash(hash);
+    SecureZeroMemory(object, context->object_length);
+    if (heap_object) HeapFree(GetProcessHeap(), 0, object);
+    return status >= 0;
+}
+
 static int welnpt_auth_sign(welnpt_auth_context *context, char *packet, int packet_length) {
     welnpt_packet_header *header;
     unsigned char digest[WELNPT_SHA256_LENGTH];
@@ -79,21 +116,17 @@ static int welnpt_auth_sign(welnpt_auth_context *context, char *packet, int pack
 }
 
 static int welnpt_auth_verify(welnpt_auth_context *context, const char *packet, int packet_length) {
-    char authenticated[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
-    welnpt_packet_header *header;
+    const welnpt_packet_header *header;
     unsigned char expected[WELNPT_AUTH_TAG_LENGTH];
     unsigned char digest[WELNPT_SHA256_LENGTH];
     unsigned char difference = 0;
     int index;
     if (packet == NULL || packet_length < (int)sizeof(welnpt_packet_header) ||
-        packet_length > (int)sizeof(authenticated)) return 0;
-    CopyMemory(authenticated, packet, (size_t)packet_length);
-    header = (welnpt_packet_header *)authenticated;
+        packet_length > (int)(sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD)) return 0;
+    header = (const welnpt_packet_header *)packet;
     CopyMemory(expected, header->auth_tag, sizeof(expected));
-    ZeroMemory(header->auth_tag, sizeof(header->auth_tag));
-    if (!welnpt_auth_digest(context, authenticated, packet_length, digest)) return 0;
+    if (!welnpt_auth_digest_without_tag(context, packet, packet_length, digest)) return 0;
     for (index = 0; index < WELNPT_AUTH_TAG_LENGTH; ++index) difference |= expected[index] ^ digest[index];
-    SecureZeroMemory(authenticated, sizeof(authenticated));
     SecureZeroMemory(expected, sizeof(expected));
     SecureZeroMemory(digest, sizeof(digest));
     return difference == 0;

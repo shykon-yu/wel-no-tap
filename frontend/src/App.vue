@@ -29,12 +29,24 @@ const LEGACY_GAME_PATH_KEY = 'pes8.game-path'
 const gamePath = ref(localStorage.getItem(GAME_PATH_KEY) ?? localStorage.getItem(LEGACY_GAME_PATH_KEY) ?? '')
 const totalOnline = computed(() => rooms.value.reduce((total, room) => total + room.members, 0))
 const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => room.id === activeLease.value?.room_id) ?? null : null)
-const displayRoomName = (room: Room) => `${room.connection_mode === 'tap' ? '网卡' : room.connection_mode === 'direct' ? '直连' : '中继'} ${String(room.id).padStart(2, '0')}`
-const activeRoomName = computed(() => activeRoom.value ? displayRoomName(activeRoom.value) : (activeLease.value ? `房间 ${String(activeLease.value.room_id).padStart(2, '0')}` : '未进入房间'))
+const ROOM_LABELS: Record<number, string> = {
+  1: '直连01',
+  2: '直连02',
+  3: '中继03',
+  4: '中继04',
+  5: '网卡05',
+  6: '网卡06',
+}
+const roomLabel = (roomID: number, mode?: Room['connection_mode']) => ROOM_LABELS[roomID]
+  ?? `${mode === 'tap' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
+const displayRoomName = (room: Room) => roomLabel(room.id, room.connection_mode)
+const activeRoomName = computed(() => activeRoom.value
+  ? displayRoomName(activeRoom.value)
+  : (activeLease.value ? roomLabel(activeLease.value.room_id, activeLease.value.connection_mode) : '未进入房间'))
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
-  if (activeLease.value.connection_mode === 'tap') return `${activeRoomName.value} · TAP/n2n 房间已连接`
+  if (activeLease.value.connection_mode === 'tap') return `${activeRoomName.value} · 网卡房间已连接`
   if (activeLease.value.connection_mode === 'relay') return `${activeRoomName.value} · 仅使用云中继`
   if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 直连组件准备中，中继已连接`
   if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
@@ -226,7 +238,9 @@ async function renewLease(epoch: number) {
 async function loadRooms() {
   loading.value = true
   errorMessage.value = ''
-  try { rooms.value = (await roomApi.list()).rooms } catch (error) { errorMessage.value = messageOf(error) } finally { loading.value = false }
+  try {
+    rooms.value = (await roomApi.list()).rooms.slice().sort((left, right) => left.id - right.id)
+  } catch (error) { errorMessage.value = messageOf(error) } finally { loading.value = false }
 }
 
 async function authenticate() {
@@ -322,19 +336,19 @@ async function joinRoom(room: Room) {
     const directRoom = lease.connection_mode === 'direct'
     const tapRoom = lease.connection_mode === 'tap'
     directCandidateStatus.value = directRoom ? 'gathering' : 'relay-only'
-    directCandidateMessage.value = tapRoom ? 'TAP/n2n 网卡准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
+    directCandidateMessage.value = tapRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
     networkStatus.value = {
       ready: true,
       connected: true,
-      message: tapRoom ? 'TAP/n2n 网卡准备中' : directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
+      message: tapRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
       actualIp: lease.logical_ip || lease.virtual_ip,
     }
     roomPreparationTask = directRoom ? prepareRoomTools(lease, preparationEpoch) : Promise.resolve<'relay-only'>('relay-only')
     if (tapRoom) {
       roomPreparing.value = true
-      roomPreparationMessage.value = '正在检查 TAP 驱动并连接网卡'
+      roomPreparationMessage.value = '正在检查网卡组件并建立连接'
       const desktopApi = desktop()
-      if (!desktopApi?.tapPrepare || !desktopApi.tapConnect) throw new Error('TAP 网卡组件不可用：当前不是完整 Windows 客户端')
+      if (!desktopApi?.tapPrepare || !desktopApi.tapConnect) throw new Error('网卡组件不可用：当前不是完整 Windows 客户端')
       await desktopApi.tapPrepare()
       const network = await desktopApi.tapConnect({ host: lease.server_host || lease.relay_host, port: lease.server_port || lease.relay_port, roomID: lease.room_id, username: lease.username, subnetCidr: lease.subnet_cidr, virtualIP: lease.virtual_ip, community: lease.community })
       networkStatus.value = { ...network, connected: true, ready: true, actualIp: network.actualIp || lease.virtual_ip }
@@ -350,7 +364,7 @@ async function joinRoom(room: Room) {
     startRoomMembersMonitor()
     roomPreparing.value = false
     roomPreparationMessage.value = ''
-    notice.value = tapRoom ? '已进入网卡房间，TAP/n2n 已连接' : directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
+    notice.value = tapRoom ? '已进入网卡房间，网络组件已连接' : directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       await forceSignedOut(error.message)
@@ -493,14 +507,14 @@ async function pingMember(member: RoomMember) {
     [member.user_id]: {
       host: member.virtual_ip,
       reachable: false,
-      summary: tapRoom ? '正在探测 TAP 房间内地址...' : '正在探测中继服务器和中继玩家...',
+      summary: tapRoom ? '正在探测房间内地址...' : '正在探测中继服务器和中继玩家...',
       relayServer: { reachable: false, summary: '探测中...' },
       relayPeer: { reachable: false, summary: '探测中...' },
     },
   }
   try {
     if (tapRoom) {
-      if (!desktop()!.tapPingPeer) throw new Error('TAP 房间 Ping 功能不可用，请更新完整客户端')
+      if (!desktop()!.tapPingPeer) throw new Error('房间 Ping 功能不可用，请更新完整客户端')
       const result = await desktop()!.tapPingPeer(member.virtual_ip)
       pingResults.value = {
         ...pingResults.value,
@@ -702,9 +716,8 @@ async function logout() {
   }
 }
 function messageOf(error: unknown) {
-  if (typeof error === 'string') return error
-  if (error instanceof Error) return error.message
-  return '发生未知错误'
+  const message = typeof error === 'string' ? error : error instanceof Error ? error.message : '发生未知错误'
+  return message.replace(/\b(?:TAP(?:-Windows)?|n2n|OpenVPN)\b/gi, '网络组件')
 }
 
 function summarizeCandidates(description: string) {
@@ -784,7 +797,7 @@ onBeforeUnmount(() => {
         <div v-if="roomPreparing || launchingGame" class="preparation-backdrop" role="status" aria-live="polite">
           <section class="preparation-panel">
             <LoaderCircle :size="34" class="spinning" />
-            <h3>{{ roomPreparing ? (activeLease?.connection_mode === 'tap' ? '虚拟网卡组件准备中' : '直连组件准备中') : '游戏组件准备中' }}</h3>
+            <h3>{{ roomPreparing ? (activeLease?.connection_mode === 'tap' ? '网卡组件准备中' : '直连组件准备中') : '游戏组件准备中' }}</h3>
             <p>{{ roomPreparing ? roomPreparationMessage : '正在检查并加载游戏联机组件' }}</p>
           </section>
         </div>
@@ -808,7 +821,7 @@ onBeforeUnmount(() => {
               <div class="detail-row">
                 <span>Ping</span>
                 <div class="ping-results">
-                  <div v-if="activeLease?.connection_mode === 'tap'"><span>TAP 房间对手</span><strong :class="['ping-result', { ok: selectedMemberPing?.reachable }]">{{ selectedMemberPing?.summary || '未检测' }}</strong></div>
+                  <div v-if="activeLease?.connection_mode === 'tap'"><span>房间对手</span><strong :class="['ping-result', { ok: selectedMemberPing?.reachable }]">{{ selectedMemberPing?.summary || '未检测' }}</strong></div>
                   <template v-else>
                     <div><span>中继服务器</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayServer.reachable }]">{{ selectedMemberPing?.relayServer.summary || '未检测' }}</strong></div>
                     <div><span>中继玩家</span><strong :class="['ping-result', { ok: selectedMemberPing?.relayPeer.reachable }]">{{ selectedMemberPing?.relayPeer.summary || '未检测' }}</strong></div>

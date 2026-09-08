@@ -430,7 +430,7 @@ async function prepare(excludedGuids = new Set(), repairState = { freshCreated: 
   // persistent driver failure cannot create an unbounded number of adapters.
   if (excludedGuids.size > 0 || existingTapGuids.size > 0) {
     if (repairState.freshCreated) {
-      throw new Error('TAP 网卡已存在，但当前设备无法被 n2n 打开；请在设备管理器中修复 TAP-Windows 驱动')
+      throw new Error('网卡已存在，但当前设备无法被网络组件打开；请在设备管理器中修复网卡驱动')
     }
     repairState.freshCreated = true
     const knownGuids = new Set([...existingTapGuids, ...excludedGuids])
@@ -440,11 +440,11 @@ async function prepare(excludedGuids = new Set(), repairState = { freshCreated: 
       const prepared = await ensureTapReady(freshAdapter)
       if (prepared) return { ...current, adapterReady: true, ...prepared }
     }
-    throw new Error('检测到 TAP 网卡，但所有设备实例均不可用；请在设备管理器中修复 TAP-Windows 驱动')
+    throw new Error('检测到网卡，但所有设备实例均不可用；请在设备管理器中修复网卡驱动')
   }
 
   const installer = locateTapInstaller()
-  if (!installer) throw new Error('未找到 TAP 虚拟网卡，且绿色版缺少 TAP 驱动安装文件')
+  if (!installer) throw new Error('未找到网卡，且当前安装包缺少网卡驱动文件')
 
   await installBundledTapDriver(installer)
   adapters = await waitForTapAdapter(tapctl)
@@ -454,9 +454,9 @@ async function prepare(excludedGuids = new Set(), repairState = { freshCreated: 
     adapters = await waitForTapAdapter(tapctl)
     installedAdapter = selectWelTapAdapter(adapters, excludedGuids)
   }
-  if (!installedAdapter) throw new Error('TAP 虚拟网卡驱动安装后仍未检测到网卡，请重启 Windows 后重试')
+  if (!installedAdapter) throw new Error('网卡驱动安装后仍未检测到网卡，请重启 Windows 后重试')
   const installed = await ensureTapReady(installedAdapter)
-  if (!installed) throw new Error('检测到 TAP 网卡，但驱动设备状态异常，请在设备管理器中修复 TAP-Windows 驱动')
+  if (!installed) throw new Error('检测到网卡，但驱动设备状态异常，请在设备管理器中修复网卡驱动')
   return { ...current, adapterReady: true, ...installed }
 }
 
@@ -466,7 +466,7 @@ function installBundledTapDriver(installer) {
     child.once('error', reject)
     child.once('close', (code) => {
       if ([0, 1641, 3010].includes(Number(code))) resolve()
-      else reject(new Error(`TAP 虚拟网卡驱动安装失败（代码 ${code ?? '未知'}）`))
+      else reject(new Error(`网卡驱动安装失败（代码 ${code ?? '未知'}）`))
     })
   })
 }
@@ -522,7 +522,7 @@ function readRecentLog(filePath, limit = 2000) {
 function n2nExitReason(code) {
   const formatted = formatProcessExitCode(code)
   const hint = (Number(code) >>> 0) === 0xC0000135 ? '，缺少运行库 DLL' : ''
-  return `n2n 进程提前退出（代码 ${formatted}${hint}）`
+  return `网络组件进程提前退出（代码 ${formatted}${hint}）`
 }
 
 function transportConfigPath(filePath) {
@@ -630,7 +630,7 @@ function status() {
     tapName: TAP_NAME,
     message: ready
       ? '联机组件已准备好'
-      : '未检测到 n2n 联机组件，请重新运行完整安装包。',
+      : '未检测到网络组件，请重新运行完整安装包。',
   }
 }
 
@@ -658,10 +658,10 @@ function isValidIPv4(value) {
 function pingHost(host) {
   const target = String(host || '').trim()
   if (!isValidIPv4(target)) return Promise.reject(new Error('Ping 地址不正确'))
-  if (process.platform !== 'win32') return Promise.reject(new Error('TAP 房间 Ping 仅支持 Windows'))
+  if (process.platform !== 'win32') return Promise.reject(new Error('房间 Ping 仅支持 Windows'))
   const network = activeNetwork()
-  if (!network?.connected || !isValidIPv4(network.actualIp)) return Promise.reject(new Error('TAP 网卡尚未连接'))
-  if (!isIPv4InCIDR(target, network.subnetCidr)) return Promise.reject(new Error('对手不在当前 TAP 房间网段'))
+  if (!network?.connected || !isValidIPv4(network.actualIp)) return Promise.reject(new Error('网卡尚未连接'))
+  if (!isIPv4InCIDR(target, network.subnetCidr)) return Promise.reject(new Error('对手不在当前房间网段'))
   const ping = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\ping.exe`
   const source = network.actualIp
   const args = ['-n', '4', '-w', '1000']
@@ -773,7 +773,7 @@ function n2nCommunity(roomID, community) {
 }
 
 function buildEdgeArgs({ host, port, roomID, username, subnetCidr, virtualIP, community, transportKey, tapName, transportBindIP }) {
-  if (!virtualIP) throw new Error('n2n 房间虚拟 IP 未分配，请重新进入房间')
+  if (!virtualIP) throw new Error('房间地址未分配，请重新进入房间')
   const args = [
     '-E',
     '-x', '1',
@@ -835,7 +835,7 @@ function queryEdgeManagement(command = 'edges', port = EDGE_MANAGEMENT_PORT, tim
 
 async function transportStatus() {
   if (!connection?.process || connection.process.exitCode !== null) {
-    return { path: 'pending', peers: 0, directPeers: 0, relayPeers: 0, summary: 'TAP/n2n 未连接' }
+    return { path: 'pending', peers: 0, directPeers: 0, relayPeers: 0, summary: '网络组件未连接' }
   }
   try {
     const result = classifyN2NPeers(await queryEdgeManagement('edges', connection.managementPort || EDGE_MANAGEMENT_PORT))
@@ -917,7 +917,7 @@ async function connectAttempt({ executable, host, port, roomID, username, subnet
         if (network.connected && (!virtualIP || network.actualIp === virtualIP)) {
           const inspectedNetwork = await inspectVpnNetwork(subnetCidr)
           if (failed || child.exitCode !== null) {
-            throw new Error(failed || 'n2n 进程在获取游戏 TAP 网卡时退出')
+            throw new Error(failed || '网络组件在准备游戏网卡时退出')
           }
           if (connection?.process !== child) throw new Error('n2n 连接在准备游戏网络时已关闭')
           connection.network = inspectedNetwork
@@ -932,7 +932,7 @@ async function connectAttempt({ executable, host, port, roomID, username, subnet
     const fileOutput = readRecentLog(files.logPath)
     const reason = failed || '连接超时：未获取虚拟 IP'
     const detail = [reason, liveOutput || fileOutput].filter(Boolean).join('\n')
-    throw new Error(`n2n 连接失败：${detail || '连接超时'}\n日志文件：${files.logPath}`)
+    throw new Error(`网络连接失败：${detail || '连接超时'}\n日志文件：${files.logPath}`)
   } catch (error) {
     await stopConnection()
     throw error
@@ -941,9 +941,9 @@ async function connectAttempt({ executable, host, port, roomID, username, subnet
 
 async function connect({ host, port, roomID, username, subnetCidr, virtualIP, community, transportKey }) {
   const executable = locateEdge()
-  if (!executable) throw new Error('未检测到 n2n 联机组件 edge.exe，请重新运行完整安装包')
-  if (!username || !roomID || !subnetCidr) throw new Error('n2n 房间凭据不完整')
-  if (!virtualIP) throw new Error('n2n 房间虚拟 IP 未分配，请重新进入房间')
+  if (!executable) throw new Error('未检测到网络组件，请重新运行完整安装包')
+  if (!username || !roomID || !subnetCidr) throw new Error('房间凭据不完整')
+  if (!virtualIP) throw new Error('房间地址未分配，请重新进入房间')
 
   await stopConnection()
   await stopStaleWelN2nProcesses()

@@ -58,7 +58,7 @@ function normalizeNetwork(network) {
     : 0
   const subnetCidr = String(network?.subnetCidr || '').trim()
   if (ipv4ToNumber(tapIP) === null) {
-    throw new Error('当前房间的 TAP 网卡信息不完整，请重新进入房间')
+    throw new Error('当前房间的网卡信息不完整，请重新进入房间')
   }
   return {
     tapIP,
