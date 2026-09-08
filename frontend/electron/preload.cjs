@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   tapStatus: () => ipcRenderer.invoke('tap-status'),
   tapPrepare: () => ipcRenderer.invoke('tap-prepare'),
   tapConnect: (options) => ipcRenderer.invoke('tap-connect', options),
+  tapTransportStatus: () => ipcRenderer.invoke('tap-transport-status'),
   tapDisconnect: () => ipcRenderer.invoke('tap-disconnect'),
   tapInspect: (options) => ipcRenderer.invoke('tap-inspect', options),
 })

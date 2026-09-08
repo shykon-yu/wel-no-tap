@@ -50,6 +50,7 @@ declare global {
       tapStatus: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
       tapPrepare: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
       tapConnect: (options: { host: string; port: number; roomID: number; username: string; subnetCidr: string; virtualIP: string; community: string }) => Promise<DesktopLeaseStatus>
+      tapTransportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct' | 'mixed'; peers: number; directPeers: number; relayPeers: number; summary: string }>
       tapDisconnect: () => Promise<{ stopped?: boolean } | void>
       tapInspect: (options: { subnetCidr: string }) => Promise<DesktopLeaseStatus | null>
     }

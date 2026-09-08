@@ -1,4 +1,5 @@
 const fs = require('node:fs')
+const dgram = require('node:dgram')
 const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
@@ -10,6 +11,8 @@ const DEFAULT_PORT = 22222
 const TAP_NAME = 'TAP-Windows Adapter V9'
 const WEL_TAP_NAME = /^(?:WEL Virtual LAN|WEL TAP|TAP-Windows Adapter V9|OpenVPN TAP-Windows6|以太网|本地连接)(?: \d+| #\d+)?$/i
 const N2N_PROGRESS = /(?:supernode|register|edge|tuntap|wintap|tap|peer|packet|created local tap|successfully joined)/i
+const EDGE_MANAGEMENT_PORT = 5645
+const EDGE_MANAGEMENT_TIMEOUT_MS = 700
 const CONNECT_TIMEOUT_MS = 45000
 const CONNECT_MAX_ATTEMPTS = 4
 const APP_DATA_DIRECTORY = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform')
@@ -676,13 +679,76 @@ function buildEdgeArgs({ host, port, roomID, username, subnetCidr, virtualIP, co
     '-c', n2nCommunity(roomID, community),
     '-l', `${host}:${port}`,
     '-a', `${virtualIP}/${prefixFromCidr(subnetCidr)}`,
-    '-t', '5645',
+    '-t', String(EDGE_MANAGEMENT_PORT),
   ]
   if (transportBindIP) args.push('-p', transportBindIP, '-e', transportBindIP)
   if (tapName) args.unshift('-d', tapName)
   if (transportKey) args.push('-k', transportKey)
   if (username) args.push('-I', username)
   return args
+}
+
+function classifyN2NPeers(rows) {
+  const peers = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : []
+  const directPeers = peers.filter((peer) => String(peer.mode || '').toLowerCase() === 'p2p')
+  const relayPeers = peers.filter((peer) => String(peer.mode || '').toLowerCase() === 'psp')
+  if (directPeers.length > 0 && relayPeers.length > 0) return { path: 'mixed', peers: peers.length, directPeers: directPeers.length, relayPeers: relayPeers.length }
+  if (directPeers.length > 0) return { path: 'direct', peers: peers.length, directPeers: directPeers.length, relayPeers: relayPeers.length }
+  if (relayPeers.length > 0) return { path: 'relay', peers: peers.length, directPeers: 0, relayPeers: relayPeers.length }
+  return { path: 'pending', peers: peers.length, directPeers: 0, relayPeers: 0 }
+}
+
+function queryEdgeManagement(command = 'edges', port = EDGE_MANAGEMENT_PORT, timeoutMs = EDGE_MANAGEMENT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket('udp4')
+    const rows = []
+    let settled = false
+    let timer
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      try { socket.close() } catch {}
+      if (error) reject(error)
+      else resolve(value)
+    }
+    socket.on('error', (error) => finish(error))
+    socket.on('message', (message) => {
+      for (const line of String(message || '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+        let event
+        try { event = JSON.parse(line) } catch { continue }
+        if (event._type === 'error') return finish(new Error(String(event.error || 'n2n 管理接口返回错误')))
+        if (event._type === 'row') rows.push(event)
+        if (event._type === 'end') return finish(null, rows)
+      }
+    })
+    timer = setTimeout(() => finish(new Error('n2n 管理接口响应超时')), timeoutMs)
+    socket.bind(0, '127.0.0.1', () => {
+      const payload = Buffer.from(`r 0 ${String(command || 'edges').trim()}\n`, 'utf8')
+      socket.send(payload, 0, payload.length, Number(port) || EDGE_MANAGEMENT_PORT, '127.0.0.1', (error) => {
+        if (error) finish(error)
+      })
+    })
+  })
+}
+
+async function transportStatus() {
+  if (!connection?.process || connection.process.exitCode !== null) {
+    return { path: 'pending', peers: 0, directPeers: 0, relayPeers: 0, summary: 'TAP/n2n 未连接' }
+  }
+  try {
+    const result = classifyN2NPeers(await queryEdgeManagement('edges', connection.managementPort || EDGE_MANAGEMENT_PORT))
+    const summary = result.path === 'direct'
+      ? '直连'
+      : result.path === 'relay'
+        ? '中继'
+        : result.path === 'mixed'
+          ? '混合'
+          : '连接中'
+    return { ...result, summary }
+  } catch {
+    return { path: 'pending', peers: 0, directPeers: 0, relayPeers: 0, summary: '连接中' }
+  }
 }
 
 async function connectAttempt({ executable, host, port, roomID, username, subnetCidr, virtualIP, community, transportKey, tapName, transportBindIP }) {
@@ -731,6 +797,7 @@ async function connectAttempt({ executable, host, port, roomID, username, subnet
   })
   connection = {
     process: child,
+    managementPort: EDGE_MANAGEMENT_PORT,
     temporaryFiles: [files.configPath],
     logPath: files.logPath,
     network: null,
@@ -825,6 +892,9 @@ module.exports = {
   isRetryableConnectError,
   n2nCommunity,
   n2nExitReason,
+  classifyN2NPeers,
+  queryEdgeManagement,
+  transportStatus,
   transportConfigPath,
   parseTapGuid,
   parseTapctlList,

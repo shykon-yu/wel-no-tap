@@ -139,11 +139,16 @@ function stopTransportStatusMonitor() {
 
 function startTransportStatusMonitor() {
   stopTransportStatusMonitor()
-  if (!desktop()?.transportStatus) return
+  const desktopApi = desktop()
+  if (!desktopApi) return
+  const tapRoom = activeLease.value?.connection_mode === 'tap'
+  const readStatus = tapRoom ? desktopApi.tapTransportStatus : desktopApi.transportStatus
+  if (!readStatus) return
+  const roomID = activeLease.value?.room_id
   const refresh = async () => {
     try {
-      const status = await desktop()!.transportStatus()
-      gameTransportSummary.value = status.summary
+      const status = await readStatus()
+      if (activeLease.value?.room_id === roomID) gameTransportSummary.value = status.summary
     } catch { /* status is best effort */ }
   }
   void refresh()
@@ -333,6 +338,8 @@ async function joinRoom(room: Room) {
       await desktopApi.tapPrepare()
       const network = await desktopApi.tapConnect({ host: lease.server_host || lease.relay_host, port: lease.server_port || lease.relay_port, roomID: lease.room_id, username: lease.username, subnetCidr: lease.subnet_cidr, virtualIP: lease.virtual_ip, community: lease.community })
       networkStatus.value = { ...network, connected: true, ready: true, actualIp: network.actualIp || lease.virtual_ip }
+      gameTransportSummary.value = '连接中'
+      startTransportStatusMonitor()
     } else if (directRoom) {
       roomPreparing.value = true
       roomPreparationMessage.value = '直连组件准备中，请稍候'
@@ -465,10 +472,8 @@ async function launchGameNow() {
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
     notice.value = result.detail.includes('injection=apc') ? '已启动 WE8（APC 兼容模式）' : '已启动 WE8'
-    gameTransportSummary.value = activeLease.value.connection_mode === 'tap'
-      ? '游戏已启动，使用 TAP/n2n 网卡'
-      : '游戏已启动，等待网络数据'
-    if (activeLease.value.connection_mode !== 'tap') startTransportStatusMonitor()
+    gameTransportSummary.value = '连接中'
+    startTransportStatusMonitor()
   } catch (error) {
     notice.value = ''
     errorMessage.value = `游戏组件加载失败：${messageOf(error)}`
@@ -756,7 +761,7 @@ onBeforeUnmount(() => {
 
       <div class="room-workspace">
         <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">网卡房间会加载虚拟网卡组件，进入房间和启动游戏可能比其他房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '虚拟网卡' : room.connection_mode === 'direct' ? 'P2P 优先' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '直连/中继' : room.connection_mode === 'direct' ? 'P2P直连/云中继' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>

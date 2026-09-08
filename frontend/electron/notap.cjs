@@ -199,10 +199,10 @@ function transportStatus() {
   updateTransportPathFromLog()
   const pathName = transportPath
   const summary = pathName === 'direct'
-    ? '当前联机：P2P 直连'
+    ? 'P2P直连'
     : pathName === 'relay'
-      ? '当前联机：云中继'
-      : '游戏已启动，正在选择本场连接'
+      ? '云中继'
+      : '连接中'
   return { path: pathName, directState: iceState, summary }
 }
 
