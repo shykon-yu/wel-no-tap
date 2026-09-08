@@ -1,7 +1,7 @@
 {
   "name": "wel-no-tap-client",
   "private": true,
-  "version": "0.0.47",
+  "version": "0.0.48",
   "packageManager": "pnpm@11.11.0",
   "type": "module",
   "main": "electron/main.cjs",
@@ -50,6 +50,30 @@
         "to": "welhelper/welnptice.exe"
       },
       {
+        "from": "../build/x86/edge.exe",
+        "to": "welhelper/edge.exe"
+      },
+      {
+        "from": "../build/x86/welhook.dll",
+        "to": "welhelper/game-runtime/welhook.dll"
+      },
+      {
+        "from": "../build/x86/welgame.exe",
+        "to": "welhelper/game-runtime/welgame.exe"
+      },
+      {
+        "from": "../build/x86/welfirewall.exe",
+        "to": "welhelper/welfirewall.exe"
+      },
+      {
+        "from": "resources/tap/tapctl.exe",
+        "to": "welhelper/tapctl.exe"
+      },
+      {
+        "from": "resources/tap/weltap.exe",
+        "to": "welhelper/weltap.exe"
+      },
+      {
         "from": "build/icon.ico",
         "to": "welhelper/wel.ico"
       },
@@ -76,7 +100,7 @@
       "perMachine": true,
       "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "WEL对战平台 v0.0.47",
+      "shortcutName": "WEL对战平台 v0.0.48",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     }

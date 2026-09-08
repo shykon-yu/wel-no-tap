@@ -30,4 +30,9 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   },
   pingRelay: () => ipcRenderer.invoke('notap-ping-relay'),
   pingRelayPeer: (remoteIp) => ipcRenderer.invoke('notap-ping-relay-peer', remoteIp),
+  tapStatus: () => ipcRenderer.invoke('tap-status'),
+  tapPrepare: () => ipcRenderer.invoke('tap-prepare'),
+  tapConnect: (options) => ipcRenderer.invoke('tap-connect', options),
+  tapDisconnect: () => ipcRenderer.invoke('tap-disconnect'),
+  tapInspect: (options) => ipcRenderer.invoke('tap-inspect', options),
 })

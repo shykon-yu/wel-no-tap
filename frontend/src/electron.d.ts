@@ -33,7 +33,7 @@ declare global {
       ensureFirewall: (options: { gamePath?: string }) => Promise<{ state: string; warning?: string; missing?: Array<{ name: string }>; blockers?: Array<{ name: string }> }>
       transportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct'; directState: string; summary: string }>
       chooseGame: () => Promise<string | null>
-      launchGame: (options: { gamePath: string; relay: string; room: string; logicalIp: string; token: string; direct: boolean }) => Promise<{ started: boolean; detail: string; warnings?: string[] }>
+      launchGame: (options: { gamePath: string; relay: string; room: string; logicalIp: string; token: string; direct: boolean; mode?: 'tap' | 'direct' | 'relay' }) => Promise<{ started: boolean; detail: string; warnings?: string[] }>
       disconnect: () => Promise<{ stopped: boolean }>
       onBeforeQuit: (callback: () => void) => () => void
       completeQuit: () => Promise<void>
@@ -47,6 +47,11 @@ declare global {
       onGamePeer: (callback: (event: { logicalIp: string; transactionKey: string }) => void) => () => void
       pingRelay: () => Promise<number>
       pingRelayPeer: (remoteIp: string) => Promise<number>
+      tapStatus: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
+      tapPrepare: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
+      tapConnect: (options: { host: string; port: number; roomID: number; username: string; subnetCidr: string; virtualIP: string; community: string }) => Promise<DesktopLeaseStatus>
+      tapDisconnect: () => Promise<{ stopped?: boolean } | void>
+      tapInspect: (options: { subnetCidr: string }) => Promise<DesktopLeaseStatus | null>
     }
   }
 }

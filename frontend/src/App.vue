@@ -29,11 +29,12 @@ const LEGACY_GAME_PATH_KEY = 'pes8.game-path'
 const gamePath = ref(localStorage.getItem(GAME_PATH_KEY) ?? localStorage.getItem(LEGACY_GAME_PATH_KEY) ?? '')
 const totalOnline = computed(() => rooms.value.reduce((total, room) => total + room.members, 0))
 const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => room.id === activeLease.value?.room_id) ?? null : null)
-const displayRoomName = (room: Room) => `${room.connection_mode === 'direct' ? '直连' : '中继'} ${String(room.id).padStart(2, '0')}`
+const displayRoomName = (room: Room) => `${room.connection_mode === 'tap' ? '网卡' : room.connection_mode === 'direct' ? '直连' : '中继'} ${String(room.id).padStart(2, '0')}`
 const activeRoomName = computed(() => activeRoom.value ? displayRoomName(activeRoom.value) : (activeLease.value ? `房间 ${String(activeLease.value.room_id).padStart(2, '0')}` : '未进入房间'))
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
+  if (activeLease.value.connection_mode === 'tap') return `${activeRoomName.value} · TAP/n2n 房间已连接`
   if (activeLease.value.connection_mode === 'relay') return `${activeRoomName.value} · 仅使用云中继`
   if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 直连组件准备中，中继已连接`
   if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
@@ -179,7 +180,7 @@ async function forceSignedOut(message: string) {
   stopRoomMembersMonitor()
   const lease = activeLease.value
   if (lease) {
-    try { await desktop()?.disconnect() } catch { /* the server has already revoked this session */ }
+    try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* the server has already revoked this session */ }
   }
   clearRoomSessionState()
   user.value = null
@@ -206,7 +207,7 @@ async function renewLease(epoch: number) {
       if (epoch !== leaseEpoch) return
       stopLeaseHeartbeat()
       stopRoomMembersMonitor()
-      try { await desktop()?.disconnect() } catch { /* local connection may already be gone */ }
+      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* local connection may already be gone */ }
       activeLease.value = null
       networkStatus.value = null
       await loadRooms()
@@ -255,7 +256,7 @@ async function restoreSession() {
   await loadRooms()
   startSessionMonitor()
   if (previousLease) {
-    try { await desktop()?.disconnect() } catch { /* best effort cleanup */ }
+    try { if (previousLease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* best effort cleanup */ }
     try { await roomApi.leave(previousLease.room_id) } catch { /* stale room state will expire server-side */ }
     notice.value = '已清理上次房间状态，请重新进入房间'
     await loadRooms()
@@ -314,16 +315,25 @@ async function joinRoom(room: Room) {
     activeLease.value = lease
     const preparationEpoch = ++roomPreparationEpoch
     const directRoom = lease.connection_mode === 'direct'
+    const tapRoom = lease.connection_mode === 'tap'
     directCandidateStatus.value = directRoom ? 'gathering' : 'relay-only'
-    directCandidateMessage.value = directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
+    directCandidateMessage.value = tapRoom ? 'TAP/n2n 网卡准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
     networkStatus.value = {
       ready: true,
       connected: true,
-      message: directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
+      message: tapRoom ? 'TAP/n2n 网卡准备中' : directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
       actualIp: lease.logical_ip || lease.virtual_ip,
     }
     roomPreparationTask = directRoom ? prepareRoomTools(lease, preparationEpoch) : Promise.resolve<'relay-only'>('relay-only')
-    if (directRoom) {
+    if (tapRoom) {
+      roomPreparing.value = true
+      roomPreparationMessage.value = '正在检查 TAP 驱动并连接网卡'
+      const desktopApi = desktop()
+      if (!desktopApi?.tapPrepare || !desktopApi.tapConnect) throw new Error('TAP 网卡组件不可用：当前不是完整 Windows 客户端')
+      await desktopApi.tapPrepare()
+      const network = await desktopApi.tapConnect({ host: lease.server_host || lease.relay_host, port: lease.server_port || lease.relay_port, roomID: lease.room_id, username: lease.username, subnetCidr: lease.subnet_cidr, virtualIP: lease.virtual_ip, community: lease.community })
+      networkStatus.value = { ...network, connected: true, ready: true, actualIp: network.actualIp || lease.virtual_ip }
+    } else if (directRoom) {
       roomPreparing.value = true
       roomPreparationMessage.value = '直连组件准备中，请稍候'
       const result = await roomPreparationTask
@@ -333,7 +343,7 @@ async function joinRoom(room: Room) {
     startRoomMembersMonitor()
     roomPreparing.value = false
     roomPreparationMessage.value = ''
-    notice.value = directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
+    notice.value = tapRoom ? '已进入网卡房间，TAP/n2n 已连接' : directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       await forceSignedOut(error.message)
@@ -342,7 +352,7 @@ async function joinRoom(room: Room) {
     stopLeaseHeartbeat()
     stopRoomMembersMonitor()
     if (lease) {
-      try { await desktop()?.disconnect() } catch { /* connection setup may be incomplete */ }
+      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* connection setup may be incomplete */ }
     }
     if (lease) try { await roomApi.leave(room.id) } catch { /* the lease reaper will clean it up */ }
     activeLease.value = null
@@ -361,7 +371,7 @@ async function releaseActiveLease() {
   stopLeaseHeartbeat()
   stopRoomMembersMonitor()
   let cleanupError: unknown
-  try { await desktop()?.disconnect() } catch (error) { cleanupError = error }
+  try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch (error) { cleanupError = error }
   try {
     await roomApi.leave(lease.room_id)
   } catch (error) {
@@ -450,6 +460,7 @@ async function launchGameNow() {
       logicalIp: activeLease.value.logical_ip || activeLease.value.virtual_ip,
       token: activeLease.value.relay_token,
       direct: activeLease.value.connection_mode === 'direct',
+      mode: activeLease.value.connection_mode,
     })
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
@@ -742,8 +753,8 @@ onBeforeUnmount(() => {
       </section>
 
       <div class="room-workspace">
-        <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">直连房间需要准备直连组件，进入房间和启动游戏可能比中继房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'direct' ? 'P2P 优先' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+        <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">网卡房间会加载虚拟网卡组件，进入房间和启动游戏可能比其他房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '虚拟网卡' : room.connection_mode === 'direct' ? 'P2P 优先' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>

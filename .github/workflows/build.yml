@@ -23,6 +23,24 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
+      - name: Build TAP/n2n runtime sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path build/x86, frontend/resources/tap, frontend/resources/welhelper/game-runtime | Out-Null
+          if (-not (Test-Path third_party/n2n/n2n-3.0.zip)) { throw 'Missing third_party/n2n/n2n-3.0.zip' }
+          Remove-Item .n2n-build -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive third_party/n2n/n2n-3.0.zip .n2n-build
+          Move-Item .n2n-build/n2n-3.0 .n2n-build/source
+          cmake -S .n2n-build/source -B .n2n-build/build -DN2N_OPTION_USE_PTHREAD=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded '-DCMAKE_C_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG' '-DCMAKE_POLICY_VERSION_MINIMUM=3.5'
+          cmake --build .n2n-build/build --config Release --target edge --parallel 2
+          Copy-Item .n2n-build/build/Release/edge.exe build/x86/edge.exe -Force
+          Copy-Item .n2n-build/build/Release/edge.exe frontend/resources/welhelper/edge.exe -Force
+          if (-not (Test-Path frontend/resources/tap/tapctl.exe)) { throw 'Missing frontend/resources/tap/tapctl.exe' }
+          if (-not (Test-Path frontend/resources/tap/weltap.exe)) { throw 'Missing frontend/resources/tap/weltap.exe' }
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
       - name: Build observation and no-TAP connection tools
         shell: pwsh
         run: |
@@ -81,6 +99,12 @@ jobs:
             '/D_WIN32_WINNT=0x0601', 'native/welnpt_connect_gui.c', "/Fe:$output/WEL无网卡联机.exe",
             '/link', 'User32.lib', 'Gdi32.lib', 'Comdlg32.lib', 'Shell32.lib', 'Winhttp.lib', '/SUBSYSTEM:WINDOWS'
           )
+          Invoke-Compiler 'TAP game hook' @('/nologo','/W4','/O2','/MT','/D_CRT_SECURE_NO_WARNINGS','/D_WIN32_WINNT=0x0601','/LD','native/wel-game/wel_game_hook.c','/Fe:build/x86/welhook.dll','/link','Ws2_32.lib','Psapi.lib')
+          Invoke-Compiler 'TAP game launcher' @('/nologo','/W4','/O2','/MT','/D_CRT_SECURE_NO_WARNINGS','/D_WIN32_WINNT=0x0601','native/wel-game/wel_game_launcher.c','/Febuild/x86/welgame.exe')
+          Invoke-Compiler 'TAP firewall helper' @('/nologo','/W4','/O2','/MT','/D_CRT_SECURE_NO_WARNINGS','/D_WIN32_WINNT=0x0601','native/wel-firewall/wel_firewall.c','/Febuild/x86/welfirewall.exe','/link','Shell32.lib','/SUBSYSTEM:WINDOWS')
+          Copy-Item build/x86/welhook.dll frontend/resources/welhelper/game-runtime/welhook.dll -Force
+          Copy-Item build/x86/welgame.exe frontend/resources/welhelper/game-runtime/welgame.exe -Force
+          Copy-Item build/x86/welfirewall.exe frontend/resources/welhelper/welfirewall.exe -Force
           Invoke-Compiler 'libjuice ICE helper' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             '/Ithird_party/libjuice/include', 'native/welnpt_ice.c', "/Fe:$output/welnptice.exe",

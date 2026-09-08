@@ -5,6 +5,8 @@ const { pathToFileURL } = require('node:url')
 const { version: appVersion } = require('../package.json')
 const { publicConfig } = require('./config.cjs')
 const notap = require('./notap.cjs')
+const tap = require('./tap.cjs')
+const tapGame = require('./tap-game-launch.cjs')
 const firewall = require('./firewall.cjs')
 
 if (process.platform === 'win32') app.commandLine.appendSwitch('no-sandbox')
@@ -138,6 +140,13 @@ async function ensureWindowsFirewall(event, options = {}) {
 }
 
 async function launchGameWithRecovery(event, options) {
+  if (options?.mode === 'tap') {
+    try {
+      return await tapGame.launchGameBound(options.gamePath, tap.activeNetwork())
+    } catch (error) {
+      throw error
+    }
+  }
   try {
     return await notap.launch(options)
   } catch (error) {
@@ -195,6 +204,11 @@ ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-ping-relay-peer', (_event, remoteIp) => notap.pingRelayPeer(remoteIp))
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', launchGameWithRecovery)
+ipcMain.handle('tap-status', () => tap.status())
+ipcMain.handle('tap-prepare', () => tap.prepare())
+ipcMain.handle('tap-connect', (_event, options) => tap.connect(options))
+ipcMain.handle('tap-disconnect', () => tap.stopConnection())
+ipcMain.handle('tap-inspect', () => tap.activeNetwork())
 ipcMain.handle('platform-complete-quit', finishQuit)
 
 notap.onGamePeer((logicalIp) => {
