@@ -465,8 +465,10 @@ async function launchGameNow() {
     const warnings = [...(result.warnings || [])]
     warningMessage.value = [...new Set(warnings)].join('\n')
     notice.value = result.detail.includes('injection=apc') ? '已启动 WE8（APC 兼容模式）' : '已启动 WE8'
-    gameTransportSummary.value = '游戏已启动，等待网络数据'
-    startTransportStatusMonitor()
+    gameTransportSummary.value = activeLease.value.connection_mode === 'tap'
+      ? '游戏已启动，使用 TAP/n2n 网卡'
+      : '游戏已启动，等待网络数据'
+    if (activeLease.value.connection_mode !== 'tap') startTransportStatusMonitor()
   } catch (error) {
     notice.value = ''
     errorMessage.value = `游戏组件加载失败：${messageOf(error)}`
