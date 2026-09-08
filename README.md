@@ -27,8 +27,8 @@ The data path is:
 
 ```text
 WE8.exe
-  -> welnpt.dll virtual UDP sockets
-  -> one physical UDP transport socket
+  -> welnpt.dll lightweight loopback Socket shim
+  -> welnpthost.exe (WNP2 framing, HMAC, session/path state)
   -> libjuice ICE direct UDP after connectivity checks, or authenticated
      Linux/Windows room relay on UDP 22333
   -> peer welnpt.dll
@@ -36,9 +36,12 @@ WE8.exe
 ```
 
 The Hook virtualizes `socket`, `bind`, `getsockname`, `sendto`, `recvfrom`,
-`WSASendTo`, `WSARecvFrom`, and `closesocket`. Each game Socket keeps its own
-logical source port and receive queue. Empty nonblocking reads return
-`WSAEWOULDBLOCK (10035)`, matching the successful real-LAN trace.
+`WSASendTo`, `WSARecvFrom`, and `closesocket`. In Host mode each game Socket
+gets one nonblocking loopback Socket. The Hook only builds a small local frame
+and reads the corresponding loopback datagram; WNP2/HMAC, broadcast fan-out,
+ICE path selection, and session state stay in `welnpthost.exe`. If the Host is
+not supplied, the original in-process transport remains available as a
+compatibility fallback. Empty nonblocking reads return `WSAEWOULDBLOCK (10035)`.
 
 Protocol v2 authenticates every registration and game packet with a truncated
 HMAC-SHA256 tag. The test token is never written to the JSONL game log.
@@ -57,6 +60,7 @@ Outputs are written to `build\x86`:
 ```text
 WEL无网卡联机.exe
 welnpt.dll
+welnpthost.exe
 welnptrelay.exe
 WEL无网卡观测工具.exe
 welnpttrace.dll

@@ -150,6 +150,15 @@ static void on_gathering_done(juice_agent_t *agent, void *user_ptr) {
 
 static void on_receive(juice_agent_t *agent, const char *data, size_t size, void *user_ptr) {
 	(void)user_ptr;
+	/* Game frames already contain the authenticated WNP2 envelope. Preserve
+	 * that envelope across the ICE process so the external Host can verify it,
+	 * apply the locked direct/relay path, and restore the original datagram. */
+	if (size >= sizeof(welnpt_packet_header) &&
+		memcmp(data, "WNP2", 4) == 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, data, (int)size, 0,
+			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
+		return;
+	}
 	if (size > strlen(WEL_ICE_PING_PREFIX) && memcmp(data, WEL_ICE_PING_PREFIX, strlen(WEL_ICE_PING_PREFIX)) == 0) {
 		char response[128];
 		int length = _snprintf_s(response, sizeof(response), _TRUNCATE, "%s%.*s", WEL_ICE_PONG_PREFIX,

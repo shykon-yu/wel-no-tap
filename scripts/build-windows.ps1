@@ -31,6 +31,13 @@ if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll 编译失败。' }
 if ($LASTEXITCODE -ne 0) { throw 'welnpt.dll 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
+  (Join-Path $source 'welnpt_host.c') /Fe:(Join-Path $output 'welnpthost.exe') `
+  /link Ws2_32.lib Bcrypt.lib
+if ($LASTEXITCODE -ne 0) { throw 'welnpthost.exe 编译失败。' }
+& (Join-Path $output 'welnpthost.exe') --self-test
+if ($LASTEXITCODE -ne 0) { throw 'welnpthost.exe 自测失败。' }
+
+& cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
   (Join-Path $source 'welnpt_relay.c') /Fe:(Join-Path $output 'welnptrelay.exe') `
   /link Ws2_32.lib Bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw 'welnptrelay.exe 编译失败。' }

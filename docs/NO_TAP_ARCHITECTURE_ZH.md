@@ -167,13 +167,20 @@ Hook 日志的 `session-signal` 会记录方向、协议序号、端口、长度
 
 ```text
 WE8.exe
-  -> welnpt.dll 虚拟 UDP Socket 层
+  -> welnpt.dll 轻量本地回环 Socket 层
+  -> welnpthost.exe 外部 Host 数据面
   -> 每个玩家一个真实物理 UDP transport Socket
   -> 22333/UDP 鉴权云中继
   -> 对端 transport Socket
   -> 对端每个逻辑 Socket 的 FIFO 接收队列
   -> 合成 recvfrom 返回值交给对端 WE8.exe
 ```
+
+当前轻量 Hook 模式中，游戏进程内只保留 Socket 生命周期、逻辑端口映射和本地
+回环数据报转发。WNP2 组包、HMAC、广播扇出、ICE 直连/中继选择、决策窗口和会话
+状态全部在 `welnpthost.exe` 中完成。Host 通过每个游戏 Socket 对应的本地回环端口
+投递完整数据报，避免游戏线程经过共享队列、每包认证和路径判断。启动器没有提供
+Host 时仍保留旧 Hook 数据面作为兼容回退。
 
 该架构不使用：
 

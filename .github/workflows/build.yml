@@ -77,6 +77,12 @@ jobs:
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib', 'Bcrypt.lib'
           )
+          Invoke-Compiler 'external Host transport' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            'native/welnpt_host.c', "/Fe:$output/welnpthost.exe", '/link', 'Ws2_32.lib', 'Bcrypt.lib'
+          )
+          & "$output/welnpthost.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'external Host self-test failed' }
           Invoke-Compiler 'UDP relay' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib', 'Bcrypt.lib'

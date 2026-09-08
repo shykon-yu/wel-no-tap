@@ -56,7 +56,10 @@ typedef struct virtual_datagram {
 typedef struct virtual_socket {
     int active;
     SOCKET handle;
+    SOCKET light_transport;
     unsigned short logical_port;
+    unsigned short light_local_port;
+    unsigned short light_map_port;
     virtual_datagram *head;
     virtual_datagram *tail;
     unsigned queued;
@@ -76,6 +79,10 @@ static unsigned char g_port_index[65536];
 static virtual_datagram g_datagram_pool[WELNPT_DATAGRAM_POOL_SIZE];
 static virtual_datagram *g_datagram_free;
 static SOCKET g_transport = INVALID_SOCKET;
+static SOCKET g_host_transport = INVALID_SOCKET;
+static struct sockaddr_in g_host_address;
+static unsigned short g_host_port;
+static int g_light_mode;
 static struct sockaddr_in g_relay_address;
 static SOCKET g_direct_transport = INVALID_SOCKET;
 static struct sockaddr_in g_direct_agent_address;
@@ -116,10 +123,25 @@ static wel_closesocket_fn g_real_closesocket;
 
 static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     unsigned short observed_source_port, unsigned short observed_target_port);
+static void notify_light_socket_close(unsigned short logical_port);
 static void log_line_impl(const char *format, ...);
 #define log_line(...) do { \
     if (g_diagnostic_log_enabled) log_line_impl(__VA_ARGS__); \
 } while (0)
+
+static int parse_environment_port(const char *name, unsigned short *port) {
+    char value[16];
+    char *end = NULL;
+    unsigned long parsed;
+    DWORD length;
+    if (name == NULL || port == NULL) return 0;
+    length = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (length == 0 || length >= sizeof(value)) return 0;
+    parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0 || parsed > 65535) return 0;
+    *port = (unsigned short)parsed;
+    return 1;
+}
 
 static int timed_auth_sign(char *packet, int length) {
     LARGE_INTEGER started;
@@ -380,6 +402,29 @@ static virtual_socket *register_socket(SOCKET handle, int family, int type) {
             ZeroMemory(state, sizeof(*state));
             state->active = 1;
             state->handle = handle;
+            if (g_light_mode && type == SOCK_DGRAM && family == AF_INET) {
+                struct sockaddr_in local;
+                state->light_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                if (state->light_transport != INVALID_SOCKET) {
+                    ZeroMemory(&local, sizeof(local));
+                    local.sin_family = AF_INET;
+                    local.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+                    local.sin_port = 0;
+                    if (g_real_bind(state->light_transport, (const struct sockaddr *)&local, sizeof(local)) == SOCKET_ERROR) {
+                        g_real_closesocket(state->light_transport);
+                        state->light_transport = INVALID_SOCKET;
+                    } else {
+                        struct sockaddr_in bound;
+                        int bound_length = sizeof(bound);
+                        u_long nonblocking = 1;
+                        if (g_real_getsockname(state->light_transport,
+                            (struct sockaddr *)&bound, &bound_length) == 0) {
+                            state->light_local_port = ntohs(bound.sin_port);
+                        }
+                        ioctlsocket(state->light_transport, FIONBIO, &nonblocking);
+                    }
+                }
+            }
             break;
         }
     }
@@ -392,6 +437,8 @@ static virtual_socket *register_socket(SOCKET handle, int family, int type) {
 static int virtual_socket_port(SOCKET handle, unsigned short *port) {
     virtual_socket *state;
     int found = 0;
+    unsigned short local_port = 0;
+    int announce = 0;
     EnterCriticalSection(&g_state_lock);
     state = find_socket_locked(handle);
     if (state != NULL) {
@@ -401,8 +448,23 @@ static int virtual_socket_port(SOCKET handle, unsigned short *port) {
         }
         *port = state->logical_port;
         found = state->logical_port != 0;
+        if (found && g_light_mode && state->light_transport != INVALID_SOCKET) {
+            local_port = state->light_local_port;
+            if (local_port != 0 && state->light_map_port != state->logical_port) {
+                state->light_map_port = state->logical_port;
+                announce = 1;
+            }
+        }
     }
     LeaveCriticalSection(&g_state_lock);
+    if (announce && found && g_light_mode && local_port != 0 && g_host_transport != INVALID_SOCKET) {
+        welnpt_host_frame map;
+        welnpt_initialize_host_frame(&map, WELNPT_HOST_FRAME_MAP);
+        map.source_port = htons(*port);
+        map.target_port = htons(local_port);
+        g_real_sendto(g_host_transport, (const char *)&map, sizeof(map), 0,
+            (const struct sockaddr *)&g_host_address, sizeof(g_host_address));
+    }
     return found;
 }
 
@@ -476,11 +538,16 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     state = find_socket_locked(handle);
     if (state != NULL) {
         if (logical_port != NULL) *logical_port = state->logical_port;
+        if (g_light_mode && state->logical_port != 0) notify_light_socket_close(state->logical_port);
         if (state->logical_port != 0 &&
             g_port_index[state->logical_port] == (unsigned char)((state - g_sockets) + 1)) {
             g_port_index[state->logical_port] = 0;
         }
         free_queue(state);
+        if (state->light_transport != INVALID_SOCKET) {
+            g_real_closesocket(state->light_transport);
+            state->light_transport = INVALID_SOCKET;
+        }
         ZeroMemory(state, sizeof(*state));
         found = 1;
     }
@@ -597,6 +664,111 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	return 1;
 }
 
+/*
+ * Light mode keeps the game process on a small loopback protocol. The Host
+ * process owns WNP2 framing, authentication, relay traffic and ICE traffic;
+ * this receive worker only restores a datagram to the game's virtual socket.
+ */
+static DWORD WINAPI light_receive_thread(LPVOID unused) {
+    char packet[sizeof(welnpt_host_frame) + WELNPT_MAX_PAYLOAD];
+    (void)unused;
+    while (InterlockedCompareExchange(&g_stopping, 0, 0) == 0) {
+        struct sockaddr_in source;
+        int source_length = sizeof(source);
+        int received = g_real_recvfrom(g_host_transport, packet, sizeof(packet), 0,
+            (struct sockaddr *)&source, &source_length);
+        welnpt_host_frame *frame;
+        int payload_length;
+        if (received > (int)strlen(WELNPT_TRANSPORT_STATE_PREFIX) &&
+            memcmp(packet, WELNPT_TRANSPORT_STATE_PREFIX, strlen(WELNPT_TRANSPORT_STATE_PREFIX)) == 0) {
+            log_line("\"api\":\"transport-state\",\"state\":\"%.*s\"",
+                received - (int)strlen(WELNPT_TRANSPORT_STATE_PREFIX),
+                packet + strlen(WELNPT_TRANSPORT_STATE_PREFIX));
+            continue;
+        }
+        if (received > (int)strlen(WELNPT_ICE_STATE_PREFIX) &&
+            memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
+            log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"",
+                received - (int)strlen(WELNPT_ICE_STATE_PREFIX),
+                packet + strlen(WELNPT_ICE_STATE_PREFIX));
+            continue;
+        }
+        if (received < (int)sizeof(welnpt_host_frame)) continue;
+        frame = (welnpt_host_frame *)packet;
+        if (!welnpt_valid_host_frame(frame) || frame->type != WELNPT_HOST_FRAME_DATA) continue;
+        payload_length = (int)ntohs(frame->payload_length);
+        if (payload_length < 0 || payload_length > WELNPT_MAX_PAYLOAD ||
+            received != (int)sizeof(*frame) + payload_length) continue;
+        {
+            virtual_socket *target_state;
+            SOCKET target_socket = INVALID_SOCKET;
+            unsigned short target_local_port = 0;
+            unsigned short target_port = ntohs(frame->target_port);
+            EnterCriticalSection(&g_state_lock);
+            target_state = find_socket_by_port_locked(target_port);
+            if (target_state != NULL) {
+                target_socket = target_state->light_transport;
+                target_local_port = target_state->light_local_port;
+            }
+            LeaveCriticalSection(&g_state_lock);
+            if (target_socket != INVALID_SOCKET && target_local_port != 0) {
+                struct sockaddr_in target_address;
+                ZeroMemory(&target_address, sizeof(target_address));
+                target_address.sin_family = AF_INET;
+                target_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+                target_address.sin_port = htons(target_local_port);
+                g_real_sendto(target_socket, packet, received, 0,
+                    (const struct sockaddr *)&target_address, sizeof(target_address));
+            }
+        }
+    }
+    return 0;
+}
+
+static int send_light_datagram(SOCKET handle, const char *payload, int length,
+    const struct sockaddr *destination, int destination_length) {
+    char packet[sizeof(welnpt_host_frame) + WELNPT_MAX_PAYLOAD];
+    welnpt_host_frame *frame = (welnpt_host_frame *)packet;
+    const struct sockaddr_in *target;
+    unsigned short source_port;
+    int sent;
+
+    if (g_host_transport == INVALID_SOCKET || destination == NULL ||
+        destination_length < (int)sizeof(struct sockaddr_in) ||
+        destination->sa_family != AF_INET || length < 0 || length > WELNPT_MAX_PAYLOAD) {
+        WSASetLastError(WSAEINVAL);
+        return SOCKET_ERROR;
+    }
+    if (!virtual_socket_port(handle, &source_port)) {
+        WSASetLastError(WSAENOBUFS);
+        return SOCKET_ERROR;
+    }
+    target = (const struct sockaddr_in *)destination;
+    welnpt_initialize_host_frame(frame, WELNPT_HOST_FRAME_DATA);
+    frame->source_ip = g_logical_ip;
+    frame->source_port = htons(source_port);
+    frame->target_ip = target->sin_addr.S_un.S_addr;
+    frame->target_port = target->sin_port;
+    frame->payload_length = htons((u_short)length);
+    frame->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
+    if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) frame->flags |= WELNPT_FLAG_BROADCAST;
+    if (length > 0) CopyMemory(packet + sizeof(*frame), payload, (size_t)length);
+    sent = g_real_sendto(g_host_transport, packet, (int)sizeof(*frame) + length, 0,
+        (const struct sockaddr *)&g_host_address, sizeof(g_host_address));
+    if (sent == SOCKET_ERROR) return SOCKET_ERROR;
+    WSASetLastError(0);
+    return length;
+}
+
+static void notify_light_socket_close(unsigned short logical_port) {
+    welnpt_host_frame frame;
+    if (!g_light_mode || g_host_transport == INVALID_SOCKET || logical_port == 0) return;
+    welnpt_initialize_host_frame(&frame, WELNPT_HOST_FRAME_CLOSE);
+    frame.source_port = htons(logical_port);
+    g_real_sendto(g_host_transport, (const char *)&frame, sizeof(frame), 0,
+        (const struct sockaddr *)&g_host_address, sizeof(g_host_address));
+}
+
 static int send_register_packet(void) {
     welnpt_packet_header header;
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
@@ -666,6 +838,8 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 	unsigned long payload_hash;
 	LONG selected_path = WELNPT_GAME_PATH_RELAY;
 	LONG direct_ready = 0;
+
+    if (g_light_mode) return send_light_datagram(handle, payload, length, destination, destination_length);
 
     if (destination == NULL || destination_length < (int)sizeof(struct sockaddr_in) ||
         destination->sa_family != AF_INET || length < 0 || length > WELNPT_MAX_PAYLOAD) {
@@ -764,6 +938,60 @@ static int receive_virtual_datagram(SOCKET handle, char *buffer, int length, int
     int result;
     int item_length;
     int peek = (flags & MSG_PEEK) != 0;
+
+    if (g_light_mode) {
+        char packet[sizeof(welnpt_host_frame) + WELNPT_MAX_PAYLOAD];
+        struct sockaddr_in local_source;
+        int local_source_length = sizeof(local_source);
+        SOCKET light_socket = INVALID_SOCKET;
+        welnpt_host_frame *frame;
+        int payload_length;
+        int result;
+        EnterCriticalSection(&g_state_lock);
+        state = find_socket_locked(handle);
+        if (state != NULL) light_socket = state->light_transport;
+        LeaveCriticalSection(&g_state_lock);
+        if (light_socket == INVALID_SOCKET) return -2;
+        result = g_real_recvfrom(light_socket, packet, sizeof(packet), peek ? MSG_PEEK : 0,
+            (struct sockaddr *)&local_source, &local_source_length);
+        if (result == SOCKET_ERROR) return SOCKET_ERROR;
+        if (result < (int)sizeof(welnpt_host_frame)) {
+            WSASetLastError(WSAEINVAL);
+            return SOCKET_ERROR;
+        }
+        frame = (welnpt_host_frame *)packet;
+        payload_length = (int)ntohs(frame->payload_length);
+        if (!welnpt_valid_host_frame(frame) || frame->type != WELNPT_HOST_FRAME_DATA ||
+            payload_length < 0 || payload_length > WELNPT_MAX_PAYLOAD ||
+            result != (int)sizeof(*frame) + payload_length) {
+            if (!peek) {
+                /* The malformed frame has already been consumed from the local
+                   socket. Do not expose it to the game. */
+            }
+            WSASetLastError(WSAEINVAL);
+            return SOCKET_ERROR;
+        }
+        if (source != NULL && source_length != NULL) {
+            struct sockaddr_in remote;
+            if (*source_length < (int)sizeof(remote)) {
+                WSASetLastError(WSAEFAULT);
+                return SOCKET_ERROR;
+            }
+            ZeroMemory(&remote, sizeof(remote));
+            remote.sin_family = AF_INET;
+            remote.sin_addr.S_un.S_addr = frame->source_ip;
+            remote.sin_port = frame->source_port;
+            CopyMemory(source, &remote, sizeof(remote));
+            *source_length = sizeof(remote);
+        }
+        if (length < payload_length) {
+            WSASetLastError(WSAEMSGSIZE);
+            return SOCKET_ERROR;
+        }
+        if (payload_length > 0 && buffer != NULL) CopyMemory(buffer, packet + sizeof(*frame), (size_t)payload_length);
+        WSASetLastError(0);
+        return payload_length;
+    }
 
     EnterCriticalSection(&g_queue_lock);
     EnterCriticalSection(&g_state_lock);
@@ -881,6 +1109,7 @@ static int WSAAPI wel_bind(SOCKET handle, const struct sockaddr *address, int ad
         g_port_index[state->logical_port] = 0;
     }
     state->logical_port = requested_port != 0 ? requested_port : allocate_port_locked(handle);
+    state->light_map_port = 0;
     if (state->logical_port != 0) {
         g_port_index[state->logical_port] = (unsigned char)((state - g_sockets) + 1);
     }
@@ -892,6 +1121,10 @@ static int WSAAPI wel_bind(SOCKET handle, const struct sockaddr *address, int ad
     }
     log_line("\"api\":\"bind\",\"socket\":%llu,\"logicalPort\":%u",
         (unsigned __int64)handle, (unsigned)requested_port);
+    if (g_light_mode) {
+        unsigned short announced;
+        virtual_socket_port(handle, &announced);
+    }
     WSASetLastError(0);
     return 0;
 }
@@ -1246,6 +1479,8 @@ static int load_configuration(void) {
     struct addrinfo hints;
     struct addrinfo *addresses = NULL;
     DWORD room_length;
+    unsigned short host_port = 0;
+    int host_mode;
 
     if (GetEnvironmentVariableA("WEL_NOTAP_RELAY", relay, sizeof(relay)) == 0 ||
         GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0 ||
@@ -1257,7 +1492,8 @@ static int load_configuration(void) {
     strcpy_s(port, sizeof(port), separator + 1);
     *separator = '\0';
     if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
-    if (!welnpt_auth_initialize(&g_auth, token)) return 0;
+    host_mode = parse_environment_port("WEL_NOTAP_HOST_PORT", &host_port);
+    if (!host_mode && !welnpt_auth_initialize(&g_auth, token)) return 0;
     SecureZeroMemory(token, sizeof(token));
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -1329,6 +1565,43 @@ static int initialize_hook(void) {
     g_real_closesocket = (wel_closesocket_fn)GetProcAddress(winsock, "closesocket");
     if (g_real_socket == NULL || g_real_bind == NULL || g_real_getsockname == NULL ||
         g_real_sendto == NULL || g_real_recvfrom == NULL || g_real_closesocket == NULL) return 0;
+
+    /* The launcher starts welnpthost.exe before injecting us. If its loopback
+       port is present, keep the game process on the lightweight local frame
+       path and leave WNP2/HMAC/ICE work to that external process. Without the
+       variable, retain the original in-process transport for compatibility. */
+    if (parse_environment_port("WEL_NOTAP_HOST_PORT", &g_host_port)) {
+        ZeroMemory(&g_host_address, sizeof(g_host_address));
+        g_host_address.sin_family = AF_INET;
+        g_host_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+        g_host_address.sin_port = htons(g_host_port);
+        g_host_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_host_transport == INVALID_SOCKET) return 0;
+        ZeroMemory(&local_address, sizeof(local_address));
+        local_address.sin_family = AF_INET;
+        local_address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+        local_address.sin_port = 0;
+        if (g_real_bind(g_host_transport, (const struct sockaddr *)&local_address, sizeof(local_address)) == SOCKET_ERROR) return 0;
+        tune_transport_socket(g_host_transport);
+        setsockopt(g_host_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+        {
+            welnpt_host_frame hello;
+            welnpt_initialize_host_frame(&hello, WELNPT_HOST_FRAME_HELLO);
+            if (g_real_sendto(g_host_transport, (const char *)&hello, sizeof(hello), 0,
+                (const struct sockaddr *)&g_host_address, sizeof(g_host_address)) == SOCKET_ERROR) return 0;
+        }
+        g_light_mode = 1;
+        patch_module_imports(GetModuleHandleW(NULL));
+        worker = CreateThread(NULL, 0, light_receive_thread, NULL, 0, NULL);
+        if (worker == NULL) return 0;
+        CloseHandle(worker);
+        worker = CreateThread(NULL, 0, module_watch_thread, NULL, 0, NULL);
+        if (worker != NULL) CloseHandle(worker);
+        log_line("\"api\":\"hook-ready\",\"mode\":\"loopback-host\",\"protocol\":2,\"hostPort\":%u",
+            (unsigned)g_host_port);
+        log_line("\"api\":\"session-state\",\"state\":\"WAIT_JOIN\",\"generation\":0,\"reason\":\"hook-ready\"");
+        return 1;
+    }
 
     g_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_transport == INVALID_SOCKET) return 0;

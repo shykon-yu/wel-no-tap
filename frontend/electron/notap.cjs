@@ -57,6 +57,14 @@ function hookCandidates() {
   ].filter(Boolean)
 }
 
+function hostCandidates() {
+  return [
+    path.join(process.resourcesPath || '', 'welhelper', 'welnpthost.exe'),
+    path.join(__dirname, '..', 'resources', 'welhelper', 'welnpthost.exe'),
+    path.join(__dirname, '..', 'build', 'welnpthost.exe'),
+  ].filter(Boolean)
+}
+
 function iceCandidates() {
   return [
     path.join(process.resourcesPath || '', 'welhelper', 'welnptice.exe'),
@@ -72,7 +80,7 @@ function locate(candidates) {
 function describeLaunchFailure(detail, code) {
   const raw = String(detail || '').trim()
   if (code === 3 || raw.includes('Game executable not found')) return '游戏程序 WE8.exe 不存在或路径无法访问。' + (raw ? '\n' + raw : '')
-  if (code === 4 || raw.includes('Hook module not found')) return '游戏网络组件 welnpt.dll 缺失或无法读取。' + (raw ? '\n' + raw : '')
+  if (code === 4 || raw.includes('Hook module not found') || raw.includes('Host transport not found')) return '游戏网络组件或 Host 组件缺失或无法读取。' + (raw ? '\n' + raw : '')
   if (code === 6 || raw.includes('CreateProcess failed')) return '游戏程序 WE8.exe 启动失败。' + (raw ? '\n' + raw : '')
   if (code === 7 || raw.includes('Hook module injection failed')) return '游戏网络组件 welnpt.dll 加载失败。' + (raw ? '\n' + raw : '')
   if (code === 8 || raw.includes('Hook module did not initialize')) return '游戏网络组件 welnpt.dll 初始化超时。' + (raw ? '\n' + raw : '')
@@ -1072,14 +1080,16 @@ function windowsCommandArgument(value) {
 function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
+  const host = locate(hostCandidates())
   const executable = resolveGamePath(gamePath)
   if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
+  if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
   if (!direct) transportPath = 'relay'
-  const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
+  const args = ['--game', executable, '--hook', hook, '--host', host, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token)]
   if (diagnosticLogEnabled && logPath) args.push('--log', logPath)
   if (direct && iceProcess && iceAgentPort && iceHookPort) {
@@ -1122,9 +1132,11 @@ async function launchElevated(options) {
 async function launch({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
+  const host = locate(hostCandidates())
   const executable = resolveGamePath(gamePath)
   if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
+  if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
   if (direct) {
@@ -1147,7 +1159,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
   }
-  const child = spawn(helper, ['--game', executable, '--hook', hook], {
+  const child = spawn(helper, ['--game', executable, '--hook', hook, '--host', host], {
     cwd: path.dirname(executable),
     env: environment,
     windowsHide: true,
