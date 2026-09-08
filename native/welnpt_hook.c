@@ -18,6 +18,9 @@
 #define WELNPT_HEARTBEAT_MS 2000
 #define WELNPT_ICE_DECISION_WINDOW_MS 5000
 #define WELNPT_ICE_SESSION_TIMEOUT_MS 12000
+#define WELNPT_MODULE_SCAN_MS 1000
+#define WELNPT_DATAGRAM_POOL_SIZE 1024
+#define WELNPT_STATS_INTERVAL_MS 5000
 #define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
 #define WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH 84
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
@@ -47,7 +50,7 @@ typedef struct virtual_datagram {
     struct virtual_datagram *next;
     struct sockaddr_in source;
     int length;
-    char payload[1];
+    char payload[WELNPT_MAX_PAYLOAD];
 } virtual_datagram;
 
 typedef struct virtual_socket {
@@ -68,6 +71,9 @@ static CRITICAL_SECTION g_log_lock;
 static int g_locks_initialized;
 static int g_diagnostic_log_enabled;
 static virtual_socket g_sockets[WELNPT_MAX_SOCKETS];
+static unsigned char g_port_index[65536];
+static virtual_datagram g_datagram_pool[WELNPT_DATAGRAM_POOL_SIZE];
+static virtual_datagram *g_datagram_free;
 static SOCKET g_transport = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static SOCKET g_direct_transport = INVALID_SOCKET;
@@ -82,6 +88,16 @@ static volatile LONG g_game_path;
 static ULONGLONG g_ice_decision_deadline;
 static ULONGLONG g_ice_decision_started;
 static ULONGLONG g_ice_session_deadline;
+static volatile LONG g_stat_queue_drops;
+static volatile LONG g_stat_pool_drops;
+static volatile LONG g_stat_max_queue;
+static volatile LONG g_stat_send_direct;
+static volatile LONG g_stat_send_relay;
+static volatile LONG g_stat_recv_direct;
+static volatile LONG g_stat_recv_relay;
+static volatile LONG64 g_stat_hmac_ticks;
+static volatile LONG64 g_stat_hmac_count;
+static volatile LONG64 g_stat_last_log_tick;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
 static welnpt_auth_context g_auth;
@@ -99,7 +115,67 @@ static wel_closesocket_fn g_real_closesocket;
 
 static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     unsigned short observed_source_port, unsigned short observed_target_port);
-static void log_line(const char *format, ...);
+static void log_line_impl(const char *format, ...);
+#define log_line(...) do { \
+    if (g_diagnostic_log_enabled) log_line_impl(__VA_ARGS__); \
+} while (0)
+
+static int timed_auth_sign(char *packet, int length) {
+    LARGE_INTEGER started;
+    LARGE_INTEGER finished;
+    int result;
+    if (!g_diagnostic_log_enabled) return welnpt_auth_sign(&g_auth, packet, length);
+    QueryPerformanceCounter(&started);
+    result = welnpt_auth_sign(&g_auth, packet, length);
+    QueryPerformanceCounter(&finished);
+    InterlockedExchangeAdd64(&g_stat_hmac_ticks, finished.QuadPart - started.QuadPart);
+    InterlockedIncrement64(&g_stat_hmac_count);
+    return result;
+}
+
+static int timed_auth_verify(const char *packet, int length) {
+    LARGE_INTEGER started;
+    LARGE_INTEGER finished;
+    int result;
+    if (!g_diagnostic_log_enabled) return welnpt_auth_verify(&g_auth, packet, length);
+    QueryPerformanceCounter(&started);
+    result = welnpt_auth_verify(&g_auth, packet, length);
+    QueryPerformanceCounter(&finished);
+    InterlockedExchangeAdd64(&g_stat_hmac_ticks, finished.QuadPart - started.QuadPart);
+    InterlockedIncrement64(&g_stat_hmac_count);
+    return result;
+}
+
+static void maybe_log_stats(void) {
+    ULONGLONG now;
+    LONG64 previous;
+    LARGE_INTEGER frequency;
+    LONG64 hmac_ticks;
+    LONG64 hmac_count;
+    if (!g_diagnostic_log_enabled) return;
+    now = GetTickCount64();
+    previous = InterlockedCompareExchange64(&g_stat_last_log_tick, 0, 0);
+    if (previous != 0 && now - (ULONGLONG)previous < WELNPT_STATS_INTERVAL_MS) return;
+    if (InterlockedCompareExchange64(&g_stat_last_log_tick, (LONG64)now, previous) != previous) return;
+    hmac_ticks = InterlockedExchange64(&g_stat_hmac_ticks, 0);
+    hmac_count = InterlockedExchange64(&g_stat_hmac_count, 0);
+    QueryPerformanceFrequency(&frequency);
+    log_line("\"api\":\"hook-stats\",\"sendDirect\":%ld,\"sendRelay\":%ld,\"recvDirect\":%ld,\"recvRelay\":%ld,\"queueDrops\":%ld,\"poolDrops\":%ld,\"maxQueue\":%ld,\"hmacCount\":%I64d,\"hmacMs\":%.3f",
+        InterlockedExchange(&g_stat_send_direct, 0), InterlockedExchange(&g_stat_send_relay, 0),
+        InterlockedExchange(&g_stat_recv_direct, 0), InterlockedExchange(&g_stat_recv_relay, 0),
+        InterlockedExchange(&g_stat_queue_drops, 0), InterlockedExchange(&g_stat_pool_drops, 0),
+        InterlockedCompareExchange(&g_stat_max_queue, 0, 0), hmac_count,
+        frequency.QuadPart > 0 ? (double)hmac_ticks * 1000.0 / (double)frequency.QuadPart : 0.0);
+}
+
+static void tune_transport_socket(SOCKET socket) {
+    int buffer_size = 1024 * 1024;
+    if (socket == INVALID_SOCKET) return;
+    /* Keep bursts in kernel space so the receive worker is less likely to
+       overrun the fixed virtual-datagram pool during menu transitions. */
+    setsockopt(socket, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size, sizeof(buffer_size));
+    setsockopt(socket, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size, sizeof(buffer_size));
+}
 
 static void notify_agent_transport_state(const char *state) {
     char message[64];
@@ -201,6 +277,11 @@ static void payload_fingerprint(const char *payload, int length, char *head, siz
     unsigned long value = 2166136261UL;
     size_t count = 0;
     int index;
+    if (!g_diagnostic_log_enabled) {
+        if (head_size > 0) head[0] = '\0';
+        if (hash != NULL) *hash = 0;
+        return;
+    }
     if (head_size > 0) head[0] = '\0';
     if (payload == NULL || length <= 0 || head_size < 3) {
         if (hash != NULL) *hash = value;
@@ -218,7 +299,7 @@ static void payload_fingerprint(const char *payload, int length, char *head, siz
     if (hash != NULL) *hash = value;
 }
 
-static void log_line(const char *format, ...) {
+static void log_line_impl(const char *format, ...) {
     char message[768];
     char line[896];
     va_list arguments;
@@ -251,14 +332,21 @@ static virtual_socket *find_socket_locked(SOCKET handle) {
     return NULL;
 }
 
+static virtual_socket *find_socket_by_port_locked(unsigned short port) {
+    unsigned index;
+    if (port == 0) return NULL;
+    index = g_port_index[port];
+    if (index == 0 || index > ARRAYSIZE(g_sockets)) return NULL;
+    --index;
+    if (!g_sockets[index].active || g_sockets[index].logical_port != port) return NULL;
+    return &g_sockets[index];
+}
+
 static int port_in_use_locked(unsigned short port, SOCKET except_handle) {
-    size_t index;
+    virtual_socket *state;
     if (port == 0) return 0;
-    for (index = 0; index < ARRAYSIZE(g_sockets); ++index) {
-        if (g_sockets[index].active && g_sockets[index].handle != except_handle &&
-            g_sockets[index].logical_port == port) return 1;
-    }
-    return 0;
+    state = find_socket_by_port_locked(port);
+    return state != NULL && state->handle != except_handle;
 }
 
 static unsigned short allocate_port_locked(SOCKET handle) {
@@ -298,6 +386,9 @@ static int virtual_socket_port(SOCKET handle, unsigned short *port) {
     state = find_socket_locked(handle);
     if (state != NULL) {
         if (state->logical_port == 0) state->logical_port = allocate_port_locked(handle);
+        if (state->logical_port != 0) {
+            g_port_index[state->logical_port] = (unsigned char)((state - g_sockets) + 1);
+        }
         *port = state->logical_port;
         found = state->logical_port != 0;
     }
@@ -305,11 +396,58 @@ static int virtual_socket_port(SOCKET handle, unsigned short *port) {
     return found;
 }
 
+static void initialize_datagram_pool(void) {
+    size_t index;
+    g_datagram_free = NULL;
+    for (index = ARRAYSIZE(g_datagram_pool); index > 0; --index) {
+        g_datagram_pool[index - 1].next = g_datagram_free;
+        g_datagram_free = &g_datagram_pool[index - 1];
+    }
+}
+
+static virtual_datagram *acquire_datagram_locked(void) {
+    virtual_datagram *item = g_datagram_free;
+    if (item != NULL) {
+        g_datagram_free = item->next;
+    } else {
+        /* Preserve the old queue capacity during an exceptional burst. The
+           pool handles the normal path; overflow allocations are reclaimed
+           immediately when the datagram is consumed. */
+        item = (virtual_datagram *)HeapAlloc(GetProcessHeap(), 0, sizeof(*item));
+    }
+    return item;
+}
+
+static int is_pool_datagram(const virtual_datagram *item) {
+    ULONG_PTR address = (ULONG_PTR)item;
+    ULONG_PTR begin = (ULONG_PTR)&g_datagram_pool[0];
+    ULONG_PTR end = (ULONG_PTR)&g_datagram_pool[ARRAYSIZE(g_datagram_pool)];
+    return address >= begin && address < end && ((address - begin) % sizeof(g_datagram_pool[0])) == 0;
+}
+
+static void release_datagram_locked(virtual_datagram *item) {
+    if (item == NULL) return;
+    if (!is_pool_datagram(item)) {
+        HeapFree(GetProcessHeap(), 0, item);
+        return;
+    }
+    item->next = g_datagram_free;
+    g_datagram_free = item;
+}
+
+static void update_max_queue(unsigned value) {
+    LONG current;
+    do {
+        current = InterlockedCompareExchange(&g_stat_max_queue, 0, 0);
+        if ((unsigned)current >= value) return;
+    } while (InterlockedCompareExchange(&g_stat_max_queue, (LONG)value, current) != current);
+}
+
 static void free_queue(virtual_socket *state) {
     virtual_datagram *item = state->head;
     while (item != NULL) {
         virtual_datagram *next = item->next;
-        HeapFree(GetProcessHeap(), 0, item);
+        release_datagram_locked(item);
         item = next;
     }
     state->head = NULL;
@@ -325,6 +463,10 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     state = find_socket_locked(handle);
     if (state != NULL) {
         if (logical_port != NULL) *logical_port = state->logical_port;
+        if (state->logical_port != 0 &&
+            g_port_index[state->logical_port] == (unsigned char)((state - g_sockets) + 1)) {
+            g_port_index[state->logical_port] = 0;
+        }
         free_queue(state);
         ZeroMemory(state, sizeof(*state));
         found = 1;
@@ -335,37 +477,33 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
 
 static int enqueue_datagram(const welnpt_packet_header *header, const char *payload, int length) {
     virtual_datagram *item;
-    virtual_socket *state = NULL;
-    size_t allocation_size;
-    size_t index;
+    virtual_socket *state;
     unsigned short target_port = ntohs(header->target_port);
 
-    allocation_size = sizeof(virtual_datagram) + (size_t)(length > 0 ? length - 1 : 0);
-    item = (virtual_datagram *)HeapAlloc(GetProcessHeap(), 0, allocation_size);
-    if (item == NULL) return 0;
+    EnterCriticalSection(&g_state_lock);
+    state = find_socket_by_port_locked(target_port);
+    if (state == NULL || state->queued >= WELNPT_MAX_QUEUED_DATAGRAMS) {
+        InterlockedIncrement(&g_stat_queue_drops);
+        LeaveCriticalSection(&g_state_lock);
+        return 0;
+    }
+    item = acquire_datagram_locked();
+    if (item == NULL) {
+        InterlockedIncrement(&g_stat_pool_drops);
+        LeaveCriticalSection(&g_state_lock);
+        return 0;
+    }
     ZeroMemory(item, sizeof(*item));
     item->source.sin_family = AF_INET;
     item->source.sin_addr.S_un.S_addr = header->source_ip;
     item->source.sin_port = header->source_port;
     item->length = length;
     if (length > 0) CopyMemory(item->payload, payload, (size_t)length);
-
-    EnterCriticalSection(&g_state_lock);
-    for (index = 0; index < ARRAYSIZE(g_sockets); ++index) {
-        if (g_sockets[index].active && g_sockets[index].logical_port == target_port) {
-            state = &g_sockets[index];
-            break;
-        }
-    }
-    if (state == NULL || state->queued >= WELNPT_MAX_QUEUED_DATAGRAMS) {
-        LeaveCriticalSection(&g_state_lock);
-        HeapFree(GetProcessHeap(), 0, item);
-        return 0;
-    }
     if (state->tail == NULL) state->head = item;
     else state->tail->next = item;
     state->tail = item;
     ++state->queued;
+    update_max_queue(state->queued);
     LeaveCriticalSection(&g_state_lock);
     return 1;
 }
@@ -387,7 +525,7 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
-		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
+        !timed_auth_verify(packet, received)) return 0;
 	is_join = is_game_join_payload(packet + sizeof(*header), payload_length);
 	is_accept = is_game_accept_payload(packet + sizeof(*header), payload_length);
 	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_search_payload(packet + sizeof(*header), payload_length) &&
@@ -401,11 +539,13 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		unsigned short target_port = ntohs(header->target_port);
 		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->source_ip, join_port, source_port, target_port);
-		payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
-		if (InetNtopA(AF_INET, &header->source_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
-		log_line("\"api\":\"session-signal\",\"direction\":\"receive\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(packet + sizeof(*header), payload_length), (unsigned long)ntohl(header->sequence), payload_length, new_session ? "true" : "false",
-			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		if (g_diagnostic_log_enabled) {
+			payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
+			if (InetNtopA(AF_INET, &header->source_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
+			log_line("\"api\":\"session-signal\",\"direction\":\"receive\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
+				packet_kind(packet + sizeof(*header), payload_length), (unsigned long)ntohl(header->sequence), payload_length, new_session ? "true" : "false",
+				peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		}
 	}
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip) {
 		LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
@@ -418,13 +558,17 @@ static int handle_transport_packet(char *packet, int received, const char *path)
     if (!enqueue_datagram(header, packet + sizeof(*header), payload_length)) {
 		log_line("\"api\":\"transport-drop\",\"path\":\"%s\",\"targetPort\":%u,\"length\":%d",
 			path, (unsigned)ntohs(header->target_port), payload_length);
-		return 0;
+        return 0;
+    }
+    if (strcmp(path, "direct") == 0) InterlockedIncrement(&g_stat_recv_direct);
+    else InterlockedIncrement(&g_stat_recv_relay);
+	if (g_diagnostic_log_enabled) {
+		payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
+		log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"broadcast\":%s,\"sequence\":%lu,\"sourcePort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
+			path, (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
+			(unsigned long)ntohl(header->sequence), (unsigned)ntohs(header->source_port), payload_length,
+			packet_kind(packet + sizeof(*header), payload_length), payload_head, payload_hash);
 	}
-	payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
-	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"broadcast\":%s,\"sequence\":%lu,\"sourcePort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-		path, (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
-		(unsigned long)ntohl(header->sequence), (unsigned)ntohs(header->source_port), payload_length,
-		packet_kind(packet + sizeof(*header), payload_length), payload_head, payload_hash);
 	return 1;
 }
 
@@ -433,7 +577,7 @@ static int send_register_packet(void) {
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
     CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
     header.source_ip = g_logical_ip;
-    if (!welnpt_auth_sign(&g_auth, (char *)&header, sizeof(header))) return SOCKET_ERROR;
+    if (!timed_auth_sign((char *)&header, sizeof(header))) return SOCKET_ERROR;
     return g_real_sendto(g_transport, (const char *)&header, sizeof(header), 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
@@ -517,7 +661,7 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) header->flags |= WELNPT_FLAG_BROADCAST;
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
-	if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) {
+	if (!timed_auth_sign(packet, (int)sizeof(*header) + length)) {
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -532,11 +676,13 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 		unsigned short target_port = ntohs(target->sin_port);
 		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->target_ip, join_port, source_port, target_port);
-		payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-		if (InetNtopA(AF_INET, &header->target_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
-		log_line("\"api\":\"session-signal\",\"direction\":\"send\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(payload, length), (unsigned long)ntohl(header->sequence), length, new_session ? "true" : "false",
-			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		if (g_diagnostic_log_enabled) {
+			payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
+			if (InetNtopA(AF_INET, &header->target_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
+			log_line("\"api\":\"session-signal\",\"direction\":\"send\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
+				packet_kind(payload, length), (unsigned long)ntohl(header->sequence), length, new_session ? "true" : "false",
+				peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		}
 	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
         g_direct_transport != INVALID_SOCKET && header->target_ip == g_direct_peer_ip &&
@@ -545,10 +691,14 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
         sent = g_real_sendto(g_direct_transport, packet, (int)sizeof(*header) + length, 0,
             (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
         if (sent != SOCKET_ERROR) {
-            payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-			log_line("\"api\":\"sendto\",\"path\":\"direct\",\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-				(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port, (unsigned)ntohs(target->sin_port), length,
-				packet_kind(payload, length), payload_head, payload_hash);
+			InterlockedIncrement(&g_stat_send_direct);
+			maybe_log_stats();
+			if (g_diagnostic_log_enabled) {
+				payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
+				log_line("\"api\":\"sendto\",\"path\":\"direct\",\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
+					(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port, (unsigned)ntohs(target->sin_port), length,
+					packet_kind(payload, length), payload_head, payload_hash);
+			}
             WSASetLastError(0);
             return length;
         }
@@ -561,12 +711,16 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
     if (sent == SOCKET_ERROR) return SOCKET_ERROR;
-    payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-	log_line("\"api\":\"sendto\",\"path\":\"relay\",\"broadcast\":%s,\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-		(header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
-		(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port,
-		(unsigned)ntohs(target->sin_port), length,
-		packet_kind(payload, length), payload_head, payload_hash);
+	InterlockedIncrement(&g_stat_send_relay);
+	maybe_log_stats();
+	if (g_diagnostic_log_enabled) {
+		payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
+		log_line("\"api\":\"sendto\",\"path\":\"relay\",\"broadcast\":%s,\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
+			(header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
+			(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port,
+			(unsigned)ntohs(target->sin_port), length,
+			packet_kind(payload, length), payload_head, payload_hash);
+	}
     WSASetLastError(0);
     return length;
 }
@@ -602,7 +756,7 @@ static int receive_virtual_datagram(SOCKET handle, char *buffer, int length, int
     if (result > 0 && buffer != NULL) CopyMemory(buffer, item->payload, (size_t)result);
     if (source != NULL && source_length != NULL) {
         if (*source_length < (int)sizeof(struct sockaddr_in)) {
-            if (!peek) HeapFree(GetProcessHeap(), 0, item);
+            if (!peek) release_datagram_locked(item);
             LeaveCriticalSection(&g_state_lock);
             WSASetLastError(WSAEFAULT);
             return SOCKET_ERROR;
@@ -610,14 +764,20 @@ static int receive_virtual_datagram(SOCKET handle, char *buffer, int length, int
         CopyMemory(source, &item->source, sizeof(item->source));
         *source_length = sizeof(item->source);
     }
-    log_line("\"api\":\"recvfrom\",\"socket\":%llu,\"sourcePort\":%u,\"length\":%d",
-        (unsigned __int64)handle, (unsigned)ntohs(item->source.sin_port), item_length);
-    if (!peek) HeapFree(GetProcessHeap(), 0, item);
-    LeaveCriticalSection(&g_state_lock);
+    {
+        unsigned short source_port = ntohs(item->source.sin_port);
+        if (!peek) release_datagram_locked(item);
+        LeaveCriticalSection(&g_state_lock);
+        if (g_diagnostic_log_enabled) {
+            log_line("\"api\":\"recvfrom\",\"socket\":%llu,\"sourcePort\":%u,\"length\":%d",
+                (unsigned __int64)handle, (unsigned)source_port, item_length);
+        }
+    }
     if (length < item_length) {
         WSASetLastError(WSAEMSGSIZE);
         return SOCKET_ERROR;
     }
+    maybe_log_stats();
     WSASetLastError(0);
     return result;
 }
@@ -663,7 +823,14 @@ static int WSAAPI wel_bind(SOCKET handle, const struct sockaddr *address, int ad
         WSASetLastError(WSAEADDRINUSE);
         return SOCKET_ERROR;
     }
+    if (state->logical_port != 0 && state->logical_port != requested_port &&
+        g_port_index[state->logical_port] == (unsigned char)((state - g_sockets) + 1)) {
+        g_port_index[state->logical_port] = 0;
+    }
     state->logical_port = requested_port != 0 ? requested_port : allocate_port_locked(handle);
+    if (state->logical_port != 0) {
+        g_port_index[state->logical_port] = (unsigned char)((state - g_sockets) + 1);
+    }
     requested_port = state->logical_port;
     LeaveCriticalSection(&g_state_lock);
     if (requested_port == 0) {
@@ -872,7 +1039,7 @@ static DWORD WINAPI module_watch_thread(LPVOID unused) {
     (void)unused;
     while (InterlockedCompareExchange(&g_stopping, 0, 0) == 0) {
         patch_all_modules();
-        Sleep(250);
+        Sleep(WELNPT_MODULE_SCAN_MS);
     }
     return 0;
 }
@@ -893,6 +1060,7 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
         received = g_real_recvfrom(g_transport, packet, sizeof(packet), 0,
             (struct sockaddr *)&source, &source_length);
         if (received > 0) handle_transport_packet(packet, received, "relay");
+        maybe_log_stats();
     }
     return 0;
 }
@@ -996,6 +1164,7 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
 			continue;
 		}
         handle_transport_packet(packet, received, "direct");
+        maybe_log_stats();
     }
     return 0;
 }
@@ -1076,6 +1245,8 @@ static int initialize_hook(void) {
     InitializeCriticalSection(&g_state_lock);
     InitializeCriticalSection(&g_log_lock);
     g_locks_initialized = 1;
+    ZeroMemory(g_port_index, sizeof(g_port_index));
+    initialize_datagram_pool();
     {
         char logging[16];
         DWORD length = GetEnvironmentVariableA("WEL_NOTAP_DIAGNOSTIC_LOG", logging, sizeof(logging));
@@ -1112,6 +1283,7 @@ static int initialize_hook(void) {
     local_address.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
     local_address.sin_port = 0;
     if (g_real_bind(g_transport, (const struct sockaddr *)&local_address, sizeof(local_address)) == SOCKET_ERROR) return 0;
+    tune_transport_socket(g_transport);
     setsockopt(g_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 	if (g_direct_agent_address.sin_port != 0 && g_direct_hook_port != 0) {
 		g_direct_transport = g_real_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1124,6 +1296,7 @@ static int initialize_hook(void) {
 				g_real_closesocket(g_direct_transport);
 				g_direct_transport = INVALID_SOCKET;
 			} else {
+				tune_transport_socket(g_direct_transport);
 				setsockopt(g_direct_transport, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 				g_real_sendto(g_direct_transport, "WELICESTATE?", 12, 0,
 					(const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));

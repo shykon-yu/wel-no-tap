@@ -7,6 +7,12 @@
 
 #define WELNPT_AUTH_SECRET_MAX 128
 #define WELNPT_SHA256_LENGTH 32
+#define WELNPT_AUTH_OBJECT_MAX 512
+
+/* BCrypt hash objects are thread-owned. Keeping the common SHA-256 object in
+   TLS removes a heap allocation from every packet without sharing handles
+   between the game's networking threads. */
+static __declspec(thread) unsigned char g_welnpt_auth_object[WELNPT_AUTH_OBJECT_MAX];
 
 typedef struct welnpt_auth_context {
     BCRYPT_ALG_HANDLE provider;
@@ -40,17 +46,23 @@ static int welnpt_auth_digest(welnpt_auth_context *context, const char *packet,
     int packet_length, unsigned char digest[WELNPT_SHA256_LENGTH]) {
     BCRYPT_HASH_HANDLE hash = NULL;
     PUCHAR object;
+    int heap_object = 0;
     NTSTATUS status;
     if (context == NULL || context->provider == NULL || packet == NULL || packet_length < 0) return 0;
-    object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, context->object_length);
-    if (object == NULL) return 0;
+    if (context->object_length <= sizeof(g_welnpt_auth_object)) {
+        object = g_welnpt_auth_object;
+    } else {
+        object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, context->object_length);
+        if (object == NULL) return 0;
+        heap_object = 1;
+    }
     status = BCryptCreateHash(context->provider, &hash, object, context->object_length,
         (PUCHAR)context->secret, (ULONG)strlen(context->secret), 0);
     if (status >= 0) status = BCryptHashData(hash, (PUCHAR)packet, (ULONG)packet_length, 0);
     if (status >= 0) status = BCryptFinishHash(hash, digest, WELNPT_SHA256_LENGTH, 0);
     if (hash != NULL) BCryptDestroyHash(hash);
     SecureZeroMemory(object, context->object_length);
-    HeapFree(GetProcessHeap(), 0, object);
+    if (heap_object) HeapFree(GetProcessHeap(), 0, object);
     return status >= 0;
 }
 
