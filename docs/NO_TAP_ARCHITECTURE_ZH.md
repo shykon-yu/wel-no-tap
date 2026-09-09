@@ -399,7 +399,7 @@ systemd：welnpt-notap-relay.service
 
 ```text
 Git commit：f1736c3（架构基准）
-Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.53）
+Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.54）
 Linux 工件：WEL无网卡云中继-P2-linux-x64
 ```
 

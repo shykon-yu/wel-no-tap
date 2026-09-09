@@ -164,7 +164,13 @@ static int self_test(void) {
     welnpt_initialize_header(header, WELNPT_PACKET_DATA);
     header->payload_length = htons(4);
     memcpy(packet + sizeof(*header), "test", 4);
-    if (sizeof(*header) != 58 || !welnpt_valid_header(header)) return 1;
+    if (sizeof(*header) != 58 || !welnpt_valid_header(header) || !valid_route_fields(header)) return 1;
+    welnpt_initialize_header(header, WELNPT_PACKET_REGISTER);
+    header->source_ip = htonl(0x0a7a0101UL);
+    if (!valid_route_fields(header)) return 1;
+    welnpt_initialize_header(header, WELNPT_PACKET_PING);
+    header->source_ip = htonl(0x0a7a0101UL);
+    if (!valid_route_fields(header)) return 1;
     memset(g_peers, 0, sizeof(g_peers));
     memset(g_diagnostic_peers, 0, sizeof(g_diagnostic_peers));
     memset(&game_endpoint, 0, sizeof(game_endpoint));
