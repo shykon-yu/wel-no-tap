@@ -287,9 +287,9 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
   const desktopApi = desktop()
   if (!desktopApi) throw new Error('直连组件不可用：当前不是 Windows 客户端')
 
-  // Firewall rules are only needed by the direct room. Relay rooms must not
-  // start ICE or touch the ICE firewall policy at all.
-  void desktopApi.ensureFirewall({}).catch(() => undefined)
+  // Search and relay transport use the outbound 22333/UDP mapping and do not
+  // require a client firewall rule. ICE remains optional; skipping this
+  // best-effort policy write keeps room entry quiet and lightweight.
   if (!desktopApi.prepareIce) throw new Error('直连组件不可用：welnptice.exe 接口缺失')
 
   try {

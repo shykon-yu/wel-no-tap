@@ -385,9 +385,11 @@ if ($enabled -eq $false) {
 `, 6000)
     return /(^|\r?\n)READY(\r?\n|$)/.test(state) ? adapter : null
   } catch {
-    // A failed health query is not proof that the GUID is usable. Let the
-    // caller try another TAP candidate instead of handing a broken device to n2n.
-    return null
+    // tapctl already identified this GUID as a TAP device. Older Windows
+    // installations may deny WMI access or omit ConfigManagerErrorCode; that
+    // observation alone is not proof that the adapter is unusable. Let n2n
+    // validate the device and use the existing retry path if it really fails.
+    return adapter
   }
 }
 
@@ -461,10 +463,30 @@ async function prepare(excludedGuids = new Set(), repairState = { freshCreated: 
   return { ...current, adapterReady: true, ...installed }
 }
 
+function powershellLiteral(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'"
+}
+
+async function installBundledTapDriverElevated(installer) {
+  const script = `$path=${powershellLiteral(installer)}; ` +
+    `try { Unblock-File -LiteralPath $path -ErrorAction SilentlyContinue } catch {}; ` +
+    `$p=Start-Process -FilePath $path -ArgumentList '/S' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; ` +
+    `if ($null -eq $p) { exit 1 }; if (@(0,1641,3010) -notcontains [int]$p.ExitCode) { exit ([int]$p.ExitCode) }`
+  await runPowerShell(script, 60000)
+}
+
 function installBundledTapDriver(installer) {
   return new Promise((resolve, reject) => {
     const child = spawn(installer, ['/S'], { windowsHide: true })
-    child.once('error', reject)
+    child.once('error', async (error) => {
+      if (!['EACCES', 'EPERM'].includes(String(error?.code || ''))) return reject(error)
+      try {
+        await installBundledTapDriverElevated(installer)
+        resolve()
+      } catch (e) {
+        reject(new Error(`网卡驱动安装器无法运行：${e?.message || error.message}`))
+      }
+    })
     child.once('close', (code) => {
       if ([0, 1641, 3010].includes(Number(code))) resolve()
       else reject(new Error(`网卡驱动安装失败（代码 ${code ?? '未知'}）`))

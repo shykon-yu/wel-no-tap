@@ -1,6 +1,6 @@
 # WEL 无虚拟网卡网络架构与实测基准
 
-> 更新日期：2026-08-18
+> 更新日期：2026-09-10
 > 适用仓库：`wel-no-tap`
 > 当前阶段：轻量 WNP3 数据面已完成搜索、加入、开赛和直连/中继回退；P2P 使用 libjuice ICE，当前每场使用全新 agent 并保留 A/B 预热切换逻辑
 > 现网关系：本项目独立于 `welopenvpn-clean`，不会替换或改动当前 TAP/n2n 平台
@@ -399,7 +399,7 @@ systemd：welnpt-notap-relay.service
 
 ```text
 Git commit：f1736c3（架构基准）
-Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.54）
+Windows 工件：WEL对战平台-安装包（客户端 package.json v0.0.55）
 Linux 工件：WEL无网卡云中继-P2-linux-x64
 ```
 
