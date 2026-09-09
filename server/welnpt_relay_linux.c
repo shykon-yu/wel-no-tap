@@ -56,6 +56,16 @@ static int same_room(const char left[WELNPT_ROOM_LENGTH], const char right[WELNP
     return memcmp(left, right, WELNPT_ROOM_LENGTH) == 0;
 }
 
+static int valid_route_fields(const welnpt_packet_header *header) {
+    uint8_t allowed_flags = WELNPT_FLAG_BROADCAST;
+    if (header->source_ip == 0 || header->source_port == 0) return 0;
+    if ((header->flags & (uint8_t)~allowed_flags) != 0 || header->reserved != 0) return 0;
+    if (header->type == WELNPT_PACKET_DATA &&
+        (header->target_ip == 0 || header->target_port == 0) &&
+        (header->flags & WELNPT_FLAG_BROADCAST) == 0) return 0;
+    return 1;
+}
+
 static relay_peer *upsert_peer_in(relay_peer peers[WELNPT_MAX_PEERS],
     const welnpt_packet_header *header, const struct sockaddr_in *endpoint, uint64_t now) {
     relay_peer *free_peer = NULL;
@@ -238,7 +248,7 @@ int main(int argc, char **argv) {
         }
         header = (welnpt_packet_header *)packet;
         payload_length = ntohs(header->payload_length);
-        if (!welnpt_valid_header(header) || payload_length > WELNPT_MAX_PAYLOAD ||
+        if (!welnpt_valid_header(header) || !valid_route_fields(header) || payload_length > WELNPT_MAX_PAYLOAD ||
             received != (ssize_t)(sizeof(*header) + payload_length)) {
             ++g_stats.malformed_drops;
             continue;

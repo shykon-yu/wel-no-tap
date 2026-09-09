@@ -4,7 +4,7 @@
 >
 > 用途：新服务器上线、迁移服务器或灾难恢复时按本文执行。
 >
-> 最后更新：2026-08-19，客户端基线：`v0.0.46`
+> 最后更新：2026-09-09，客户端基线：`v0.0.53`
 
 本文是操作手册，不是架构设计。开始前先阅读
 [`NO_TAP_DEPLOYMENT_ZH.md`](NO_TAP_DEPLOYMENT_ZH.md) 了解组件边界。
@@ -62,8 +62,9 @@ TLS 证书及私钥来源：
 现有 Nginx 配置位置：
 ```
 
-`WEL_NOTAP_RELAY_TOKEN` 必须同时写入 Go API 和 relay 的 systemd 环境文件；两边任一
-字符不同都会导致进房间后无法通信。该密钥不得写进客户端，也不得写入日志。
+当前 relay 数据面不执行每包 token/HMAC 校验；`WEL_NOTAP_RELAY_TOKEN` 仅用于 Go
+控制面租约配置。不要把它写入固定客户端或日志。若以后恢复数据面认证，需同步更新
+客户端、relay 和部署步骤。
 
 ### 2.2 备份
 
@@ -171,7 +172,7 @@ SOCCER_AUTH_URL=http://<laravel internal endpoint>/api/v1/auth/platform-login
 
 WEL_NOTAP_RELAY_HOST=<new public IP or DNS name>
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=<same relay token>
+WEL_NOTAP_RELAY_TOKEN=<Go 控制面租约值；当前不参与 WNP3 数据包认证>
 WEL_NOTAP_ICE_STUN_HOST=<new public IP or DNS name>
 WEL_NOTAP_ICE_STUN_PORT=3478
 ```
@@ -190,7 +191,7 @@ SELECT version, applied_at
 FROM platform_schema_migrations ORDER BY applied_at;
 ```
 
-应能看到 `notap-01`、`notap-02`（直连）和 `notap-03`、`notap-04`（中继）。
+应能看到 `notap-01/02`（直连）、`notap-03/04`（中继）和 `notap-05/06`（网卡）。
 
 ### 5.2 API 与反向代理验收
 
@@ -221,18 +222,16 @@ git checkout <approved-commit-or-tag>
 ./scripts/build-linux-relay.sh
 ```
 
-安装 systemd 服务。以下命令是可重复执行的；替换 `<relay-token>`，不要把真实值放进
-shell 历史或文档：
+安装 systemd 服务。以下命令是可重复执行的；relay 仅需监听端口，控制面 token 单独
+配置在 Go API 环境中：
 
 ```bash
 sudo useradd --system --home-dir /opt/welnpt-notap --shell /sbin/nologin welnpt 2>/dev/null || true
 sudo install -d -o root -g root -m 0755 /opt/welnpt-notap
 sudo install -m 0755 build/linux-x64/welnpt-relay /opt/welnpt-notap/welnpt-relay
 sudo install -m 0644 deploy/systemd/welnpt-notap-relay.service /etc/systemd/system/welnpt-notap-relay.service
-sudo install -m 0600 /dev/null /etc/welnpt-notap.env
-read -rsp '请输入 relay token: ' RELAY_TOKEN; echo
-sudo env RELAY_TOKEN="$RELAY_TOKEN" sh -c 'printf "WEL_NOTAP_PORT=22333\nWEL_NOTAP_TOKEN=%s\n" "$RELAY_TOKEN" > /etc/welnpt-notap.env'
-unset RELAY_TOKEN
+sudo sh -c 'printf "WEL_NOTAP_PORT=22333\n" > /etc/welnpt-notap.env'
+sudo chmod 0600 /etc/welnpt-notap.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now welnpt-notap-relay
 ```
@@ -245,8 +244,8 @@ sudo ss -lunp | grep ':22333'
 sudo journalctl -u welnpt-notap-relay -n 100 --no-pager
 ```
 
-期望日志包含 `listening=0.0.0.0:22333/udp`。relay 每 60 秒输出活动玩家与收发包、
-鉴权失败、畸形包和无路由包计数。
+期望日志包含 `listening=0.0.0.0:22333/udp`。relay 每 60 秒输出活动玩家、收发包、
+畸形包和无路由包计数。
 
 ## 7. 部署 STUN
 

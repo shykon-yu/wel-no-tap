@@ -9,7 +9,10 @@ const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'A
 const logDirectory = path.join(appData, 'logs')
 const localConfig = loadConfig().values
 const diagnosticLogEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_DIAGNOSTIC_LOG || 'false'))
-const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'true'))
+// Port mapping is optional and can be enabled for targeted NAT diagnostics.
+// Keep it off by default so entering a room/prewarming an agent never waits
+// on a router's UPnP/NAT-PMP/PCP implementation.
+const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'false'))
 
 let lastProcess = null
 let iceProcess = null

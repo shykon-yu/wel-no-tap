@@ -21,7 +21,7 @@ export type RuntimeConfig = {
 }
 
 const fallback: RuntimeConfig = {
-  appVersion: '0.0.52',
+  appVersion: '0.0.53',
   platformName: 'WEL对战平台',
   platformShortName: 'WEL',
   gameName: 'WE8',
@@ -38,7 +38,7 @@ const fallback: RuntimeConfig = {
   apiRoomIcePath: '/notap/rooms/{roomId}/ice',
   apiRoomPeerProbesPath: '/notap/rooms/{roomId}/peer-probes',
   diagnosticLog: 'false',
-  upnp: 'true',
+  upnp: 'false',
 }
 
 export const runtimeConfig: RuntimeConfig = { ...fallback, ...(window.welNoTapConfig ?? {}) }

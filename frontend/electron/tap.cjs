@@ -26,6 +26,7 @@ const NETWORK_CONNECTIONS_KEY = 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Netwo
 
 let connection = null
 let preparedTap = null
+let manualRoomRoute = null
 
 function runtimeCandidates() {
   const resources = process.resourcesPath || ''
@@ -548,12 +549,27 @@ async function ensureRoomRoute(subnetCidr, tapIP, interfaceIndex) {
   const args = [network, 'mask', mask, tapIP, 'metric', '1', 'if', String(ifIndex)]
   try {
     await runProcess('route', ['change', ...args], 5000)
+    return { network, mask, ifIndex, added: false }
   } catch {
     try {
       await runProcess('route', ['add', ...args], 5000)
+      manualRoomRoute = { network, mask, ifIndex }
+      return { network, mask, ifIndex, added: true }
     } catch {
       // 路由修正失败不阻塞已建立的 n2n 连接，保持原有行为
     }
+  }
+  return null
+}
+
+async function removeRoomRoute() {
+  const route = manualRoomRoute
+  manualRoomRoute = null
+  if (process.platform !== 'win32' || !route) return
+  try {
+    await runProcess('route', ['delete', route.network, 'mask', route.mask, 'if', String(route.ifIndex)], 5000)
+  } catch {
+    // Best effort: Windows may remove the route automatically with the adapter.
   }
 }
 
@@ -607,7 +623,10 @@ function waitForProcessExit(process, timeoutMs) {
 }
 
 async function stopConnection() {
-  if (!connection) return
+  if (!connection) {
+    await removeRoomRoute()
+    return
+  }
   const current = connection
   connection = null
   try {
@@ -615,6 +634,7 @@ async function stopConnection() {
     const exited = await waitForProcessExit(current.process, STOP_TIMEOUT_MS)
     if (!exited) try { current.process.kill('SIGKILL') } catch {}
   } finally {
+    await removeRoomRoute()
     removeFiles(current.temporaryFiles)
   }
 }
@@ -992,6 +1012,7 @@ module.exports = {
   buildEdgeArgs,
   connect,
   ensureRoomRoute,
+  removeRoomRoute,
   isWelTapAdapter,
   isRetryableConnectError,
   n2nCommunity,

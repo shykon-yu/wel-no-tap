@@ -72,6 +72,7 @@ const pingingMemberIds = ref<Set<number>>(new Set())
 let activeGamePeerIp = ''
 let activeGamePeerTransaction = ''
 let activeGamePeerAgentUsed = false
+let directGameEnabled = false
 let gamePeerEpoch = 0
 let roomPreparationEpoch = 0
 let roomPreparationTask: Promise<'ready' | 'relay-only'> | null = null
@@ -134,6 +135,7 @@ function clearRoomSessionState() {
   activeGamePeerIp = ''
   activeGamePeerTransaction = ''
   activeGamePeerAgentUsed = false
+  directGameEnabled = false
   gamePeerEpoch = 0
   gamePeerOperation = Promise.resolve(true)
   roomPreparationEpoch += 1
@@ -308,14 +310,16 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
     }
     directCandidateStatus.value = 'relay-only'
     directCandidateMessage.value = '未发现可用直连候选'
-    throw new Error('welnptice.exe 未返回可用 candidate')
+    return 'relay-only'
   } catch (error) {
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
     directCandidateStatus.value = 'relay-only'
     directCandidateMessage.value = '直连候选暂未就绪，当前使用中继'
     notice.value = `已进入房间，${directCandidateMessage.value}`
     console.warn('直连组件准备失败', messageOf(error))
-    throw new Error(`直连组件准备失败：${messageOf(error)}`)
+    // ICE is an optimization. Keep the lease and allow the game to use the
+    // already available relay path when candidate collection is unavailable.
+    return 'relay-only'
   }
 }
 
@@ -353,7 +357,10 @@ async function joinRoom(room: Room) {
       roomPreparing.value = true
       roomPreparationMessage.value = '直连组件准备中，请稍候'
       const result = await roomPreparationTask
-      if (result !== 'ready') throw new Error('直连候选未收集完成，未进入直连房间')
+      if (result !== 'ready') {
+        directCandidateStatus.value = 'relay-only'
+        directCandidateMessage.value = '直连候选未就绪，当前使用中继'
+      }
     }
     startLeaseHeartbeat()
     startRoomMembersMonitor()
@@ -463,22 +470,33 @@ async function launchGameNow() {
     activeGamePeerIp = ''
     activeGamePeerTransaction = ''
     activeGamePeerAgentUsed = false
+    directGameEnabled = false
     gamePeerEpoch += 1
     gamePeerOperation = Promise.resolve(true)
-    if (activeLease.value.connection_mode === 'direct' && desktop()?.prepareGameIce) {
-      const ice = await desktop()!.prepareGameIce()
-      localIceDescription.value = ice.localDescription
+    let useDirect = activeLease.value.connection_mode === 'direct'
+    if (useDirect && desktop()?.prepareGameIce) {
+      try {
+        const ice = await desktop()!.prepareGameIce()
+        localIceDescription.value = ice.localDescription
+      } catch (error) {
+        useDirect = false
+        warningMessage.value = `直连组件未就绪，本场使用云中继：${messageOf(error)}`
+      }
     }
+    directGameEnabled = useDirect
     const result = await desktop()!.launchGame({
       gamePath: gamePath.value,
       relay: `${activeLease.value.relay_host}:${activeLease.value.relay_port}`,
       room: activeLease.value.community,
       logicalIp: activeLease.value.logical_ip || activeLease.value.virtual_ip,
       token: activeLease.value.relay_token,
-      direct: activeLease.value.connection_mode === 'direct',
+      direct: useDirect,
       mode: activeLease.value.connection_mode,
     })
     const warnings = [...(result.warnings || [])]
+    if (!useDirect && activeLease.value.connection_mode === 'direct') {
+      warnings.push('直连组件未就绪，本场使用云中继')
+    }
     warningMessage.value = [...new Set(warnings)].join('\n')
     notice.value = result.detail.includes('injection=apc') ? '已启动 WE8（APC 兼容模式）' : '已启动 WE8'
     gameTransportSummary.value = '连接中'
@@ -597,7 +615,7 @@ async function waitForIncomingGameProbe(roomID: number, requesterUserID: number,
 
 async function configureGamePeerOnce(logicalIp: string, transactionKey: string, epoch: number) {
   const lease = activeLease.value
-  if (!lease || lease.connection_mode !== 'direct' || !desktop()?.configureIce || !desktop()?.resetIce || !user.value) return false
+  if (!directGameEnabled || !lease || lease.connection_mode !== 'direct' || !desktop()?.configureIce || !desktop()?.resetIce || !user.value) return false
   let member: RoomMember | undefined
   try {
     const current = await roomApi.members(lease.room_id)

@@ -1,4 +1,4 @@
-# P2 云中继旁路部署
+# WEL 无网卡直连 / 云中继部署
 
 完整的无网卡平台上线组件、Laravel/Go/Relay/STUN 依赖和验收顺序见：
 [`docs/NO_TAP_DEPLOYMENT_ZH.md`](../docs/NO_TAP_DEPLOYMENT_ZH.md)。
@@ -12,10 +12,10 @@
 |---|---:|---|
 | 现有 n2n supernode | `22222/UDP+TCP` | `weln2n-supernode.service` |
 | 现有平台 API/Nginx | `8082/80/443 TCP` | Docker/Nginx |
-| P2 无网卡中继 | `22333/UDP` | `welnpt-notap-relay.service` |
-| P2 ICE STUN | `3478/UDP` | `wel-stun.service` |
+| 无网卡中继（直连失败回退） | `22333/UDP` | `welnpt-notap-relay.service` |
+| ICE STUN | `3478/UDP` | `wel-stun.service` |
 
-部署 P2 时禁止重启 Docker、Nginx、OpenVPN 或 `weln2n-supernode`。
+部署无网卡服务时禁止重启 Docker、Nginx、OpenVPN 或 `weln2n-supernode`。
 
 ## 安装
 
@@ -25,25 +25,23 @@ sudo install -d -o root -g root -m 0755 /opt/welnpt-notap
 sudo install -m 0755 welnpt-relay /opt/welnpt-notap/welnpt-relay
 sudo install -m 0644 deploy/systemd/welnpt-notap-relay.service \
   /etc/systemd/system/welnpt-notap-relay.service
-sudo sh -c 'umask 077; openssl rand -hex 24 > /etc/welnpt-notap.token'
-sudo sh -c 'printf "WEL_NOTAP_PORT=22333\nWEL_NOTAP_TOKEN=%s\n" \
-  "$(cat /etc/welnpt-notap.token)" > /etc/welnpt-notap.env'
-sudo chmod 0600 /etc/welnpt-notap.env /etc/welnpt-notap.token
+sudo sh -c 'printf "WEL_NOTAP_PORT=22333\n" > /etc/welnpt-notap.env'
+sudo chmod 0600 /etc/welnpt-notap.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now welnpt-notap-relay
 ```
 
-Go API 同时配置同一公网中继地址和同一密钥：
+Go API 配置公网中继地址；当前 relay 数据面不执行逐包 token/HMAC 校验：
 
 ```env
 WEL_NOTAP_RELAY_HOST=8.155.145.132
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=<与控制面配置相同的值>
+WEL_NOTAP_RELAY_TOKEN=<Go 控制面租约值>
 ```
 
 这些变量只属于 Go API 的 No-TAP 控制器，不替换现有 TAP/n2n 房间配置。No-TAP
 使用独立的 `no_tap_rooms`、`no_tap_room_leases` 和 `10.122.1.0/24` 至
-`10.122.3.0/24`；TAP 客户端继续使用原有表和 `10.222.x.x`。
+`10.122.4.0/24`；网卡 05/06 使用 `10.222.5.0/24`、`10.222.6.0/24`。
 
 只开放新端口：
 
@@ -92,7 +90,7 @@ curl -fsS http://127.0.0.1:8082/healthz
 journalctl -u welnpt-notap-relay -n 50 --no-pager
 ```
 
-中继每 60 秒输出活动玩家、收发包、鉴权失败、畸形包和无路由包计数。
+中继每 60 秒输出活动玩家、收发包、畸形包和无路由包计数。
 
 ## 回滚
 

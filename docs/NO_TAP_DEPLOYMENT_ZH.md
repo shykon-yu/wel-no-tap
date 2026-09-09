@@ -4,8 +4,8 @@
 > [`NO_TAP_SERVER_RUNBOOK_ZH.md`](NO_TAP_SERVER_RUNBOOK_ZH.md) 逐步执行；本文保留架构、
 > 配置项与验收依据。
 
-> 适用版本：`wel-no-tap` 当前 P3 直连 + P2 云中继架构
-> 更新日期：2026-08-18
+> 适用版本：`wel-no-tap` 当前直连优先 + 云中继回退，并提供独立 TAP/n2n 房间
+> 更新日期：2026-09-09
 > 目标：明确 Laravel、Go、云中继、STUN、数据库和反向代理分别需要部署什么
 
 ## 1. 总体结构
@@ -39,7 +39,7 @@
 | Go `platform-api` | `platform/backend` | No-TAP 登录桥接、房间、租约、ICE SDP 和 Ping | 是 | `8080/TCP`，生产可配置为 `8082` |
 | MySQL | 平台基础设施 | Go 平台数据库和 `no_tap_*` 表 | 是 | `3306/TCP`，不应公网开放 |
 | Redis | 平台基础设施 | Go JWT 会话/在线状态依赖 | 是 | `6379/TCP`，不应公网开放 |
-| `welnpt-notap-relay` | `wel-no-tap/server` | 鉴权 UDP 中继，搜索广播和比赛回退 | 是 | `22333/UDP` |
+| `welnpt-notap-relay` | `wel-no-tap/server` | 无网卡 UDP 中继，搜索广播和比赛回退 | 直连/中继房间必需 | `22333/UDP` |
 | `wel-stun` / coturn | `wel-no-tap/deploy` | STUN candidate 收集和 ICE 探测 | 推荐 | `3478/UDP` |
 | Nginx/HTTPS | 现有部署 | Laravel 和 Go API 的域名、TLS、反向代理 | 推荐 | `80/443 TCP` |
 | TAP/n2n supernode | 现有 TAP 平台 | 只服务有虚拟网卡版本 | 无网卡不依赖 | `22222/UDP` |
@@ -95,7 +95,7 @@ SOCCER_AUTH_URL=https://api.example.com/api/v1/auth/platform-login
 
 WEL_NOTAP_RELAY_HOST=relay.example.com
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=与中继服务完全相同的随机密钥
+WEL_NOTAP_RELAY_TOKEN=Go 控制面租约使用的随机值（不参与 WNP3 数据包认证）
 
 WEL_NOTAP_ICE_STUN_HOST=stun.example.com
 WEL_NOTAP_ICE_STUN_PORT=3478
@@ -130,11 +130,11 @@ no_tap_peer_probes
 中继 03 -> 10.122.3.0/24
 中继 04 -> 10.122.4.0/24
 
-`connection_mode=direct` 的房间进入时必须完成本机 ICE candidate 发布；
+`connection_mode=direct` 的房间进入时会尝试完成本机 ICE candidate 发布；失败时仍可进入并使用中继；
 `connection_mode=relay` 的房间完全跳过 ICE，适合无法使用直连组件的玩家。
 ```
 
-迁移前必须备份 `pes8_platform`。第一次启动后检查 `no_tap_rooms` 有 4 条记录，
+迁移前必须备份 `pes8_platform`。第一次启动后检查 `no_tap_rooms` 有 6 条记录，
 并确认 `platform_schema_migrations` 已记录：
 
 ```text
@@ -142,6 +142,11 @@ no_tap_peer_probes
 20260815_add_no_tap_ice_description
 20260816_rename_no_tap_room_labels
 20260816_add_no_tap_peer_probes
+20260817_add_no_tap_game_probe_fields
+20260818_add_no_tap_room_modes
+20260818_add_no_tap_room_04
+20260908_add_no_tap_tap_rooms
+20260909_set_no_tap_room_layout
 ```
 
 ### 4.3 Go API 路由
@@ -200,16 +205,15 @@ deploy/welnpt-notap.env.example
 sudo useradd --system --home-dir /opt/welnpt-notap --shell /sbin/nologin welnpt
 sudo install -d -m 0755 /opt/welnpt-notap
 sudo install -m 0755 welnpt-relay /opt/welnpt-notap/welnpt-relay
-sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/welnpt-notap.token'
-sudo sh -c 'printf "WEL_NOTAP_PORT=22333\nWEL_NOTAP_TOKEN=%s\n" "$(cat /etc/welnpt-notap.token)" > /etc/welnpt-notap.env'
-sudo chmod 0600 /etc/welnpt-notap.env /etc/welnpt-notap.token
+sudo sh -c 'printf "WEL_NOTAP_PORT=22333\n" > /etc/welnpt-notap.env'
+sudo chmod 0600 /etc/welnpt-notap.env
 sudo install -m 0644 deploy/systemd/welnpt-notap-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now welnpt-notap-relay
 ```
 
-Go API 的 `WEL_NOTAP_RELAY_TOKEN` 必须和中继的 `WEL_NOTAP_TOKEN` 完全相同。密钥
-不放进客户端，不写入客户端 JSONL 日志，不提交 Git。
+当前 relay 数据面不执行每包 token/HMAC 校验；该值仅用于 Go 控制面租约配置，不放进
+固定客户端、不写入客户端 JSONL 日志、不提交 Git。
 
 ### 5.2 中继功能边界
 
@@ -327,7 +331,7 @@ WEL_API_BASE_URL=https://api.example.com:8082/api/v1
 - 按真实比赛对手锁定 ICE，而不是选房间第一个成员。
 - Ping 使用临时 pair-specific ICE，不污染比赛通道。
 - 直连成功后显示 `当前联机：P2P 直连`，失败时保留 `云中继`。
-- 非管理员启动 WE8 的 UAC 流程不会等待游戏退出；当前版本是 `v0.0.40`。
+- 非管理员启动 WE8 的 UAC 流程不会等待游戏退出；当前版本是 `v0.0.53`。
 
 ## 9. 上线顺序
 
@@ -343,7 +347,7 @@ WEL_API_BASE_URL=https://api.example.com:8082/api/v1
 8. 配置阿里云安全组和服务器防火墙。
 9. 修改客户端 `wel-no-tap.env`，先用两台电脑进入同一个 No-TAP 房间。
 10. 验证登录、IP 分配、搜索、加入、10 分钟比赛、直连状态和中继回退。
-11. 再开放更多玩家，观察 relay 包数、鉴权失败、路由失败和数据库租约数。
+11. 再开放更多玩家，观察 relay 包数、畸形包、路由失败和数据库租约数。
 
 ## 10. 验收命令
 

@@ -17,7 +17,7 @@ const defaults = {
   WEL_API_ROOM_ICE_PATH: '/notap/rooms/{roomId}/ice',
   WEL_API_ROOM_PEER_PROBES_PATH: '/notap/rooms/{roomId}/peer-probes',
   WEL_NOTAP_DIAGNOSTIC_LOG: 'false',
-  WEL_NOTAP_UPNP: 'true',
+  WEL_NOTAP_UPNP: 'false',
   WEL_GAME_NAME: 'WE8',
 }
 
