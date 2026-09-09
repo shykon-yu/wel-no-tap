@@ -785,7 +785,7 @@ Windows 客户端的比赛会话日志默认在：
 4. 是否出现 `direct-state: connected/completed`。
 5. 比赛单播是否出现 `path:"direct"`，还是只有 `path:"relay"`。
 6. `failed` 是否发生在玩家退出或最后一个数据包之后。
-7. 中继端是否增加 `auth_drops`、`malformed_drops`、`route_drops`。
+7. 中继端是否增加 `malformed_drops`、`route_drops`。
 
 “候选已就绪”“中继服务器 Ping 通”“最后一行 failed”都不能单独证明比赛
 线路。必须把 Hook 日志、ICE 状态和实际游戏单播合并判断。

@@ -75,17 +75,17 @@ jobs:
           )
           Invoke-Compiler 'virtual socket DLL' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib', 'Bcrypt.lib'
+            '/LD', 'native/welnpt_hook.c', "/Fe:$output/welnpt.dll", '/link', 'Ws2_32.lib', 'Psapi.lib'
           )
           Invoke-Compiler 'external Host transport' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            'native/welnpt_host.c', "/Fe:$output/welnpthost.exe", '/link', 'Ws2_32.lib', 'Bcrypt.lib'
+            'native/welnpt_host.c', "/Fe:$output/welnpthost.exe", '/link', 'Ws2_32.lib'
           )
           & "$output/welnpthost.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'external Host self-test failed' }
           Invoke-Compiler 'UDP relay' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib', 'Bcrypt.lib'
+            'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib'
           )
           & "$output/welnptrelay.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'relay self-test failed' }
@@ -114,7 +114,7 @@ jobs:
           Invoke-Compiler 'libjuice ICE helper' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             '/Ithird_party/libjuice/include', 'native/welnpt_ice.c', "/Fe:$output/welnptice.exe",
-            '/link', 'Ws2_32.lib', 'Iphlpapi.lib', 'Bcrypt.lib', "$output/juice-static.lib"
+            '/link', 'Ws2_32.lib', 'Iphlpapi.lib', "$output/juice-static.lib"
           )
           & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --hook-port 49000 --ice-port 49001 --validate-args
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper argument validation failed' }
@@ -176,7 +176,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Build and self-test authenticated Linux relay
+      - name: Build and self-test Linux relay
         run: ./scripts/build-linux-relay.sh
       - name: Upload Linux relay
         uses: actions/upload-artifact@v4
