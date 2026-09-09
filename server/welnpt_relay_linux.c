@@ -58,11 +58,14 @@ static int same_room(const char left[WELNPT_ROOM_LENGTH], const char right[WELNP
 
 static int valid_route_fields(const welnpt_packet_header *header) {
     uint8_t allowed_flags = WELNPT_FLAG_BROADCAST;
-    if (header->source_ip == 0 || header->source_port == 0) return 0;
+    // REGISTER and server/peer PING packets intentionally have zero ports;
+    // only DATA packets need a complete logical socket route.
+    if (header->source_ip == 0) return 0;
     if ((header->flags & (uint8_t)~allowed_flags) != 0 || header->reserved != 0) return 0;
-    if (header->type == WELNPT_PACKET_DATA &&
-        (header->target_ip == 0 || header->target_port == 0) &&
-        (header->flags & WELNPT_FLAG_BROADCAST) == 0) return 0;
+    if (header->type == WELNPT_PACKET_DATA) {
+        if (header->flags & WELNPT_FLAG_BROADCAST) return 1;
+        if (header->target_ip == 0 || header->target_port == 0 || header->source_port == 0) return 0;
+    }
     return 1;
 }
 
