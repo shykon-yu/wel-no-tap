@@ -9,7 +9,6 @@
 #include <string.h>
 
 #include "welnpt_protocol.h"
-#include "welnpt_auth_windows.h"
 
 #define WEL_HOST_BUFFER_SIZE (sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD)
 #define WEL_HOST_DECISION_WINDOW_MS 5000
@@ -27,7 +26,6 @@ static int g_hook_known;
 static unsigned short g_agent_port;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
-static welnpt_auth_context g_auth;
 static volatile LONG g_stopping;
 static volatile LONG g_sequence;
 static LONG g_path = WEL_HOST_PATH_PENDING;
@@ -51,7 +49,6 @@ typedef enum wel_host_payload_kind {
     WEL_HOST_PAYLOAD_DATA = 0,
     WEL_HOST_PAYLOAD_JOIN,
     WEL_HOST_PAYLOAD_ACCEPT,
-    WEL_HOST_PAYLOAD_GAME,
     WEL_HOST_PAYLOAD_SEARCH,
 } wel_host_payload_kind;
 
@@ -99,7 +96,6 @@ static void signal_ready(void) {
 static wel_host_payload_kind classify_payload(const char *payload, int length) {
     static const unsigned char join_prefix[] = { 0xe7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     static const unsigned char accept_prefix[] = { 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00 };
-    static const unsigned char game_prefix[] = { 0xe7, 0x03, 0x02, 0x00 };
     if (payload == NULL || length < 0) return WEL_HOST_PAYLOAD_DATA;
     if (length == 64 && length >= (int)sizeof(join_prefix) && memcmp(payload, join_prefix, sizeof(join_prefix)) == 0) {
         return WEL_HOST_PAYLOAD_JOIN;
@@ -107,13 +103,17 @@ static wel_host_payload_kind classify_payload(const char *payload, int length) {
     if (length == 84 && length >= (int)sizeof(accept_prefix) && memcmp(payload, accept_prefix, sizeof(accept_prefix)) == 0) {
         return WEL_HOST_PAYLOAD_ACCEPT;
     }
-    if (length >= (int)sizeof(game_prefix) && memcmp(payload, game_prefix, sizeof(game_prefix)) == 0) {
-        return WEL_HOST_PAYLOAD_GAME;
-    }
     if (length == 24 && length >= (int)sizeof(join_prefix) && memcmp(payload, join_prefix, sizeof(join_prefix)) == 0) {
         return WEL_HOST_PAYLOAD_SEARCH;
     }
     return WEL_HOST_PAYLOAD_DATA;
+}
+
+/* Only join/accept/search packets affect the session state. Ordinary game
+ * datagrams stay on the fast path and do not need a payload prefix scan. */
+static wel_host_payload_kind classify_control_payload(const char *payload, int length) {
+    if (length != 24 && length != 64 && length != 84) return WEL_HOST_PAYLOAD_DATA;
+    return classify_payload(payload, length);
 }
 
 static void send_to_hook(const void *data, int length) {
@@ -208,7 +208,6 @@ static int send_wire_packet(const char *payload, int length, uint32_t target_ip,
     header->payload_length = htons((u_short)length);
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
-    if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) return SOCKET_ERROR;
     path = InterlockedCompareExchange(&g_path, 0, 0);
     if ((flags & WELNPT_FLAG_BROADCAST) == 0 && path == WEL_HOST_PATH_DIRECT &&
         InterlockedCompareExchange(&g_direct_connected, 0, 0) != 0 && target_ip == g_peer_ip && g_agent_port != 0) {
@@ -263,7 +262,7 @@ static void process_game_frame(const welnpt_host_frame *frame, const char *paylo
     unsigned short target_port;
     unsigned short join_port;
     if (frame == NULL) return;
-    kind = classify_payload(payload, (int)ntohs(frame->payload_length));
+    kind = classify_control_payload(payload, (int)ntohs(frame->payload_length));
     if ((frame->flags & WELNPT_FLAG_BROADCAST) != 0 && kind == WEL_HOST_PAYLOAD_SEARCH) reset_session();
     session_signal = (frame->flags & WELNPT_FLAG_BROADCAST) == 0 &&
         (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT);
@@ -290,9 +289,8 @@ static int process_wire_packet(char *packet, int received, int direct) {
         !same_room(header->room, g_room) ||
         (((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
         payload_length < 0 || payload_length > WELNPT_MAX_PAYLOAD ||
-        received != (int)sizeof(*header) + payload_length ||
-        !welnpt_auth_verify(&g_auth, packet, received)) return 0;
-    kind = classify_payload(packet + sizeof(*header), payload_length);
+        received != (int)sizeof(*header) + payload_length) return 0;
+    kind = classify_control_payload(packet + sizeof(*header), payload_length);
     if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 &&
         kind == WEL_HOST_PAYLOAD_SEARCH && header->source_ip == g_peer_ip) {
         reset_session();
@@ -359,7 +357,6 @@ static void process_ice_message(char *packet, int received) {
 static int initialize_configuration(unsigned short host_port) {
     char relay[256];
     char logical_ip[64];
-    char token[WELNPT_AUTH_SECRET_MAX];
     char service[16];
     char *separator;
     struct addrinfo hints;
@@ -369,14 +366,12 @@ static int initialize_configuration(unsigned short host_port) {
     WSADATA winsock;
     if (!env_text("WEL_NOTAP_RELAY", relay, sizeof(relay)) ||
         !env_text("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) ||
-        !env_text("WEL_NOTAP_ROOM", g_room, sizeof(g_room)) ||
-        !env_text("WEL_NOTAP_TOKEN", token, sizeof(token))) return 0;
+        !env_text("WEL_NOTAP_ROOM", g_room, sizeof(g_room))) return 0;
     separator = strrchr(relay, ':');
     if (separator == NULL || separator == relay || separator[1] == '\0') return 0;
     strcpy_s(service, sizeof(service), separator + 1);
     *separator = '\0';
-    if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1 || !welnpt_auth_initialize(&g_auth, token)) return 0;
-    SecureZeroMemory(token, sizeof(token));
+    if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 0;
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -395,7 +390,7 @@ static int initialize_configuration(unsigned short host_port) {
     ZeroMemory(&local, sizeof(local));
     local.sin_family = AF_INET;
     /* One transport socket serves both the local Hook/ICE control path and
-       the authenticated relay. Bind all interfaces so relay datagrams do not
+       the room relay. Bind all interfaces so relay datagrams do not
        leave with a 127.0.0.1 source address. Local callers still target the
        explicit loopback address in g_hook_address/g_agent_address. */
     local.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
@@ -413,10 +408,8 @@ static void send_presence(void) {
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
     CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
     header.source_ip = g_logical_ip;
-    if (welnpt_auth_sign(&g_auth, (char *)&header, sizeof(header))) {
-        sendto(g_socket, (const char *)&header, sizeof(header), 0,
-            (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
-    }
+    sendto(g_socket, (const char *)&header, sizeof(header), 0,
+        (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
 
 int main(int argc, char **argv) {
@@ -434,10 +427,7 @@ int main(int argc, char **argv) {
         header->payload_length = htons(4);
         CopyMemory(packet + sizeof(*header), "test", 4);
         welnpt_initialize_host_frame(&frame, WELNPT_HOST_FRAME_DATA);
-        if (sizeof(*header) != 74 || !welnpt_valid_header(header) || !welnpt_valid_host_frame(&frame) ||
-            !welnpt_auth_initialize(&g_auth, "local-test-token") ||
-            !welnpt_auth_sign(&g_auth, packet, sizeof(packet)) ||
-            !welnpt_auth_verify(&g_auth, packet, sizeof(packet))) return 1;
+        if (sizeof(*header) != 58 || !welnpt_valid_header(header) || !welnpt_valid_host_frame(&frame)) return 1;
         welnpt_initialize_host_frame(&frame, WELNPT_HOST_FRAME_CLOSE);
         frame.source_port = htons(49152);
         if (!welnpt_valid_host_frame(&frame)) return 1;
@@ -502,7 +492,7 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (received > 0 && received >= (int)sizeof(welnpt_packet_header) &&
-            memcmp(packet, "WNP2", 4) == 0) {
+            memcmp(packet, "WNP3", 4) == 0) {
             process_wire_packet(packet, received,
                 is_loopback(&source) && g_agent_port != 0 && ntohs(source.sin_port) == g_agent_port);
         } else if (received > 0 && is_loopback(&source)) {

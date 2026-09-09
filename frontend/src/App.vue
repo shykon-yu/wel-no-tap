@@ -29,16 +29,11 @@ const LEGACY_GAME_PATH_KEY = 'pes8.game-path'
 const gamePath = ref(localStorage.getItem(GAME_PATH_KEY) ?? localStorage.getItem(LEGACY_GAME_PATH_KEY) ?? '')
 const totalOnline = computed(() => rooms.value.reduce((total, room) => total + room.members, 0))
 const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => room.id === activeLease.value?.room_id) ?? null : null)
-const ROOM_LABELS: Record<number, string> = {
-  1: '直连01',
-  2: '直连02',
-  3: '中继03',
-  4: '中继04',
-  5: '网卡05',
-  6: '网卡06',
-}
-const roomLabel = (roomID: number, mode?: Room['connection_mode']) => ROOM_LABELS[roomID]
-  ?? `${mode === 'tap' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
+// Derive the label from the server's transport mode. Keeping the mode in the
+// label prevents stale room data from being presented as a different transport
+// (for example, a TAP lease shown as "直连01").
+const roomLabel = (roomID: number, mode?: Room['connection_mode']) =>
+  `${mode === 'tap' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
 const displayRoomName = (room: Room) => roomLabel(room.id, room.connection_mode)
 const activeRoomName = computed(() => activeRoom.value
   ? displayRoomName(activeRoom.value)

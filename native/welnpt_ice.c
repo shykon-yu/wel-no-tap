@@ -13,7 +13,6 @@
 #include <juice/juice.h>
 
 #include "welnpt_protocol.h"
-#include "welnpt_auth_windows.h"
 
 #define WEL_ICE_BUFFER_SIZE 8192
 #define WEL_ICE_CONTROL_PREFIX "WELICESTATE:"
@@ -30,7 +29,6 @@ static SOCKET g_relay_socket = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
-static welnpt_auth_context g_auth;
 static struct sockaddr_in g_hook_address;
 static volatile LONG g_stopping;
 static volatile LONG g_connected;
@@ -150,11 +148,10 @@ static void on_gathering_done(juice_agent_t *agent, void *user_ptr) {
 
 static void on_receive(juice_agent_t *agent, const char *data, size_t size, void *user_ptr) {
 	(void)user_ptr;
-	/* Game frames already contain the authenticated WNP2 envelope. Preserve
-	 * that envelope across the ICE process so the external Host can verify it,
-	 * apply the locked direct/relay path, and restore the original datagram. */
+	/* Preserve the WNP3 envelope across ICE so the Host can apply the locked
+	 * direct/relay path and restore the original datagram. */
 	if (size >= sizeof(welnpt_packet_header) &&
-		memcmp(data, "WNP2", 4) == 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		memcmp(data, "WNP3", 4) == 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, data, (int)size, 0,
 			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 		return;
@@ -232,8 +229,7 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 		}
 		if (received < (int)sizeof(welnpt_packet_header)) continue;
 		header = (welnpt_packet_header *)packet;
-		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
-			!welnpt_auth_verify(&g_auth, packet, received)) continue;
+		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0) continue;
 		if (header->type == WELNPT_PACKET_PING) {
 			/* 中继转发的 PING：目标是自己则回 PONG，发回中继由其转发给发起方 */
 			if (header->target_ip == g_logical_ip && g_relay_socket != INVALID_SOCKET) {
@@ -243,8 +239,7 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 				pong_header->type = WELNPT_PACKET_PONG;
 				pong_header->source_ip = g_logical_ip;
 				pong_header->target_ip = header->source_ip;
-				if (welnpt_auth_sign(&g_auth, pong, (size_t)received) &&
-					sendto(g_relay_socket, pong, (size_t)received, 0,
+				if (sendto(g_relay_socket, pong, (size_t)received, 0,
 						(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == received) {
 					/* 转发式 PING 已应答 */
 				}
@@ -314,7 +309,7 @@ static void send_relay_ping(const char *nonce) {
 	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
 	header->source_ip = g_logical_ip;
 	header->sequence = htonl((u_long)strtoul(nonce, NULL, 10));
-	if (!welnpt_auth_sign(&g_auth, packet, sizeof(packet)) || sendto(g_relay_socket, packet, sizeof(packet), 0,
+	if (sendto(g_relay_socket, packet, sizeof(packet), 0,
 		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
 		g_relay_ping_nonce[0] = '\0';
 		output_line("RELAY_PING_UNAVAILABLE %s", nonce);
@@ -337,7 +332,7 @@ static void send_relay_peer_ping(const char *nonce, uint32_t target_ip) {
 	header->source_ip = g_logical_ip;
 	header->target_ip = target_ip;
 	header->sequence = htonl((u_long)strtoul(nonce, NULL, 10));
-	if (!welnpt_auth_sign(&g_auth, packet, sizeof(packet)) || sendto(g_relay_socket, packet, sizeof(packet), 0,
+	if (sendto(g_relay_socket, packet, sizeof(packet), 0,
 		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
 		g_relay_peer_ping_nonce[0] = '\0';
 		output_line("RELAY_PEER_PING_UNAVAILABLE %s", nonce);
@@ -353,10 +348,8 @@ static void send_relay_presence(void) {
 	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
 	header->source_ip = g_logical_ip;
 	header->sequence = 0;
-	if (welnpt_auth_sign(&g_auth, packet, sizeof(packet))) {
-		sendto(g_relay_socket, packet, sizeof(packet), 0,
-			(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
-	}
+	sendto(g_relay_socket, packet, sizeof(packet), 0,
+		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
 
 static int parse_port(const char *value, unsigned short *port) {
@@ -370,7 +363,6 @@ static int parse_port(const char *value, unsigned short *port) {
 static int initialize_relay(void) {
 	char relay[256];
 	char logical_ip[64];
-	char token[WELNPT_AUTH_SECRET_MAX];
 	char service[16];
 	char *separator;
 	struct addrinfo hints;
@@ -378,14 +370,12 @@ static int initialize_relay(void) {
 	DWORD timeout = 250;
 	if (GetEnvironmentVariableA("WEL_NOTAP_RELAY", relay, sizeof(relay)) == 0 ||
 		GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0 ||
-		GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room)) == 0 ||
-		GetEnvironmentVariableA("WEL_NOTAP_TOKEN", token, sizeof(token)) == 0) return 0;
+		GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room)) == 0) return 0;
 	separator = strrchr(relay, ':');
 	if (separator == NULL || separator == relay || separator[1] == '\0') return 0;
 	strcpy_s(service, sizeof(service), separator + 1);
 	*separator = '\0';
-	if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1 || !welnpt_auth_initialize(&g_auth, token)) return 0;
-	SecureZeroMemory(token, sizeof(token));
+	if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
 	ZeroMemory(&hints, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_DGRAM;

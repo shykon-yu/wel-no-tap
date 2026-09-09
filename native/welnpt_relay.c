@@ -9,7 +9,6 @@
 #include <wchar.h>
 
 #include "welnpt_protocol.h"
-#include "welnpt_auth_windows.h"
 
 #define WELNPT_DEFAULT_RELAY_PORT 22333
 #define WELNPT_MAX_PEERS 256
@@ -24,7 +23,6 @@ typedef struct relay_peer {
 } relay_peer;
 
 static relay_peer g_peers[WELNPT_MAX_PEERS];
-static welnpt_auth_context g_auth;
 
 static int same_room(const char left[WELNPT_ROOM_LENGTH], const char right[WELNPT_ROOM_LENGTH]) {
     return memcmp(left, right, WELNPT_ROOM_LENGTH) == 0;
@@ -102,12 +100,7 @@ static int self_test(void) {
     welnpt_initialize_header(header, WELNPT_PACKET_DATA);
     header->payload_length = htons(4);
     CopyMemory(packet + sizeof(*header), "test", 4);
-    if (sizeof(*header) != 74 || !welnpt_valid_header(header) ||
-        !welnpt_auth_initialize(&g_auth, "local-test-token") ||
-        !welnpt_auth_sign(&g_auth, packet, sizeof(packet)) ||
-        !welnpt_auth_verify(&g_auth, packet, sizeof(packet))) return 1;
-    packet[sizeof(*header)] ^= 1;
-    if (welnpt_auth_verify(&g_auth, packet, sizeof(packet))) return 1;
+    if (sizeof(*header) != 58 || !welnpt_valid_header(header)) return 1;
     puts("SELF-TEST OK");
     return 0;
 }
@@ -119,7 +112,6 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t *end = NULL;
     unsigned long parsed_port = WELNPT_DEFAULT_RELAY_PORT;
     char packet[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
-    char token[WELNPT_AUTH_SECRET_MAX];
 
     if (argc > 1 && wcscmp(argv[1], L"--self-test") == 0) return self_test();
     if (argc > 1) {
@@ -129,12 +121,6 @@ int wmain(int argc, wchar_t **argv) {
             return 2;
         }
     }
-    if (GetEnvironmentVariableA("WEL_NOTAP_TOKEN", token, sizeof(token)) == 0 ||
-        !welnpt_auth_initialize(&g_auth, token)) {
-        fputs("WEL_NOTAP_TOKEN must contain at least 8 characters\n", stderr);
-        return 3;
-    }
-    SecureZeroMemory(token, sizeof(token));
     if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) return 3;
     socket_handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_handle == INVALID_SOCKET) {
@@ -170,7 +156,6 @@ int wmain(int argc, wchar_t **argv) {
         payload_length = (unsigned)ntohs(header->payload_length);
         if (payload_length > WELNPT_MAX_PAYLOAD ||
             received != (int)(sizeof(welnpt_packet_header) + payload_length)) continue;
-        if (!welnpt_auth_verify(&g_auth, packet, received)) continue;
         peer = upsert_peer(header, &source);
         if (peer == NULL) continue;
         if (header->type == WELNPT_PACKET_REGISTER) {
@@ -185,9 +170,7 @@ int wmain(int argc, wchar_t **argv) {
             forward_data(socket_handle, packet, received, header);
         } else if (header->type == WELNPT_PACKET_PING) {
             header->type = WELNPT_PACKET_PONG;
-            if (welnpt_auth_sign(&g_auth, packet, received)) {
-                sendto(socket_handle, packet, received, 0, (const struct sockaddr *)&source, sizeof(source));
-            }
+            sendto(socket_handle, packet, received, 0, (const struct sockaddr *)&source, sizeof(source));
         }
     }
 }

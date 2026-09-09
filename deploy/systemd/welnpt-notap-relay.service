@@ -1,5 +1,5 @@
 [Unit]
-Description=WEL no-TAP authenticated UDP relay
+Description=WEL no-TAP UDP relay
 After=network-online.target
 Wants=network-online.target
 

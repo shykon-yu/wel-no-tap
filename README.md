@@ -8,7 +8,7 @@ system routes. It does not modify the current production client in
 ## Current Status
 
 `P3 - libjuice ICE direct path with relay fallback` is integrated and verified in
-the real game path. P2 authenticated cloud relay remains the default reliability
+the real game path. The cloud relay remains the default reliability
 fallback. P1 completed a real
 two-computer WE8 match without a virtual adapter: all overlapping packets
 and bytes matched in both directions, and the Hook reported zero queue drops.
@@ -28,9 +28,9 @@ The data path is:
 ```text
 WE8.exe
   -> welnpt.dll lightweight loopback Socket shim
-  -> welnpthost.exe (WNP2 framing, HMAC, session/path state)
-  -> libjuice ICE direct UDP after connectivity checks, or authenticated
-     Linux/Windows room relay on UDP 22333
+  -> welnpthost.exe (WNP3 framing, session/path state)
+  -> libjuice ICE direct UDP after connectivity checks, or Linux/Windows
+     room relay on UDP 22333
   -> peer welnpt.dll
   -> peer WE8.exe recvfrom queue
 ```
@@ -38,13 +38,14 @@ WE8.exe
 The Hook virtualizes `socket`, `bind`, `getsockname`, `sendto`, `recvfrom`,
 `WSASendTo`, `WSARecvFrom`, and `closesocket`. In Host mode each game Socket
 gets one nonblocking loopback Socket. The Hook only builds a small local frame
-and reads the corresponding loopback datagram; WNP2/HMAC, broadcast fan-out,
+and reads the corresponding loopback datagram; WNP3 framing, broadcast fan-out,
 ICE path selection, and session state stay in `welnpthost.exe`. If the Host is
 not supplied, the original in-process transport remains available as a
 compatibility fallback. Empty nonblocking reads return `WSAEWOULDBLOCK (10035)`.
 
-Protocol v2 authenticates every registration and game packet with a truncated
-HMAC-SHA256 tag. The test token is never written to the JSONL game log.
+Protocol v3 uses a compact 58-byte header. Game packets do not carry per-packet
+HMAC: Host and relay retain strict magic/version/room/target/length checks.
+This is an intentional performance trade-off for the small closed player group.
 
 ## Build on Windows
 
@@ -152,11 +153,12 @@ embed that secret: the Go API authenticates the Laravel account and returns
 the room credential for the current lease. The relay secret is still shared
 by the No-TAP deployment and should be rotated as an operational secret.
 
-The current protocol does not encrypt WE8 payloads. Production hardening should
+The current protocol does not encrypt or per-packet authenticate WE8 payloads.
+Production hardening should
 add per-player credentials, replay protection, and rate limits. P2P is an
 optimization only: search broadcasts remain on the relay, and unicast game
 packets switch to direct only after libjuice reports `connected` or `completed`.
-Any failed direct check automatically keeps the authenticated relay path.
+Any failed direct check automatically keeps the relay path.
 
 Detailed design and the confirmed WE8 Socket timeline are in
 [`docs/NO_TAP_ARCHITECTURE_ZH.md`](docs/NO_TAP_ARCHITECTURE_ZH.md).

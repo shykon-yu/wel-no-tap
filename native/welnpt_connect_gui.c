@@ -417,7 +417,7 @@ static DWORD WINAPI launch_thread(LPVOID parameter) {
     SetEnvironmentVariableW(L"WEL_NOTAP_RELAY", context->relay);
     SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", context->room);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", context->logical_ip);
-    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", context->token);
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", context->log_path);
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
     command_line = quoted(context->game_path);

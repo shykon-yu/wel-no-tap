@@ -38,7 +38,7 @@ Go API 同时配置同一公网中继地址和同一密钥：
 ```env
 WEL_NOTAP_RELAY_HOST=8.155.145.132
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=<与 WEL_NOTAP_TOKEN 相同的值>
+WEL_NOTAP_RELAY_TOKEN=<与控制面配置相同的值>
 ```
 
 这些变量只属于 Go API 的 No-TAP 控制器，不替换现有 TAP/n2n 房间配置。No-TAP

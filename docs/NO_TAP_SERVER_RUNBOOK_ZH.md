@@ -84,18 +84,18 @@ relay `/etc/welnpt-notap.env`，以及当前客户端 `wel-no-tap.env`。不要�
 ## 3. 新服务器基础准备
 
 建议使用受支持的 Linux 发行版和一个固定公网 IPv4。安装 Docker/Compose、Git、
-OpenSSL、编译 relay 所需的 GCC/OpenSSL 开发包和 coturn。包管理器依发行版不同：
+GCC 和 coturn。relay 已不依赖 OpenSSL 开发库：
 
 ```bash
 # Rocky / AlmaLinux / Alibaba Cloud Linux 等 dnf 系统
-sudo dnf install -y git gcc openssl-devel openssl coturn
+sudo dnf install -y git gcc coturn
 
 # CentOS 7 等 yum 系统（coturn 可能需要先启用 EPEL）
-sudo yum install -y git gcc openssl-devel openssl coturn
+sudo yum install -y git gcc coturn
 
 # Ubuntu / Debian
 sudo apt-get update
-sudo apt-get install -y git build-essential libssl-dev openssl coturn
+sudo apt-get install -y git build-essential coturn
 ```
 
 安装 Docker Engine 与 Docker Compose plugin 后，确认：

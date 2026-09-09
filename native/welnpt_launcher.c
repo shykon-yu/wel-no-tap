@@ -160,7 +160,6 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t relay[256];
     wchar_t room[64];
     wchar_t logical_ip[64];
-    wchar_t token[256];
     wchar_t log_path[MAX_PATH];
     wchar_t ready_name[96];
     wchar_t host_ready_name[96];
@@ -212,8 +211,6 @@ int wmain(int argc, wchar_t **argv) {
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room, ARRAYSIZE(room)) == 0) return 2;
     if (options.logical_ip != NULL) wcsncpy_s(logical_ip, ARRAYSIZE(logical_ip), options.logical_ip, _TRUNCATE);
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip, ARRAYSIZE(logical_ip)) == 0) return 2;
-    if (options.token != NULL) wcsncpy_s(token, ARRAYSIZE(token), options.token, _TRUNCATE);
-    else if (GetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token, ARRAYSIZE(token)) == 0) return 2;
     log_path[0] = L'\0';
     if (options.log_path != NULL) wcsncpy_s(log_path, ARRAYSIZE(log_path), options.log_path, _TRUNCATE);
     else GetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path, ARRAYSIZE(log_path));
@@ -247,7 +244,7 @@ int wmain(int argc, wchar_t **argv) {
     SetEnvironmentVariableW(L"WEL_NOTAP_RELAY", relay);
     SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip);
-    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path[0] != L'\0' ? log_path : NULL);
     SetEnvironmentVariableW(L"WEL_NOTAP_DIAGNOSTIC_LOG", log_path[0] != L'\0' ? L"true" : L"false");
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);

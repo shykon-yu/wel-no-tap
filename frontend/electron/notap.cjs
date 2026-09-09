@@ -1119,8 +1119,24 @@ async function launchElevated(options) {
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    child.once('error', (error) => reject(new Error('管理员权限启动器 powershell.exe 无法运行：' + error.message)))
-    child.once('close', (code) => {
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill() } catch {}
+      reject(new Error('管理员权限启动器等待游戏组件超时，请检查 welnptgame.exe、welnpthost.exe 是否被安全软件拦截'))
+    }, 35000)
+    child.once('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      lastProcess = null
+      reject(new Error('管理员权限启动器 powershell.exe 无法运行：' + error.message))
+    })
+    child.once('exit', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail || '用户取消了管理员授权，或提权启动失败', code)))
@@ -1171,8 +1187,27 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    child.once('error', (error) => reject(new Error('游戏启动辅助程序 welnptgame.exe 无法运行：' + error.message)))
-    child.once('close', (code) => {
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill() } catch {}
+      lastProcess = null
+      reject(new Error('游戏启动组件等待超时，请检查 welnptgame.exe、welnpthost.exe 和 welnpt.dll 是否被安全软件拦截'))
+    }, 35000)
+    child.once('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      lastProcess = null
+      reject(new Error('游戏启动辅助程序 welnptgame.exe 无法运行：' + error.message))
+    })
+    // The launcher exits after injection succeeds. Use exit instead of close:
+    // a descendant retaining stdout/stderr must not leave the UI waiting forever.
+    child.once('exit', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail, code)))
