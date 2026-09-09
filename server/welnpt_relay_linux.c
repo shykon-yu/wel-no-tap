@@ -163,6 +163,10 @@ static int self_test(void) {
     relay_peer *diagnostic_peer;
     welnpt_initialize_header(header, WELNPT_PACKET_DATA);
     header->payload_length = htons(4);
+    header->source_ip = htonl(0x0a7a0101UL);
+    header->source_port = htons(5739);
+    header->target_ip = htonl(0x0a7a0102UL);
+    header->target_port = htons(5739);
     memcpy(packet + sizeof(*header), "test", 4);
     if (sizeof(*header) != 58 || !welnpt_valid_header(header) || !valid_route_fields(header)) return 1;
     welnpt_initialize_header(header, WELNPT_PACKET_REGISTER);
