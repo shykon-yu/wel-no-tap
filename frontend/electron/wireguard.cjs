@@ -100,7 +100,7 @@ async function installBundledWireGuard(installer) {
   if (!installer || !fs.existsSync(installer)) throw new Error('当前安装包缺少 WireGuard 驱动安装文件')
   // The official MSI installs the signed Wintun driver, tools and tunnel
   // service. It must run elevated even when the platform is not elevated.
-  await runElevated('msiexec.exe', ['/i', installer, '/qn', '/norestart'], 120000)
+  await runElevated('msiexec.exe', ['/i', installer, '/qn', '/norestart', 'DO_NOT_LAUNCH=1'], 120000)
 }
 
 async function ensureWireGuardRuntime(current) {
