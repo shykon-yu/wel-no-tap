@@ -712,12 +712,13 @@ function activeNetwork() {
 
 function parsePingSummary(host, output) {
   const text = String(output || '').replace(/\r?\n/g, '\n')
-  const reachable = /TTL=/i.test(text)
+  const reachable = /TTL\s*[=:]/i.test(text) || /时间\s*[<＝=]\s*\d+\s*ms/i.test(text) || /time\s*[<＝=]\s*\d+\s*ms/i.test(text)
   const loss = text.match(/(\d+)%\s*(?:loss|丢失)/i)?.[1]
-  const average = text.match(/(?:Average|平均)\s*[=<]\s*(\d+ms)/i)?.[1]
-    || text.match(/平均\s*=\s*(\d+ms)/)?.[1]
+  const average = text.match(/(?:Average|平均(?:值)?)[^0-9]*(\d+)\s*ms/i)?.[1]
+    || text.match(/(?:time|时间)\s*[<＝=]\s*(\d+)\s*ms/i)?.[1]
+  const averageText = average ? `${average}ms` : ''
   const parts = [reachable ? '可达' : '不可达']
-  if (average) parts.push(`平均 ${average}`)
+  if (averageText) parts.push(`平均 ${averageText}`)
   if (loss !== undefined) parts.push(`丢包 ${loss}%`)
   return { host, reachable, summary: parts.join('，') }
 }

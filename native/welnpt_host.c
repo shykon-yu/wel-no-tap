@@ -180,8 +180,19 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
     char text[128];
     char ip[INET_ADDRSTRLEN];
     int length;
-    int changed = g_peer_ip != peer_ip || g_join_port != join_port;
-    if (!changed || peer_ip == 0 || InetNtopA(AF_INET, &peer_ip, ip, sizeof(ip)) == NULL) return;
+    int is_new_peer = g_peer_ip != peer_ip;
+    if (peer_ip == 0 || InetNtopA(AF_INET, &peer_ip, ip, sizeof(ip)) == NULL) return;
+    /*
+     * The game reuses the same 64/84-byte control packet shapes while
+     * progressing from matchmaking through team/kit selection and kickoff.
+     * Its observed join port may change during that flow, but that is not a
+     * new ICE transaction.  Only a different logical peer starts ICE again;
+     * keep the latest port solely so socket-close can still end the session.
+     */
+    if (!is_new_peer) {
+        g_join_port = join_port;
+        return;
+    }
     g_peer_ip = peer_ip;
     g_join_port = join_port;
     InterlockedIncrement(&g_generation);

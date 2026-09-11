@@ -178,9 +178,13 @@ function startTransportStatusMonitor() {
     } catch { /* status is best effort */ }
   }
   void refresh()
-  // Native transport state is updated on transition events. Keep this as a
-  // one-shot read for launch/connection setup; do not poll the game data path.
-  transportStatusTimer = undefined
+  /* TAP/WireGuard status comes from the management plane, not game packets.
+     A slow poll keeps the room label current without adding data-path work. */
+  if (tapRoom || wireguardRoom) {
+    transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
+  } else {
+    transportStatusTimer = undefined
+  }
 }
 
 async function loadRoomMembers() {
@@ -406,6 +410,8 @@ async function joinRoom(room: Room) {
           warningMessage.value = `网卡汇合服务暂不可用，本场使用云中继：${messageOf(error)}`
         }
       }
+      gameTransportSummary.value = '连接中'
+      startTransportStatusMonitor()
       directCandidateStatus.value = 'relay-only'
       directCandidateMessage.value = wg?.available ? '网卡组件已准备，比赛时建立专属通道' : 'WireGuard 组件未就绪，比赛时使用现有直连/中继'
       await roomPreparationTask

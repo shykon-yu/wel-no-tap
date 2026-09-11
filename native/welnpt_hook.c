@@ -751,8 +751,10 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || target_ip == 0) return 0;
     if (InetNtopA(AF_INET, &target_ip, target, sizeof(target)) == NULL) return 0;
     EnterCriticalSection(&g_state_lock);
-	is_new_transaction = g_direct_transaction_peer_ip != target_ip ||
-		g_direct_transaction_join_port != join_port;
+	/* The game reuses the same 64/84-byte control shapes when moving from
+	   matchmaking to team/kit selection and kickoff.  A changed observed port
+	   is not a new opponent; only a new logical peer starts ICE again. */
+	is_new_transaction = g_direct_transaction_peer_ip != target_ip;
 	if (is_new_transaction) {
 		g_direct_transaction_peer_ip = target_ip;
 		g_direct_transaction_join_port = join_port;
@@ -760,9 +762,13 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 	}
     generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
     LeaveCriticalSection(&g_state_lock);
-    if (!is_new_transaction) return 0;
-    /* A new peer or join Socket starts a new connection session. Same-key
-       64/84-byte packets are data in the current session, not a new match. */
+    if (!is_new_transaction) {
+        /* Keep close detection aligned with the game's current socket while
+           retaining the existing ICE generation and selected path. */
+        g_direct_transaction_join_port = join_port;
+        return 0;
+    }
+	/* Same-peer 64/84-byte packets remain in the current session. */
     g_direct_peer_ip = 0;
     InterlockedExchange(&g_direct_connected, 0);
     InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
@@ -778,7 +784,7 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 	log_line("\"api\":\"direct-target\",\"target\":\"%s\",\"joinPort\":%u,\"generation\":%lu,\"observedSourcePort\":%u,\"observedTargetPort\":%u",
 		target, (unsigned)join_port, (unsigned long)generation,
 		(unsigned)observed_source_port, (unsigned)observed_target_port);
-	log_line("\"api\":\"session-state\",\"state\":\"SESSION_NEGOTIATING\",\"generation\":%lu,\"reason\":\"peer-or-join-port-changed\"",
+	log_line("\"api\":\"session-state\",\"state\":\"SESSION_NEGOTIATING\",\"generation\":%lu,\"reason\":\"new-peer\"",
 		(unsigned long)generation);
 		log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"session-start\",\"windowMs\":0,\"sessionTimeoutMs\":%d,\"generation\":%lu",
 			WELNPT_ICE_SESSION_TIMEOUT_MS, (unsigned long)generation);
