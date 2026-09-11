@@ -1,7 +1,7 @@
 {
   "name": "wel-no-tap-client",
   "private": true,
-  "version": "0.0.59",
+  "version": "0.0.60",
   "packageManager": "pnpm@11.11.0",
   "type": "module",
   "main": "electron/main.cjs",
@@ -62,6 +62,10 @@
         "to": "welhelper/wireguard/wireguard-amd64-0.5.3.msi"
       },
       {
+        "from": "resources/wireguard/runtime",
+        "to": "welhelper/wireguard/runtime"
+      },
+      {
         "from": "../build/x86/edge.exe",
         "to": "welhelper/edge.exe"
       },
@@ -112,7 +116,7 @@
       "perMachine": true,
       "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "WEL对战平台 v0.0.59",
+      "shortcutName": "WEL对战平台 v0.0.60",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     }

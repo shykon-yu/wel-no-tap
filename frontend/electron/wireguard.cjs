@@ -5,6 +5,7 @@ const dgram = require('node:dgram')
 const { spawn, spawnSync } = require('node:child_process')
 
 const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform', 'wireguard')
+const bundledRuntimeRoot = path.join(appData, 'runtime')
 const tunnelName = 'WELGame'
 let bridgeProcess = null
 let bridgeLineBuffer = ''
@@ -17,11 +18,23 @@ function emptyIdentity() { return { runtime: null, privateKey: '', publicKey: ''
 let identityState = emptyIdentity()
 
 function runtimeRoots() {
-  return [path.join(process.resourcesPath || '', 'welhelper'), path.join(__dirname, '..', 'resources', 'welhelper'), path.join(__dirname, '..', 'build')].filter(Boolean)
+  return [
+    path.join(process.resourcesPath || '', 'welhelper'),
+    path.join(__dirname, '..', 'resources', 'welhelper'),
+    path.join(__dirname, '..', 'build'),
+    bundledRuntimeRoot,
+  ].filter(Boolean)
 }
 
 function findRuntime() {
-  const roots = [...runtimeRoots()]
+  const roots = runtimeRoots().flatMap((root) => [
+    root,
+    path.join(root, 'wireguard'),
+    path.join(root, 'WireGuard'),
+    path.join(root, 'wireguard', 'runtime'),
+    path.join(root, 'wireguard', 'runtime', 'WireGuard'),
+    path.join(root, 'WireGuard', 'runtime'),
+  ])
   if (process.env.ProgramFiles) roots.push(path.join(process.env.ProgramFiles, 'WireGuard'))
   if (process.env['ProgramFiles(x86)']) roots.push(path.join(process.env['ProgramFiles(x86)'], 'WireGuard'))
   const bridge = runtimeRoots().map((root) => path.join(root, 'welnptwg.exe')).find(fs.existsSync) || null
@@ -98,9 +111,13 @@ function needsElevation(error) {
 async function installBundledWireGuard(installer) {
   if (process.platform !== 'win32') throw new Error('WireGuard 自动安装仅支持 Windows')
   if (!installer || !fs.existsSync(installer)) throw new Error('当前安装包缺少 WireGuard 驱动安装文件')
-  // The official MSI installs the signed Wintun driver, tools and tunnel
-  // service. It must run elevated even when the platform is not elevated.
-  await runElevated('msiexec.exe', ['/i', installer, '/qn', '/norestart', 'DO_NOT_LAUNCH=1'], 120000)
+  // Administrative extraction keeps the signed WireGuard/Wintun files but
+  // does not register the official manager in Add/Remove Programs or launch
+  // its GUI. The tunnel service is installed later for the temporary WELGame
+  // config by wireguard.exe itself.
+  fs.rmSync(bundledRuntimeRoot, { recursive: true, force: true })
+  fs.mkdirSync(bundledRuntimeRoot, { recursive: true })
+  await runElevated('msiexec.exe', ['/a', installer, `TARGETDIR=${bundledRuntimeRoot}`, '/qn', '/norestart', 'DO_NOT_LAUNCH=1'], 120000)
 }
 
 async function ensureWireGuardRuntime(current) {
