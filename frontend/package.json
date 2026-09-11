@@ -1,7 +1,7 @@
 {
   "name": "wel-no-tap-client",
   "private": true,
-  "version": "0.0.55",
+  "version": "0.0.56",
   "packageManager": "pnpm@11.11.0",
   "type": "module",
   "main": "electron/main.cjs",
@@ -54,6 +54,10 @@
         "to": "welhelper/welnptice.exe"
       },
       {
+        "from": "../build/x86/welnptwg.exe",
+        "to": "welhelper/welnptwg.exe"
+      },
+      {
         "from": "../build/x86/edge.exe",
         "to": "welhelper/edge.exe"
       },
@@ -104,7 +108,7 @@
       "perMachine": true,
       "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "WEL对战平台 v0.0.55",
+      "shortcutName": "WEL对战平台 v0.0.56",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     }

@@ -191,7 +191,7 @@ SELECT version, applied_at
 FROM platform_schema_migrations ORDER BY applied_at;
 ```
 
-应能看到 `notap-01/02`（直连）、`notap-03/04`（中继）和 `notap-05/06`（网卡）。
+应能看到 `notap-01/02`（直连）、`notap-03/04`（中继）、`notap-05/06`（TAP 网卡）和 `notap-07/08`（WireGuard 实验网卡）。07/08 只有在客户端运行文件和服务端 peer 配置就绪后才适合开放给玩家。
 
 ### 5.2 API 与反向代理验收
 

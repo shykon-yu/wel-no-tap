@@ -5,6 +5,7 @@ const {
   parseTapctlList,
   parsePingSummary,
   parseWmiTapAdapters,
+  parseRegistryTapAdapters,
   selectWelTapAdapter,
 } = require('./tap.cjs')
 
@@ -64,6 +65,30 @@ test('does not infer TAP from a generic connection alias alone', () => {
     connectionName: '以太网 2',
     description: null,
   }]), null)
+})
+
+test('keeps a registry TAP adapter when its connection name is unavailable', () => {
+  const guid = '12345678-1234-1234-1234-1234567890ae'
+  const output = [
+    `HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}\\0009`,
+    '    ComponentId    REG_SZ    tap0901',
+    '    DriverDesc    REG_SZ    TAP-Windows Adapter V9',
+    `    NetCfgInstanceId    REG_SZ    {${guid}}`,
+  ].join('\n')
+  const adapters = parseRegistryTapAdapters(output, new Map())
+  assert.equal(adapters.length, 1)
+  assert.equal(adapters[0].guid, `{${guid}}`)
+  assert.equal(adapters[0].connectionName, null)
+  assert.equal(selectWelTapAdapter(adapters).guid, `{${guid}}`)
+})
+
+test('recognizes the WEL Virtual LAN driver description', () => {
+  const guid = '12345678-1234-1234-1234-1234567890af'
+  assert.equal(selectWelTapAdapter([{
+    guid: `{${guid}}`,
+    name: 'WEL Virtual LAN',
+    description: 'WEL Virtual LAN',
+  }]).guid, `{${guid}}`)
 })
 
 test('parses Windows Ping output for a TAP peer', () => {

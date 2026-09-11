@@ -28,6 +28,11 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
     ipcRenderer.on('notap-game-peer', listener)
     return () => ipcRenderer.removeListener('notap-game-peer', listener)
   },
+  onTransportChange: (callback) => {
+    const listener = (_event, status) => callback(status)
+    ipcRenderer.on('notap-transport-change', listener)
+    return () => ipcRenderer.removeListener('notap-transport-change', listener)
+  },
   pingRelay: () => ipcRenderer.invoke('notap-ping-relay'),
   pingRelayPeer: (remoteIp) => ipcRenderer.invoke('notap-ping-relay-peer', remoteIp),
   tapPingPeer: (remoteIp) => ipcRenderer.invoke('tap-ping-peer', remoteIp),
@@ -37,4 +42,11 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   tapTransportStatus: () => ipcRenderer.invoke('tap-transport-status'),
   tapDisconnect: () => ipcRenderer.invoke('tap-disconnect'),
   tapInspect: (options) => ipcRenderer.invoke('tap-inspect', options),
+  wireguardStatus: () => ipcRenderer.invoke('wireguard-status'),
+  wireguardPrepare: (options) => ipcRenderer.invoke('wireguard-prepare', options),
+  wireguardPrepareGame: () => ipcRenderer.invoke('wireguard-prepare-game'),
+  wireguardConnectPeer: (options) => ipcRenderer.invoke('wireguard-connect-peer', options),
+  wireguardTransportStatus: () => ipcRenderer.invoke('wireguard-transport-status'),
+  wireguardClearPeer: () => ipcRenderer.invoke('wireguard-clear-peer'),
+  wireguardDisconnect: () => ipcRenderer.invoke('wireguard-disconnect'),
 })

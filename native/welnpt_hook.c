@@ -15,7 +15,6 @@
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
-#define WELNPT_ICE_DECISION_WINDOW_MS 5000
 #define WELNPT_ICE_SESSION_TIMEOUT_MS 12000
 #define WELNPT_MODULE_SCAN_MS 1000
 #define WELNPT_DATAGRAM_POOL_SIZE 1024
@@ -202,7 +201,7 @@ static void lock_relay_for_decision(const char *reason) {
         g_ice_decision_deadline = 0;
         g_ice_session_deadline = 0;
         log_line("\"api\":\"ice-decision\",\"result\":\"relay\",\"reason\":\"%s\",\"elapsedMs\":%llu,\"windowMs\":%d,\"generation\":%lu",
-            reason, (unsigned __int64)elapsed, WELNPT_ICE_DECISION_WINDOW_MS,
+            reason, (unsigned __int64)elapsed, 0,
             (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
         log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"%s\"", reason);
         notify_agent_transport_state("relay");
@@ -781,8 +780,8 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 		(unsigned)observed_source_port, (unsigned)observed_target_port);
 	log_line("\"api\":\"session-state\",\"state\":\"SESSION_NEGOTIATING\",\"generation\":%lu,\"reason\":\"peer-or-join-port-changed\"",
 		(unsigned long)generation);
-	log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"session-start\",\"windowMs\":%d,\"sessionTimeoutMs\":%d,\"generation\":%lu",
-		WELNPT_ICE_DECISION_WINDOW_MS, WELNPT_ICE_SESSION_TIMEOUT_MS, (unsigned long)generation);
+		log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"session-start\",\"windowMs\":0,\"sessionTimeoutMs\":%d,\"generation\":%lu",
+			WELNPT_ICE_SESSION_TIMEOUT_MS, (unsigned long)generation);
     return 1;
 }
 
@@ -1327,8 +1326,19 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             memcmp(packet, WELNPT_ICE_AGENT_PREFIX, strlen(WELNPT_ICE_AGENT_PREFIX)) == 0) {
             unsigned long port = strtoul(packet + strlen(WELNPT_ICE_AGENT_PREFIX), NULL, 10);
             if (port > 0 && port <= 65535) {
+                unsigned short previous_port = ntohs(g_direct_agent_address.sin_port);
                 g_direct_agent_address.sin_port = htons((u_short)port);
                 InterlockedExchange(&g_direct_connected, 0);
+                if (previous_port != 0 && previous_port != (unsigned short)port &&
+                    InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_RELAY) {
+                    /* A new agent is a fresh ICE attempt for the same peer.
+                       Relay remains usable until this attempt connects. */
+                    InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
+                    g_ice_decision_started = GetTickCount64();
+                    g_ice_decision_deadline = 0;
+                    g_ice_session_deadline = g_ice_decision_started + WELNPT_ICE_SESSION_TIMEOUT_MS;
+                    notify_agent_transport_state("pending");
+                }
                 log_line("\"api\":\"direct-agent\",\"port\":%lu", port);
             }
             continue;
@@ -1337,10 +1347,10 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             memcmp(packet, WELNPT_ICE_REMOTE_SET_PREFIX, strlen(WELNPT_ICE_REMOTE_SET_PREFIX)) == 0) {
             if (InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_PENDING) {
                 g_ice_decision_started = GetTickCount64();
-                g_ice_decision_deadline = g_ice_decision_started + WELNPT_ICE_DECISION_WINDOW_MS;
-                g_ice_session_deadline = 0;
-                log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"remote-set\",\"windowMs\":%d,\"generation\":%lu",
-                    WELNPT_ICE_DECISION_WINDOW_MS,
+                /* No fixed five-second lock. Relay remains usable while ICE
+                   is pending and a later connected state may upgrade it. */
+                g_ice_decision_deadline = 0;
+                log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"remote-set\",\"windowMs\":0,\"generation\":%lu",
                     (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
             }
             continue;
@@ -1352,16 +1362,19 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             int failed = strncmp(state, "failed", 6) == 0;
             int disconnected = strncmp(state, "disconnected", 12) == 0;
             LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-            if (connected && selected == WELNPT_GAME_PATH_PENDING) {
-                if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT,
-                    WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
+            if (connected && (selected == WELNPT_GAME_PATH_PENDING || selected == WELNPT_GAME_PATH_RELAY)) {
+                LONG changed = selected == WELNPT_GAME_PATH_PENDING
+                    ? InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT,
+                        WELNPT_GAME_PATH_PENDING)
+                    : InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT);
+                if (changed == WELNPT_GAME_PATH_PENDING || changed == WELNPT_GAME_PATH_RELAY) {
                     ULONGLONG now = GetTickCount64();
                     ULONGLONG elapsed = g_ice_decision_started != 0 && now >= g_ice_decision_started
                         ? now - g_ice_decision_started : 0;
                     g_ice_decision_deadline = 0;
                     g_ice_session_deadline = 0;
-                    log_line("\"api\":\"ice-decision\",\"result\":\"direct\",\"reason\":\"ice-connected\",\"elapsedMs\":%llu,\"windowMs\":%d,\"generation\":%lu,\"directState\":\"%.*s\"",
-                        (unsigned __int64)elapsed, WELNPT_ICE_DECISION_WINDOW_MS,
+                    log_line("\"api\":\"ice-decision\",\"result\":\"direct\",\"reason\":\"ice-connected\",\"elapsedMs\":%llu,\"windowMs\":0,\"generation\":%lu,\"directState\":\"%.*s\"",
+                        (unsigned __int64)elapsed,
                         (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0),
                         received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
                     log_line("\"api\":\"transport-lock\",\"path\":\"direct\",\"reason\":\"ice-connected\"");

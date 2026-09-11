@@ -38,11 +38,25 @@ let transportPath = 'pending'
 let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
+const transportListeners = new Set()
 const probeAgents = new Map()
 let standbyAgentKey = ''
 let standbyPromise = null
 let standbyGeneration = 0
 let iceUpnpMapping = null
+
+function setTransportPath(nextPath) {
+  if (!['pending', 'direct', 'relay'].includes(nextPath) || transportPath === nextPath) return
+  transportPath = nextPath
+  for (const listener of transportListeners) {
+    try { listener(transportStatusSnapshot()) } catch {}
+  }
+}
+
+function transportStatusSnapshot() {
+  const summary = transportPath === 'direct' ? 'P2P直连' : transportPath === 'relay' ? '云中继' : '连接中'
+  return { path: transportPath, directState: iceState, summary }
+}
 
 function helperCandidates() {
   return [
@@ -191,16 +205,16 @@ function updateTransportPathFromLog() {
       let event
       try { event = JSON.parse(line) } catch { continue }
       if (event.api === 'direct-target') {
-        transportPath = 'pending'
+        setTransportPath('pending')
       } else if (event.api === 'session-state' && event.state === 'WAIT_JOIN') {
-        transportPath = 'pending'
+        setTransportPath('pending')
       } else if (event.api === 'transport-lock') {
-        if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
+        if (event.path === 'direct' || event.path === 'relay') setTransportPath(event.path)
       } else if (event.api === 'direct-fallback') {
-        transportPath = 'relay'
+        setTransportPath('relay')
       } else if (event.api === 'transport-recv' && event.broadcast === false) {
-        if (event.path === 'direct') transportPath = 'direct'
-        else if (event.path === 'relay' && event.length !== 64 && event.length !== 84 && transportPath === 'pending') transportPath = 'relay'
+        if (event.path === 'direct') setTransportPath('direct')
+        else if (event.path === 'relay' && event.length !== 64 && event.length !== 84 && transportPath === 'pending') setTransportPath('relay')
       }
     }
   } catch {}
@@ -208,13 +222,7 @@ function updateTransportPathFromLog() {
 
 function transportStatus() {
   updateTransportPathFromLog()
-  const pathName = transportPath
-  const summary = pathName === 'direct'
-    ? 'P2P直连'
-    : pathName === 'relay'
-      ? '云中继'
-      : '连接中'
-  return { path: pathName, directState: iceState, summary }
+  return transportStatusSnapshot()
 }
 
 function chooseHookPort() {
@@ -491,6 +499,8 @@ function handleIceLine(rawLine) {
   if (line.startsWith('STATE ')) {
     iceState = line.slice(6) || 'unknown'
     rememberAgentLine('active', line)
+    if (iceState === 'connected' || iceState === 'completed') setTransportPath('direct')
+    else if ((iceState === 'failed' || iceState === 'disconnected') && transportPath === 'pending') setTransportPath('relay')
     // The next slot is prepared as soon as the active agent has a peer. This
     // keeps a quick game exit from leaving the next launch cold.
     if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
@@ -498,7 +508,7 @@ function handleIceLine(rawLine) {
   }
   if (line.startsWith('TRANSPORT_STATE ')) {
     const state = line.slice(16).trim()
-    if (state === 'pending' || state === 'direct' || state === 'relay') transportPath = state
+    if (state === 'pending' || state === 'direct' || state === 'relay') setTransportPath(state)
     appendAgentEvent('active', 'transport-state', { state })
     return
   }
@@ -806,6 +816,12 @@ function onGamePeer(listener) {
   return () => gamePeerListeners.delete(listener)
 }
 
+function onTransportChange(listener) {
+  if (typeof listener !== 'function') return () => {}
+  transportListeners.add(listener)
+  return () => transportListeners.delete(listener)
+}
+
 function randomProbeKey() {
   return 'probe-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
 }
@@ -1080,7 +1096,7 @@ function windowsCommandArgument(value) {
   return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
 }
 
-function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true }) {
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true, directAgentPort = 0, directHookPort = 0, mode = 'direct' }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const host = locate(hostCandidates())
@@ -1091,12 +1107,14 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
-  if (!direct) transportPath = 'relay'
+  if (!direct) setTransportPath('relay')
   const args = ['--game', executable, '--hook', hook, '--host', host, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token)]
   if (diagnosticLogEnabled && logPath) args.push('--log', logPath)
-  if (direct && iceProcess && iceAgentPort && iceHookPort) {
-    args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
+  const agentPort = mode === 'wireguard' ? Number(directAgentPort) : iceAgentPort
+  const hookPort = mode === 'wireguard' ? Number(directHookPort) : iceHookPort
+  if (direct && agentPort && hookPort) {
+    args.push('--direct-agent-port', String(agentPort), '--direct-hook-port', String(hookPort))
   }
   return { helper, args, logPath }
 }
@@ -1104,7 +1122,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
 async function launchElevated(options) {
   // Match the normal launch path: validate or rotate to a clean direct agent
   // before the elevated helper injects the Hook.
-  if (options?.direct !== false) {
+  if (options?.direct !== false && options?.mode !== 'wireguard') {
     await prepareGameIce()
   }
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
@@ -1117,7 +1135,7 @@ async function launchElevated(options) {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  void prewarmIce()
+  if (options?.mode !== 'wireguard') void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -1148,7 +1166,7 @@ async function launchElevated(options) {
   })
 }
 
-async function launch({ gamePath, relay, room, logicalIp, token, direct = true }) {
+async function launch({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct', directAgentPort = 0, directHookPort = 0 }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const host = locate(hostCandidates())
@@ -1158,13 +1176,13 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
   if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
-  if (direct) {
+  if (direct && mode !== 'wireguard') {
     await prepareGameIce()
   }
 
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
-  if (!direct) transportPath = 'relay'
+  if (!direct) setTransportPath('relay')
   const environment = {
     ...process.env,
     WEL_NOTAP_RELAY: String(relay),
@@ -1174,9 +1192,11 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
     WEL_NOTAP_DIAGNOSTIC_LOG: diagnosticLogEnabled ? 'true' : 'false',
   }
   if (diagnosticLogEnabled && logPath) environment.WEL_NOTAP_LOG_PATH = logPath
-  if (direct && iceProcess && iceAgentPort && iceHookPort) {
-    environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
-    environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
+  const agentPort = mode === 'wireguard' ? Number(directAgentPort) : iceAgentPort
+  const hookPort = mode === 'wireguard' ? Number(directHookPort) : iceHookPort
+  if (direct && agentPort && hookPort) {
+    environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(agentPort)
+    environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(hookPort)
   }
   const child = spawn(helper, ['--game', executable, '--hook', hook, '--host', host], {
     cwd: path.dirname(executable),
@@ -1185,7 +1205,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true }
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  void prewarmIce()
+  if (mode !== 'wireguard') void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -1272,6 +1292,7 @@ function pingHost(host) {
 module.exports = {
   configureIce: setRemoteIce,
   onGamePeer,
+  onTransportChange,
   disconnect,
   launch,
   launchElevated,

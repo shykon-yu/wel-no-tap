@@ -83,6 +83,12 @@ jobs:
           )
           & "$output/welnpthost.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'external Host self-test failed' }
+          Invoke-Compiler 'WireGuard data bridge' @(
+            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+            'native/welnpt_wg.c', "/Fe:$output/welnptwg.exe", '/link', 'Ws2_32.lib'
+          )
+          & "$output/welnptwg.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'WireGuard data bridge self-test failed' }
           Invoke-Compiler 'UDP relay' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib'

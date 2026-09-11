@@ -11,7 +11,6 @@
 #include "welnpt_protocol.h"
 
 #define WEL_HOST_BUFFER_SIZE (sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD)
-#define WEL_HOST_DECISION_WINDOW_MS 5000
 #define WEL_HOST_SESSION_TIMEOUT_MS 12000
 #define WEL_HOST_HEARTBEAT_MS 2000
 #define WEL_HOST_PATH_PENDING 0
@@ -164,10 +163,16 @@ static void reset_session(void) {
 }
 
 static void check_deadline(void) {
+    /* Relay is the live fallback while ICE is pending. Do not turn a slow
+       SDP exchange into a permanent relay decision: a late connected state
+       is allowed to upgrade the current session to direct. A failed ICE
+       state still moves the session to relay immediately. The longer session
+       timeout only makes the UI leave "pending" when an agent is silent. */
     ULONGLONG now = GetTickCount64();
-    if (InterlockedCompareExchange(&g_path, 0, 0) != WEL_HOST_PATH_PENDING) return;
-    if (g_decision_deadline != 0 && now >= g_decision_deadline) lock_relay("decision-timeout");
-    else if (g_session_deadline != 0 && now >= g_session_deadline) lock_relay("remote-sdp-timeout");
+    if (InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING &&
+        g_session_deadline != 0 && now >= g_session_deadline) {
+        lock_relay("remote-sdp-timeout");
+    }
 }
 
 static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
@@ -315,15 +320,30 @@ static void process_ice_message(char *packet, int received) {
     const char *state;
     if (received > (int)strlen("WELICEAGENT:") && memcmp(packet, "WELICEAGENT:", strlen("WELICEAGENT:")) == 0) {
         unsigned short port;
-        if (parse_port(packet + strlen("WELICEAGENT:"), &port)) g_agent_port = port;
+        if (parse_port(packet + strlen("WELICEAGENT:"), &port)) {
+            unsigned short previous = g_agent_port;
+            g_agent_port = port;
+            /* A newly activated standby agent is an explicit ICE retry for
+               the same peer. Re-open the pending state so it can upgrade a
+               relay session if connectivity succeeds later. */
+            if (previous != 0 && previous != port &&
+                InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_RELAY) {
+                InterlockedExchange(&g_direct_connected, 0);
+                InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
+                g_decision_deadline = 0;
+                g_decision_started = GetTickCount64();
+                g_session_deadline = g_decision_started + WEL_HOST_SESSION_TIMEOUT_MS;
+                notify_transport("pending");
+            }
+        }
         send_to_hook(packet, received);
         return;
     }
     if (received == (int)strlen("WELICEREMOTESET") && memcmp(packet, "WELICEREMOTESET", received) == 0) {
         if (InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING) {
             g_decision_started = GetTickCount64();
-            g_decision_deadline = g_decision_started + WEL_HOST_DECISION_WINDOW_MS;
-            g_session_deadline = 0;
+            g_decision_deadline = 0;
+            g_session_deadline = g_decision_started + WEL_HOST_SESSION_TIMEOUT_MS;
         }
         send_to_hook(packet, received);
         return;
@@ -331,7 +351,8 @@ static void process_ice_message(char *packet, int received) {
     if (received > (int)strlen("WELICESTATE:") && memcmp(packet, "WELICESTATE:", strlen("WELICESTATE:")) == 0) {
         state = packet + strlen("WELICESTATE:");
         if ((strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0) &&
-            InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING) {
+            (InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING ||
+             InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_RELAY)) {
             InterlockedExchange(&g_path, WEL_HOST_PATH_DIRECT);
             InterlockedExchange(&g_direct_connected, 1);
             g_decision_deadline = 0;

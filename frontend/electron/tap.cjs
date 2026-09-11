@@ -172,10 +172,14 @@ function parseRegistryTapAdapters(output, connectionNames = null) {
     const component = values.componentid || values.service || ''
     const description = values.driverdesc || ''
     const isTap = /(?:^|\\)tap0?(?:801|901)$/i.test(component)
-      || /TAP-Windows Adapter|OpenVPN TAP-Windows|WEL TAP/i.test(description)
+      || /TAP-Windows Adapter|OpenVPN TAP-Windows|WEL (?:TAP|Virtual LAN)/i.test(description)
     const guid = extractTapGuid(values.netcfginstanceid)
     const connectionName = guid ? connectionNames?.get(guid.slice(1, -1).toLowerCase()) : null
-    if (!isTap || !guid || (connectionNames && !connectionName)) return null
+    // A TAP adapter can be present without a NetConnectionID (disabled
+    // devices, Win7/WMI timing, or a localized shell). The GUID plus
+    // ComponentId/DriverDesc is still authoritative; do not hide the device
+    // merely because the optional connection-name lookup missed it.
+    if (!isTap || !guid) return null
     return {
       guid,
       name: connectionName || description || TAP_NAME,
@@ -344,7 +348,7 @@ Get-WmiObject -Class Win32_NetworkAdapter -ErrorAction SilentlyContinue |
     $_.GUID -and (
       $_.ServiceName -match '^(?i:tap0?(801|901))$' -or
       $_.PNPDeviceID -match '(?i)TAP0?(801|901)' -or
-      $_.Name -match '(?i)TAP-Windows Adapter|OpenVPN TAP-Windows|WEL TAP'
+      $_.Name -match '(?i)TAP-Windows Adapter|OpenVPN TAP-Windows|WEL (?:TAP|Virtual LAN)'
     )
   } |
   ForEach-Object {
@@ -397,12 +401,22 @@ async function prepare(excludedGuids = new Set(), repairState = { freshCreated: 
   const current = status()
   if (!current.ready) throw new Error(current.message)
   if (process.platform !== 'win32') return current
-  if (preparedTap?.tapNode) {
-    return { ...current, adapterReady: true, ...preparedTap }
-  }
-
   const tapctl = locateTapctl()
   if (!tapctl) throw new Error('未检测到 WEL 虚拟网卡管理组件，请重新安装客户端')
+
+  // The cached GUID is only a preference. Users can remove/reinstall TAP
+  // between room sessions, so validate it against the current device list
+  // before reusing it.
+  if (preparedTap?.tapNode) {
+    const currentAdapters = await listTapAdapters(tapctl)
+    const cachedGuid = parseTapGuid(preparedTap.tapNode)
+    const cachedAdapter = currentAdapters.find(({ guid }) => parseTapGuid(guid) === cachedGuid)
+    if (cachedAdapter && !excludedGuids.has(cachedGuid)) {
+      const refreshed = await ensureTapReady({ ...cachedAdapter, ...preparedTap })
+      if (refreshed) return { ...current, adapterReady: true, ...refreshed }
+    }
+    preparedTap = null
+  }
 
   let adapters = await listTapAdapters(tapctl)
   const existingTapGuids = new Set(adapters.map(({ guid }) => parseTapGuid(guid)).filter(Boolean))
@@ -477,19 +491,33 @@ async function installBundledTapDriverElevated(installer) {
 
 function installBundledTapDriver(installer) {
   return new Promise((resolve, reject) => {
+    let settled = false
+    let elevatedFallback = false
+    const finish = (error) => {
+      if (settled) return
+      settled = true
+      if (error) reject(error)
+      else resolve()
+    }
     const child = spawn(installer, ['/S'], { windowsHide: true })
     child.once('error', async (error) => {
-      if (!['EACCES', 'EPERM'].includes(String(error?.code || ''))) return reject(error)
+      if (!['EACCES', 'EPERM'].includes(String(error?.code || ''))) return finish(error)
+      // Windows emits both `error` and a subsequent `close` for a blocked
+      // executable. Ignore that close while the elevated retry is running;
+      // otherwise the close code can reject this promise before RunAs gets a
+      // chance to install the driver.
+      elevatedFallback = true
       try {
         await installBundledTapDriverElevated(installer)
-        resolve()
+        finish()
       } catch (e) {
-        reject(new Error(`网卡驱动安装器无法运行：${e?.message || error.message}`))
+        finish(new Error(`网卡驱动安装器无法运行：${e?.message || error.message}`))
       }
     })
     child.once('close', (code) => {
-      if ([0, 1641, 3010].includes(Number(code))) resolve()
-      else reject(new Error(`网卡驱动安装失败（代码 ${code ?? '未知'}）`))
+      if (elevatedFallback) return
+      if ([0, 1641, 3010].includes(Number(code))) finish()
+      else finish(new Error(`网卡驱动安装失败（代码 ${code ?? '未知'}）`))
     })
   })
 }
@@ -646,11 +674,13 @@ function waitForProcessExit(process, timeoutMs) {
 
 async function stopConnection() {
   if (!connection) {
+    preparedTap = null
     await removeRoomRoute()
     return
   }
   const current = connection
   connection = null
+  preparedTap = null
   try {
     try { current.process.kill() } catch {}
     const exited = await waitForProcessExit(current.process, STOP_TIMEOUT_MS)
