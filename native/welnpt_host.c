@@ -16,6 +16,9 @@
 #define WEL_HOST_PATH_PENDING 0
 #define WEL_HOST_PATH_DIRECT 1
 #define WEL_HOST_PATH_RELAY 2
+/* The WireGuard bridge sends return datagrams to the Host from its
+ * temporary virtual adapter.  Keep this port in sync with welnpt_wg.c. */
+#define WEL_WG_BRIDGE_DATA_PORT 51830
 
 static SOCKET g_socket = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
@@ -78,6 +81,15 @@ static int same_room(const char left[WELNPT_ROOM_LENGTH], const char right[WELNP
 
 static int is_loopback(const struct sockaddr_in *address) {
     return address != NULL && address->sin_addr.S_un.S_addr == htonl(INADDR_LOOPBACK);
+}
+
+static int is_wireguard_bridge(const struct sockaddr_in *address) {
+    /* The bridge's tunnel socket is bound to the same virtual address as the
+     * lease and uses a fixed data port.  This is the only non-loopback source
+     * accepted as an already authenticated direct transport. */
+    return address != NULL && g_logical_ip != 0 &&
+        address->sin_addr.S_un.S_addr == g_logical_ip &&
+        ntohs(address->sin_port) == WEL_WG_BRIDGE_DATA_PORT;
 }
 
 static void signal_ready(void) {
@@ -526,7 +538,8 @@ int main(int argc, char **argv) {
         } else if (received > 0 && received >= (int)sizeof(welnpt_packet_header) &&
             memcmp(packet, "WNP3", 4) == 0) {
             process_wire_packet(packet, received,
-                is_loopback(&source) && g_agent_port != 0 && ntohs(source.sin_port) == g_agent_port);
+                (is_loopback(&source) && g_agent_port != 0 && ntohs(source.sin_port) == g_agent_port) ||
+                is_wireguard_bridge(&source));
         } else if (received > 0 && is_loopback(&source)) {
             process_ice_message(packet, received);
         }

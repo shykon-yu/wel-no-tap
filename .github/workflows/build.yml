@@ -163,12 +163,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           npm run build
 
-      - name: Extract WireGuard runtime without registering manager
+      - name: Extract WELGame network runtime without registering manager
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $installer = (Resolve-Path 'frontend/resources/wireguard/wireguard-amd64-0.5.3.msi').Path
-          $target = (Resolve-Path 'frontend/resources/wireguard').Path + '\runtime'
+          $installer = (Resolve-Path 'frontend/resources/welgame/welgame-amd64.msi').Path
+          $target = (Resolve-Path 'frontend/resources/welgame').Path + '\runtime'
           Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           $args = "/a `"$installer`" TARGETDIR=`"$target`" /qn /norestart DO_NOT_LAUNCH=1"

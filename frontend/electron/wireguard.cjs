@@ -4,9 +4,9 @@ const path = require('node:path')
 const dgram = require('node:dgram')
 const { spawn, spawnSync } = require('node:child_process')
 
-const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform', 'wireguard')
+const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform', 'welgame')
 const bundledRuntimeRoot = path.join(appData, 'runtime')
-const tunnelName = 'WELGame'
+const tunnelName = 'welgame'
 let bridgeProcess = null
 let bridgeLineBuffer = ''
 let bridgeWaiters = new Set()
@@ -29,6 +29,8 @@ function runtimeRoots() {
 function findRuntime() {
   const roots = runtimeRoots().flatMap((root) => [
     root,
+    path.join(root, 'welgame'),
+    path.join(root, 'welgame', 'runtime'),
     path.join(root, 'wireguard'),
     path.join(root, 'WireGuard'),
     path.join(root, 'wireguard', 'runtime'),
@@ -45,6 +47,8 @@ function findRuntime() {
 
 function wireguardInstallerCandidates() {
   return [
+    path.join(process.resourcesPath || '', 'welhelper', 'welgame', 'welgame-amd64.msi'),
+    path.join(__dirname, '..', 'resources', 'welgame', 'welgame-amd64.msi'),
     path.join(process.resourcesPath || '', 'welhelper', 'wireguard', 'wireguard-amd64-0.5.3.msi'),
     path.join(__dirname, '..', 'resources', 'wireguard', 'wireguard-amd64-0.5.3.msi'),
   ].filter(Boolean)
@@ -57,7 +61,7 @@ function locateWireGuardInstaller() {
 function status() {
   const runtime = findRuntime()
   if (!runtime.bridge) return { ...runtime, message: '网卡数据组件缺失，当前使用云中继' }
-  if (!runtime.available) return { ...runtime, message: '系统未安装 WireGuard，当前使用云中继' }
+  if (!runtime.available) return { ...runtime, message: '网卡运行组件未安装，当前使用云中继' }
   return { ...runtime, message: identityState.configPath ? '网卡组件已就绪，等待比赛对手' : '网卡运行组件已就绪' }
 }
 
@@ -92,14 +96,14 @@ function runElevated(executable, args, timeoutMs = 30000) {
     }
     const timer = setTimeout(() => {
       try { child.kill() } catch {}
-      finish(new Error('WireGuard 服务权限请求超时'))
+      finish(new Error('网卡服务权限请求超时'))
     }, timeoutMs)
     child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
     child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
     child.once('error', (error) => finish(error))
     child.once('close', (code) => {
       if (code === 0) return finish()
-      finish(new Error(String(output.join('').trim() || `WireGuard 服务操作失败（代码 ${code ?? '未知'}）`)))
+      finish(new Error(String(output.join('').trim() || `网卡服务操作失败（代码 ${code ?? '未知'}）`)))
     })
   })
 }
@@ -109,12 +113,12 @@ function needsElevation(error) {
 }
 
 async function installBundledWireGuard(installer) {
-  if (process.platform !== 'win32') throw new Error('WireGuard 自动安装仅支持 Windows')
-  if (!installer || !fs.existsSync(installer)) throw new Error('当前安装包缺少 WireGuard 驱动安装文件')
-  // Administrative extraction keeps the signed WireGuard/Wintun files but
+  if (process.platform !== 'win32') throw new Error('网卡自动安装仅支持 Windows')
+  if (!installer || !fs.existsSync(installer)) throw new Error('当前安装包缺少网卡驱动安装文件')
+  // Administrative extraction keeps the signed network runtime files but
   // does not register the official manager in Add/Remove Programs or launch
   // its GUI. The tunnel service is installed later for the temporary WELGame
-  // config by wireguard.exe itself.
+  // config by the bundled service helper itself.
   fs.rmSync(bundledRuntimeRoot, { recursive: true, force: true })
   fs.mkdirSync(bundledRuntimeRoot, { recursive: true })
   await runElevated('msiexec.exe', ['/a', installer, `TARGETDIR=${bundledRuntimeRoot}`, '/qn', '/norestart', 'DO_NOT_LAUNCH=1'], 120000)
@@ -127,14 +131,14 @@ async function ensureWireGuardRuntime(current) {
   try {
     await installBundledWireGuard(installer)
   } catch (error) {
-    return { ...current, message: `WireGuard 自动安装失败：${error?.message || error}` }
+    return { ...current, message: `网卡自动安装失败：${error?.message || error}` }
   }
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const runtime = findRuntime()
     if (runtime.available) return runtime
     await new Promise((resolve) => setTimeout(resolve, 500))
   }
-  return { ...findRuntime(), message: 'WireGuard 安装完成，但运行组件尚未就绪，请重试' }
+  return { ...findRuntime(), message: '网卡安装完成，但运行组件尚未就绪，请重试' }
 }
 
 async function runTunnelCommand(executable, args, { ignoreFailure = false } = {}) {
@@ -165,7 +169,7 @@ function writeInitialConfig() {
   const server = identityState.server || {}
   const serverIp = serverVirtualIp(identityState.subnetCidr)
   const serverEndpoint = endpoint(server.host, server.port)
-  if (!identityState.privateKey || !identityState.virtualIp || !server.publicKey || !serverEndpoint || !serverIp) throw new Error('WireGuard 服务器配置不完整')
+  if (!identityState.privateKey || !identityState.virtualIp || !server.publicKey || !serverEndpoint || !serverIp) throw new Error('网卡服务器配置不完整')
   // The server only learns the NAT endpoint after it has accepted this peer.
   // Use a brief rendezvous keepalive while the player remains in the room;
   // this does not create peers for other room members.
@@ -273,7 +277,7 @@ async function prepareGame() {
 
 async function addPeer(peer) {
   const peerEndpoint = endpoint(peer.endpointHost, peer.endpointPort)
-  if (!peer.publicKey || !peer.virtualIp || !peerEndpoint) throw new Error('WireGuard 对手信息不完整')
+  if (!peer.publicKey || !peer.virtualIp || !peerEndpoint) throw new Error('网卡对手信息不完整')
   await runTunnelCommand(identityState.runtime.wg, ['set', tunnelName, 'peer', String(peer.publicKey), 'allowed-ips', `${peer.virtualIp}/32`, 'endpoint', peerEndpoint, 'persistent-keepalive', '5'])
 }
 

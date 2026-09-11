@@ -413,7 +413,7 @@ async function joinRoom(room: Room) {
       gameTransportSummary.value = '连接中'
       startTransportStatusMonitor()
       directCandidateStatus.value = 'relay-only'
-      directCandidateMessage.value = wg?.available ? '网卡组件已准备，比赛时建立专属通道' : 'WireGuard 组件未就绪，比赛时使用现有直连/中继'
+      directCandidateMessage.value = wg?.available ? '网卡组件已准备，比赛时建立专属通道' : '网卡组件未就绪，比赛时使用现有直连/中继'
       await roomPreparationTask
     } else if (directRoom) {
       roomPreparing.value = true
@@ -852,7 +852,7 @@ async function logout() {
 }
 function messageOf(error: unknown) {
   const message = typeof error === 'string' ? error : error instanceof Error ? error.message : '发生未知错误'
-  return message.replace(/\b(?:TAP(?:-Windows)?|n2n|OpenVPN)\b/gi, '网络组件')
+  return message.replace(/\b(?:TAP(?:-Windows)?|n2n|OpenVPN|WireGuard|Wintun)\b/gi, '网络组件')
 }
 
 function summarizeCandidates(description: string) {
