@@ -30,6 +30,17 @@ function findRuntime() {
   return { wireguard, wg, bridge, available: Boolean(wireguard && wg && bridge), adapterReady: Boolean(identityState.configPath) }
 }
 
+function wireguardInstallerCandidates() {
+  return [
+    path.join(process.resourcesPath || '', 'welhelper', 'wireguard', 'wireguard-amd64-0.5.3.msi'),
+    path.join(__dirname, '..', 'resources', 'wireguard', 'wireguard-amd64-0.5.3.msi'),
+  ].filter(Boolean)
+}
+
+function locateWireGuardInstaller() {
+  return wireguardInstallerCandidates().find((candidate) => fs.existsSync(candidate)) || null
+}
+
 function status() {
   const runtime = findRuntime()
   if (!runtime.bridge) return { ...runtime, message: '网卡数据组件缺失，当前使用云中继' }
@@ -84,6 +95,31 @@ function needsElevation(error) {
   return /(?:exit\s+740|elevation|required|access is denied|拒绝访问|管理员)/i.test(String(error?.message || error || ''))
 }
 
+async function installBundledWireGuard(installer) {
+  if (process.platform !== 'win32') throw new Error('WireGuard 自动安装仅支持 Windows')
+  if (!installer || !fs.existsSync(installer)) throw new Error('当前安装包缺少 WireGuard 驱动安装文件')
+  // The official MSI installs the signed Wintun driver, tools and tunnel
+  // service. It must run elevated even when the platform is not elevated.
+  await runElevated('msiexec.exe', ['/i', installer, '/qn', '/norestart'], 120000)
+}
+
+async function ensureWireGuardRuntime(current) {
+  if (current.available) return current
+  const installer = locateWireGuardInstaller()
+  if (!installer) return current
+  try {
+    await installBundledWireGuard(installer)
+  } catch (error) {
+    return { ...current, message: `WireGuard 自动安装失败：${error?.message || error}` }
+  }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const runtime = findRuntime()
+    if (runtime.available) return runtime
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return { ...findRuntime(), message: 'WireGuard 安装完成，但运行组件尚未就绪，请重试' }
+}
+
 async function runTunnelCommand(executable, args, { ignoreFailure = false } = {}) {
   try {
     runSync(executable, args)
@@ -126,7 +162,7 @@ function writeInitialConfig() {
 
 async function prepare(options = {}) {
   await disconnect()
-  const current = status()
+  const current = await ensureWireGuardRuntime(status())
   if (!current.available) return current
   const server = options.server || {}
   if (!options.virtualIp || !options.subnetCidr || !server.host || !server.port || !server.publicKey) return { ...current, available: false, adapterReady: false, message: '服务器未下发完整网卡配置，当前使用云中继' }
@@ -294,4 +330,4 @@ function onGamePeer(listener) {
   gamePeerListeners.add(listener)
   return () => gamePeerListeners.delete(listener)
 }
-module.exports = { status, prepare, prepareGame, connectPeer, clearPeer, disconnect, identity, transportStatus, onTransportChange, onGamePeer, serverVirtualIp, parseGamePeerLine }
+module.exports = { status, prepare, prepareGame, connectPeer, clearPeer, disconnect, identity, transportStatus, onTransportChange, onGamePeer, serverVirtualIp, parseGamePeerLine, locateWireGuardInstaller }
