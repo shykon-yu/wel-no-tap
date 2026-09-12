@@ -15,7 +15,7 @@
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
-#define WELNPT_ICE_SESSION_TIMEOUT_MS 12000
+#define WELNPT_ICE_SESSION_TIMEOUT_MS 30000
 #define WELNPT_MODULE_SCAN_MS 1000
 #define WELNPT_DATAGRAM_POOL_SIZE 1024
 #define WELNPT_STATS_INTERVAL_MS 5000
@@ -581,10 +581,9 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length) return 0;
 	kind = classify_control_payload(packet + sizeof(*header), payload_length);
-	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && kind == WELNPT_PAYLOAD_SEARCH &&
-		header->source_ip == g_direct_transaction_peer_ip) {
-		reset_game_session("peer-search-broadcast");
-	}
+    /* A 24-byte search broadcast can be repeated while WE8 is in the team or
+       kit screens. It is not a session end signal; only the match socket
+       close below may return an active session to WAIT_JOIN. */
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		(kind == WELNPT_PAYLOAD_JOIN || kind == WELNPT_PAYLOAD_ACCEPT);
 	if (session_signal) {
@@ -830,9 +829,8 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) header->flags |= WELNPT_FLAG_BROADCAST;
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
 	kind = classify_control_payload(payload, length);
-	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && kind == WELNPT_PAYLOAD_SEARCH) {
-		reset_game_session("search-broadcast");
-	}
+	/* Search broadcasts are valid throughout the pre-match screens. Do not
+	   tear down an established ICE session merely because WE8 probes again. */
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		(kind == WELNPT_PAYLOAD_JOIN || kind == WELNPT_PAYLOAD_ACCEPT);
 	if (session_signal) {
@@ -1401,14 +1399,18 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                 log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"peer-ice-failed\"",
                     (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
             } else if (disconnected && selected == WELNPT_GAME_PATH_DIRECT) {
-                InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
-                selected = WELNPT_GAME_PATH_RELAY;
-                notify_agent_transport_state("relay");
-                log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"direct-disconnected\"");
-                log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"direct-disconnected\"",
-                    (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
+                /* libjuice may report a transient disconnected state while
+                   WE8 is idle in team/kit screens. Keep the selected direct
+                   path; an actual send error or terminal ICE failure will
+                   perform the relay fallback. */
+                log_line("\"api\":\"direct-state\",\"state\":\"disconnected\",\"action\":\"keep-direct\"");
             }
-            InterlockedExchange(&g_direct_connected, connected && selected == WELNPT_GAME_PATH_DIRECT);
+            /* Keep the direct transport eligible during a transient
+               disconnected notification. A hard send error or terminal
+               failed state below still disables it and falls back to relay. */
+            InterlockedExchange(&g_direct_connected,
+                (connected || (disconnected && selected == WELNPT_GAME_PATH_DIRECT)) &&
+                selected == WELNPT_GAME_PATH_DIRECT);
             log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"", received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
             continue;
         }

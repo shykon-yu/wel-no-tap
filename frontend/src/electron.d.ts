@@ -33,7 +33,7 @@ declare global {
       ensureFirewall: (options: { gamePath?: string }) => Promise<{ state: string; warning?: string; missing?: Array<{ name: string }>; blockers?: Array<{ name: string }> }>
       transportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct'; directState: string; summary: string }>
       chooseGame: () => Promise<string | null>
-      launchGame: (options: { gamePath: string; relay: string; room: string; logicalIp: string; token: string; direct: boolean; mode?: 'tap' | 'direct' | 'relay' | 'wireguard'; directAgentPort?: number; directHookPort?: number }) => Promise<{ started: boolean; detail: string; warnings?: string[] }>
+      launchGame: (options: { gamePath: string; relay: string; room: string; logicalIp: string; token: string; direct: boolean; mode?: 'tap' | 'direct' | 'relay' }) => Promise<{ started: boolean; detail: string; warnings?: string[] }>
       disconnect: () => Promise<{ stopped: boolean }>
       onBeforeQuit: (callback: () => void) => () => void
       completeQuit: () => Promise<void>
@@ -55,13 +55,6 @@ declare global {
       tapTransportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct' | 'mixed'; peers: number; directPeers: number; relayPeers: number; summary: string }>
       tapDisconnect: () => Promise<{ stopped?: boolean } | void>
       tapInspect: (options: { subnetCidr: string }) => Promise<DesktopLeaseStatus | null>
-      wireguardStatus: () => Promise<{ available: boolean; adapterReady: boolean; message: string }>
-      wireguardPrepare: (options: { subnetCidr: string; virtualIp: string; server: { host: string; port: number; publicKey: string } }) => Promise<{ available: boolean; adapterReady: boolean; message: string; publicKey?: string }>
-      wireguardPrepareGame: () => Promise<{ ready: boolean; agentPort: number; hookPort: number; message: string }>
-      wireguardConnectPeer: (options: { logicalIp: string; peer?: { publicKey: string; endpointHost: string; endpointPort: number; virtualIp: string } }) => Promise<{ path: 'pending' | 'direct' | 'relay'; summary: string }>
-      wireguardTransportStatus: () => Promise<{ path: 'pending' | 'relay' | 'direct'; directState: string; summary: string }>
-      wireguardClearPeer: () => Promise<{ cleared: boolean }>
-      wireguardDisconnect: () => Promise<{ stopped: boolean }>
     }
   }
 }

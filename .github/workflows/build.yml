@@ -83,12 +83,6 @@ jobs:
           )
           & "$output/welnpthost.exe" --self-test
           if ($LASTEXITCODE -ne 0) { throw 'external Host self-test failed' }
-          Invoke-Compiler 'WireGuard data bridge' @(
-            '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
-            'native/welnpt_wg.c', "/Fe:$output/welnptwg.exe", '/link', 'Ws2_32.lib'
-          )
-          & "$output/welnptwg.exe" --self-test
-          if ($LASTEXITCODE -ne 0) { throw 'WireGuard data bridge self-test failed' }
           Invoke-Compiler 'UDP relay' @(
             '/nologo', '/W4', '/O2', '/MT', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
             'native/welnpt_relay.c', "/Fe:$output/welnptrelay.exe", '/link', 'Ws2_32.lib'
@@ -162,20 +156,6 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           npm run build
-
-      - name: Extract WELGame network runtime without registering manager
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $installer = (Resolve-Path 'frontend/resources/welgame/welgame-amd64.msi').Path
-          $target = (Resolve-Path 'frontend/resources/welgame').Path + '\runtime'
-          Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          $args = "/a `"$installer`" TARGETDIR=`"$target`" /qn /norestart DO_NOT_LAUNCH=1"
-          $p = Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
-          if ($p.ExitCode -notin @(0, 1641, 3010)) { throw "WireGuard runtime extraction failed: $($p.ExitCode)" }
-          if (-not (Get-ChildItem $target -Recurse -Filter wireguard.exe | Select-Object -First 1)) { throw 'wireguard.exe missing after extraction' }
-          if (-not (Get-ChildItem $target -Recurse -Filter wg.exe | Select-Object -First 1)) { throw 'wg.exe missing after extraction' }
 
       - name: Package Electron installer
         shell: pwsh

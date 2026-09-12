@@ -6,7 +6,6 @@ const { version: appVersion } = require('../package.json')
 const { publicConfig } = require('./config.cjs')
 const notap = require('./notap.cjs')
 const tap = require('./tap.cjs')
-const wireguard = require('./wireguard.cjs')
 const tapGame = require('./tap-game-launch.cjs')
 const { ensureWe8Firewall } = require('./tap-firewall.cjs')
 const firewall = require('./firewall.cjs')
@@ -219,28 +218,12 @@ ipcMain.handle('tap-connect', (_event, options) => tap.connect(options))
 ipcMain.handle('tap-transport-status', () => tap.transportStatus())
 ipcMain.handle('tap-disconnect', () => tap.stopConnection())
 ipcMain.handle('tap-inspect', () => tap.activeNetwork())
-ipcMain.handle('wireguard-status', () => wireguard.status())
-ipcMain.handle('wireguard-prepare', (_event, options) => wireguard.prepare(options))
-ipcMain.handle('wireguard-prepare-game', () => wireguard.prepareGame())
-ipcMain.handle('wireguard-connect-peer', (_event, options) => wireguard.connectPeer(options))
-ipcMain.handle('wireguard-transport-status', () => wireguard.transportStatus())
-ipcMain.handle('wireguard-clear-peer', () => wireguard.clearPeer())
-ipcMain.handle('wireguard-disconnect', async () => {
-  await wireguard.disconnect()
-  return notap.disconnect()
-})
 ipcMain.handle('platform-complete-quit', finishQuit)
 
 notap.onGamePeer((logicalIp) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-game-peer', logicalIp)
 })
-wireguard.onGamePeer((gamePeer) => {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-game-peer', gamePeer)
-})
 notap.onTransportChange((status) => {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-transport-change', status)
-})
-wireguard.onTransportChange((status) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-transport-change', status)
 })
 
@@ -288,7 +271,7 @@ app.on('before-quit', (event) => {
   isQuitting = true
   if (transportShutdownComplete) return
   event.preventDefault()
-  Promise.allSettled([tap.stopConnection(), wireguard.disconnect(), notap.disconnect()]).finally(() => {
+  Promise.allSettled([tap.stopConnection(), notap.disconnect()]).finally(() => {
     transportShutdownComplete = true
     app.quit()
   })

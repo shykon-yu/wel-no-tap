@@ -104,4 +104,7 @@ test('parses Windows Ping output for a TAP peer', () => {
   })
   assert.equal(parsePingSummary('10.222.1.11', 'Reply from 10.222.1.11: bytes=32 time=2ms TTL=128\nAverage = 2ms').summary, '可达，平均 2ms')
   assert.equal(parsePingSummary('10.222.1.11', '来自 10.222.1.11 的回复: 字节=32 时间<1ms TTL=128').summary, '可达，平均 1ms')
+  assert.equal(parsePingSummary('10.222.1.11', 'Reply from 10.222.1.11: bytes=32 time<1ms TTL=128').summary, '可达，平均 1ms')
+  assert.equal(parsePingSummary('10.222.1.11', '来自 10.222.1.11 的回复: 字节=32 延迟 2 毫秒 TTL=128').summary, '可达，平均 2ms')
+  assert.equal(parsePingSummary('10.222.1.11', 'Reply from 10.222.1.11: bytes=32 time=2 ms TTL=128').summary, '可达，平均 2ms')
 })

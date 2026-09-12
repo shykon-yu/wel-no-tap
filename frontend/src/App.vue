@@ -33,7 +33,7 @@ const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => r
 // label prevents stale room data from being presented as a different transport
 // (for example, a TAP lease shown as "直连01").
 const roomLabel = (roomID: number, mode?: Room['connection_mode']) =>
-  `${mode === 'tap' || mode === 'wireguard' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
+  `${mode === 'tap' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
 const displayRoomName = (room: Room) => roomLabel(room.id, room.connection_mode)
 const activeRoomName = computed(() => activeRoom.value
   ? displayRoomName(activeRoom.value)
@@ -41,7 +41,7 @@ const activeRoomName = computed(() => activeRoom.value
 const roomInfoTitle = computed(() => activeLease.value ? activeRoomName.value : '未进入房间')
 const roomInfoSubtitle = computed(() => {
   if (!activeLease.value) return '请选择一个可用房间进入'
-  if (activeLease.value.connection_mode === 'tap' || activeLease.value.connection_mode === 'wireguard') return `${activeRoomName.value} · 网卡房间已连接`
+  if (activeLease.value.connection_mode === 'tap') return `${activeRoomName.value} · 网卡房间已连接`
   if (activeLease.value.connection_mode === 'relay') return `${activeRoomName.value} · 仅使用云中继`
   if (directCandidateStatus.value === 'gathering') return `${activeRoomName.value} · 直连组件准备中，中继已连接`
   if (directCandidateStatus.value === 'ready') return `${activeRoomName.value} · 中继已连接 · 直连候选已就绪`
@@ -56,7 +56,10 @@ const gamePathLabel = computed(() => gamePath.value.trim() || `未选择 ${runti
 const desktop = () => window.welNoTapDesktop
 const heartbeatIntervalMs = 5 * 60 * 1000
 const sessionCheckIntervalMs = 30 * 1000
-const roomMembersIntervalMs = 3 * 1000
+// Member presence is control-plane information. Keep it fresh without
+// competing with game signaling; a new game peer still triggers an immediate
+// members fetch from the Hook event path.
+const roomMembersIntervalMs = 5 * 1000
 let heartbeatTimer: number | undefined
 let sessionCheckTimer: number | undefined
 let roomMembersTimer: number | undefined
@@ -78,8 +81,6 @@ let gamePeerEpoch = 0
 let roomPreparationEpoch = 0
 let roomPreparationTask: Promise<'ready' | 'relay-only'> | null = null
 let gamePeerOperation: Promise<boolean> = Promise.resolve(true)
-let wireGuardPublicKey = ''
-let wireGuardGamePorts = { agentPort: 0, hookPort: 0 }
 
 function stopLeaseHeartbeat() {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
@@ -141,8 +142,6 @@ function clearRoomSessionState() {
   directGameEnabled = false
   gamePeerEpoch = 0
   gamePeerOperation = Promise.resolve(true)
-  wireGuardPublicKey = ''
-  wireGuardGamePorts = { agentPort: 0, hookPort: 0 }
   roomPreparationEpoch += 1
 }
 
@@ -154,7 +153,6 @@ async function resetMatchTransport() {
   activeGamePeerAgentUsed = false
   gamePeerEpoch += 1
   gamePeerOperation = Promise.resolve(true)
-  if (activeLease.value?.connection_mode === 'wireguard') await desktop()?.wireguardClearPeer?.()
 }
 
 function stopTransportStatusMonitor() {
@@ -167,8 +165,7 @@ function startTransportStatusMonitor() {
   const desktopApi = desktop()
   if (!desktopApi) return
   const tapRoom = activeLease.value?.connection_mode === 'tap'
-  const wireguardRoom = activeLease.value?.connection_mode === 'wireguard'
-  const readStatus = tapRoom ? desktopApi.tapTransportStatus : wireguardRoom ? desktopApi.wireguardTransportStatus : desktopApi.transportStatus
+  const readStatus = tapRoom ? desktopApi.tapTransportStatus : desktopApi.transportStatus
   if (!readStatus) return
   const roomID = activeLease.value?.room_id
   const refresh = async () => {
@@ -178,9 +175,9 @@ function startTransportStatusMonitor() {
     } catch { /* status is best effort */ }
   }
   void refresh()
-  /* TAP/WireGuard status comes from the management plane, not game packets.
+  /* TAP status comes from the management plane, not game packets.
      A slow poll keeps the room label current without adding data-path work. */
-  if (tapRoom || wireguardRoom) {
+  if (tapRoom) {
     transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
   } else {
     transportStatusTimer = undefined
@@ -217,7 +214,7 @@ async function forceSignedOut(message: string) {
   stopRoomMembersMonitor()
   const lease = activeLease.value
   if (lease) {
-    try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else if (lease.connection_mode === 'wireguard') await desktop()?.wireguardDisconnect?.(); else await desktop()?.disconnect() } catch { /* the server has already revoked this session */ }
+    try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* the server has already revoked this session */ }
   }
   clearRoomSessionState()
   user.value = null
@@ -244,7 +241,7 @@ async function renewLease(epoch: number) {
       if (epoch !== leaseEpoch) return
       stopLeaseHeartbeat()
       stopRoomMembersMonitor()
-      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else if (lease.connection_mode === 'wireguard') await desktop()?.wireguardDisconnect?.(); else await desktop()?.disconnect() } catch { /* local connection may already be gone */ }
+      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* local connection may already be gone */ }
       activeLease.value = null
       networkStatus.value = null
       await loadRooms()
@@ -295,7 +292,7 @@ async function restoreSession() {
   await loadRooms()
   startSessionMonitor()
   if (previousLease) {
-    try { if (previousLease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else if (previousLease.connection_mode === 'wireguard') await desktop()?.wireguardDisconnect?.(); else await desktop()?.disconnect() } catch { /* best effort cleanup */ }
+    try { if (previousLease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* best effort cleanup */ }
     try { await roomApi.leave(previousLease.room_id) } catch { /* stale room state will expire server-side */ }
     notice.value = '已清理上次房间状态，请重新进入房间'
     await loadRooms()
@@ -356,14 +353,13 @@ async function joinRoom(room: Room) {
     activeLease.value = lease
     const preparationEpoch = ++roomPreparationEpoch
     const directRoom = lease.connection_mode === 'direct'
-    const wireguardRoom = lease.connection_mode === 'wireguard'
     const tapRoom = lease.connection_mode === 'tap'
-    directCandidateStatus.value = directRoom || wireguardRoom ? 'gathering' : 'relay-only'
-    directCandidateMessage.value = tapRoom || wireguardRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
+    directCandidateStatus.value = directRoom ? 'gathering' : 'relay-only'
+    directCandidateMessage.value = tapRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
     networkStatus.value = {
       ready: true,
       connected: true,
-      message: tapRoom || wireguardRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
+      message: tapRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '房间已准备，当前使用云中继',
       actualIp: lease.logical_ip || lease.virtual_ip,
     }
     roomPreparationTask = directRoom ? prepareRoomTools(lease, preparationEpoch) : Promise.resolve<'relay-only'>('relay-only')
@@ -377,44 +373,6 @@ async function joinRoom(room: Room) {
       networkStatus.value = { ...network, connected: true, ready: true, actualIp: network.actualIp || lease.virtual_ip }
       gameTransportSummary.value = '连接中'
       startTransportStatusMonitor()
-    } else if (wireguardRoom) {
-      roomPreparing.value = true
-      roomPreparationMessage.value = '正在准备网卡组件'
-      let wg: { available: boolean; adapterReady: boolean; message: string; publicKey?: string } | undefined
-      try {
-        wg = await desktopApi?.wireguardPrepare?.({
-          subnetCidr: lease.subnet_cidr,
-          virtualIp: lease.virtual_ip,
-          server: {
-            host: lease.wireguard_server_host || '',
-            port: lease.wireguard_server_port || 0,
-            publicKey: lease.wireguard_server_public_key || '',
-          },
-        })
-      } catch (error) {
-        warningMessage.value = `网卡组件暂不可用，本场使用云中继：${messageOf(error)}`
-      }
-      if (wg && !wg.available) warningMessage.value = wg.message
-      if (wg?.available && wg.publicKey) {
-        wireGuardPublicKey = wg.publicKey
-        try {
-          await roomApi.registerWireGuardClient(lease.room_id, wg.publicKey)
-        } catch (error) {
-          // A server-side WireGuard rollout must not eject the player from
-          // the room: Hook plus relay remains the defined fallback.
-          wireGuardPublicKey = ''
-          // Do not leave an unregistered temporary adapter running. The
-          // normal room lease remains active and the game will use the
-          // existing Hook/relay path instead.
-          try { await desktopApi?.wireguardDisconnect?.() } catch {}
-          warningMessage.value = `网卡汇合服务暂不可用，本场使用云中继：${messageOf(error)}`
-        }
-      }
-      gameTransportSummary.value = '连接中'
-      startTransportStatusMonitor()
-      directCandidateStatus.value = 'relay-only'
-      directCandidateMessage.value = wg?.available ? '网卡组件已准备，比赛时建立专属通道' : '网卡组件未就绪，比赛时使用现有直连/中继'
-      await roomPreparationTask
     } else if (directRoom) {
       roomPreparing.value = true
       roomPreparationMessage.value = '直连组件准备中，请稍候'
@@ -428,7 +386,7 @@ async function joinRoom(room: Room) {
     startRoomMembersMonitor()
     roomPreparing.value = false
     roomPreparationMessage.value = ''
-    notice.value = tapRoom || wireguardRoom ? '已进入网卡房间，网络组件已连接' : directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
+    notice.value = tapRoom ? '已进入网卡房间，网络组件已连接' : directRoom ? `已进入房间，${directCandidateMessage.value}` : '已进入房间，当前使用云中继'
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       await forceSignedOut(error.message)
@@ -437,7 +395,7 @@ async function joinRoom(room: Room) {
     stopLeaseHeartbeat()
     stopRoomMembersMonitor()
     if (lease) {
-      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else if (lease.connection_mode === 'wireguard') await desktop()?.wireguardDisconnect?.(); else await desktop()?.disconnect() } catch { /* connection setup may be incomplete */ }
+      try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch { /* connection setup may be incomplete */ }
     }
     if (lease) try { await roomApi.leave(room.id) } catch { /* the lease reaper will clean it up */ }
     activeLease.value = null
@@ -456,7 +414,7 @@ async function releaseActiveLease() {
   stopLeaseHeartbeat()
   stopRoomMembersMonitor()
   let cleanupError: unknown
-  try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else if (lease.connection_mode === 'wireguard') await desktop()?.wireguardDisconnect?.(); else await desktop()?.disconnect() } catch (error) { cleanupError = error }
+  try { if (lease.connection_mode === 'tap') await desktop()?.tapDisconnect?.(); else await desktop()?.disconnect() } catch (error) { cleanupError = error }
   try {
     await roomApi.leave(lease.room_id)
   } catch (error) {
@@ -531,25 +489,8 @@ async function launchGameNow() {
     directGameEnabled = false
     gamePeerEpoch += 1
     gamePeerOperation = Promise.resolve(true)
-    const wireguardRoom = activeLease.value.connection_mode === 'wireguard'
     let useDirect = activeLease.value.connection_mode === 'direct'
-    wireGuardGamePorts = { agentPort: 0, hookPort: 0 }
-    if (wireguardRoom && desktop()?.wireguardPrepareGame) {
-      try {
-        const prepared = await desktop()!.wireguardPrepareGame()
-        if (prepared.ready) {
-          useDirect = true
-          wireGuardGamePorts = { agentPort: prepared.agentPort, hookPort: prepared.hookPort }
-        } else {
-          warningMessage.value = prepared.message
-        }
-      } catch (error) {
-        // The temporary bridge is optional. Keep the room and launch the game
-        // through the existing Hook/relay path when it cannot start.
-        useDirect = false
-        warningMessage.value = `网卡数据通道未就绪，本场使用云中继：${messageOf(error)}`
-      }
-    } else if (useDirect && desktop()?.prepareGameIce) {
+    if (useDirect && desktop()?.prepareGameIce) {
       try {
         const ice = await desktop()!.prepareGameIce()
         localIceDescription.value = ice.localDescription
@@ -567,8 +508,6 @@ async function launchGameNow() {
       token: activeLease.value.relay_token,
       direct: useDirect,
       mode: activeLease.value.connection_mode,
-      directAgentPort: wireGuardGamePorts.agentPort,
-      directHookPort: wireGuardGamePorts.hookPort,
     })
     const warnings = [...(result.warnings || [])]
     if (!useDirect && activeLease.value.connection_mode === 'direct') {
@@ -701,49 +640,6 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   } catch { return false }
   if (!member || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
 
-  if (lease.connection_mode === 'wireguard') {
-    try {
-      if (!wireGuardPublicKey || !desktop()?.wireguardConnectPeer) return false
-      // Both peers observe the join packet with opposite source/target ports,
-      // so the packet transaction key is intentionally not part of the shared
-      // server key. A pair-scoped key lets a later match replace the previous
-      // short-lived peer record without requiring a second room connection.
-      const matchKey = `match-${Math.min(user.value.id, member.user_id)}-${Math.max(user.value.id, member.user_id)}`
-      // The server can return before its WireGuard interface has learned this
-      // client's NAT endpoint. Retry the small registration operation briefly;
-      // do not keep polling or reconfigure the game data path indefinitely.
-      let published = false
-      for (let attempt = 0; attempt < 5 && epoch === gamePeerEpoch; attempt += 1) {
-        try {
-          await roomApi.publishWireGuardPeer(lease.room_id, { target_user_id: member.user_id, match_key: matchKey, public_key: wireGuardPublicKey })
-          published = true
-          break
-        } catch {
-          if (attempt < 4) await new Promise(resolve => window.setTimeout(resolve, 750))
-        }
-      }
-      if (!published || epoch !== gamePeerEpoch) return false
-      const deadline = Date.now() + 5000
-      let peer: import('./api').WireGuardPeer | null = null
-      while (Date.now() < deadline && epoch === gamePeerEpoch) {
-        const response = await roomApi.wireGuardPeer(lease.room_id, matchKey)
-        peer = response.peer
-        if (peer) break
-        await new Promise(resolve => window.setTimeout(resolve, 250))
-      }
-      if (peer) {
-        const result = await desktop()!.wireguardConnectPeer({ logicalIp, peer: {
-          publicKey: peer.public_key, endpointHost: peer.endpoint_host, endpointPort: peer.endpoint_port, virtualIp: peer.virtual_ip,
-        } })
-        if (result.path === 'direct') {
-          gameTransportSummary.value = result.summary || '直连'
-          return true
-        }
-      }
-    } catch {
-      // WireGuard is an optimization; keep the tested Hook/ICE/relay fallback.
-    }
-  }
   if (!directGameEnabled || lease.connection_mode !== 'direct' || !desktop()?.configureIce || !desktop()?.resetIce) return false
 
   // The lower user ID is the single offerer for this match. Both peers use
@@ -792,7 +688,7 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
 }
 
 function configureGamePeer(event: { logicalIp: string; transactionKey: string }) {
-  if (activeLease.value?.connection_mode !== 'direct' && activeLease.value?.connection_mode !== 'wireguard') return
+  if (activeLease.value?.connection_mode !== 'direct') return
   const normalizedIp = String(event?.logicalIp || '').trim()
   const transactionKey = String(event?.transactionKey || normalizedIp).trim()
   if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
@@ -925,7 +821,7 @@ onBeforeUnmount(() => {
 
       <div class="room-workspace">
         <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">网卡房间会加载虚拟网卡组件，进入房间和启动游戏可能比其他房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' || room.connection_mode === 'wireguard' ? '直连/中继' : room.connection_mode === 'direct' ? 'P2P直连/云中继' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '直连/中继' : room.connection_mode === 'direct' ? 'P2P直连/云中继' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>
@@ -934,7 +830,7 @@ onBeforeUnmount(() => {
         <div v-if="roomPreparing || launchingGame" class="preparation-backdrop" role="status" aria-live="polite">
           <section class="preparation-panel">
             <LoaderCircle :size="34" class="spinning" />
-            <h3>{{ roomPreparing ? (activeLease?.connection_mode === 'tap' || activeLease?.connection_mode === 'wireguard' ? '网卡组件准备中' : '直连组件准备中') : '游戏组件准备中' }}</h3>
+            <h3>{{ roomPreparing ? (activeLease?.connection_mode === 'tap' ? '网卡组件准备中' : '直连组件准备中') : '游戏组件准备中' }}</h3>
             <p>{{ roomPreparing ? roomPreparationMessage : '正在检查并加载游戏联机组件' }}</p>
           </section>
         </div>

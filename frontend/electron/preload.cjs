@@ -42,11 +42,4 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   tapTransportStatus: () => ipcRenderer.invoke('tap-transport-status'),
   tapDisconnect: () => ipcRenderer.invoke('tap-disconnect'),
   tapInspect: (options) => ipcRenderer.invoke('tap-inspect', options),
-  wireguardStatus: () => ipcRenderer.invoke('wireguard-status'),
-  wireguardPrepare: (options) => ipcRenderer.invoke('wireguard-prepare', options),
-  wireguardPrepareGame: () => ipcRenderer.invoke('wireguard-prepare-game'),
-  wireguardConnectPeer: (options) => ipcRenderer.invoke('wireguard-connect-peer', options),
-  wireguardTransportStatus: () => ipcRenderer.invoke('wireguard-transport-status'),
-  wireguardClearPeer: () => ipcRenderer.invoke('wireguard-clear-peer'),
-  wireguardDisconnect: () => ipcRenderer.invoke('wireguard-disconnect'),
 })

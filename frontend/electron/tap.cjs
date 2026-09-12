@@ -714,8 +714,11 @@ function parsePingSummary(host, output) {
   const text = String(output || '').replace(/\r?\n/g, '\n')
   const reachable = /TTL\s*[=:]/i.test(text) || /时间\s*[<＝=]\s*\d+\s*ms/i.test(text) || /time\s*[<＝=]\s*\d+\s*ms/i.test(text)
   const loss = text.match(/(\d+)%\s*(?:loss|丢失)/i)?.[1]
-  const average = text.match(/(?:Average|平均(?:值)?)[^0-9]*(\d+)\s*ms/i)?.[1]
-    || text.match(/(?:time|时间)\s*[<＝=]\s*(\d+)\s*ms/i)?.[1]
+  const average = text.match(/(?:Average|平均(?:值)?)[^0-9]{0,24}(\d+(?:\.\d+)?)\s*(?:ms|毫秒)/i)?.[1]
+    || text.match(/(?:time|时间|latency|延迟)[^0-9]{0,12}(\d+(?:\.\d+)?)\s*(?:ms|毫秒)/i)?.[1]
+    || text.match(/(?:[<＝=]\s*)(\d+(?:\.\d+)?)\s*(?:ms|毫秒)/i)?.[1]
+    || text.match(/(?:time|时间)[^0-9]{0,12}(\d+(?:\.\d+)?)\s*(?:ms)?/i)?.[1]
+    || text.match(/(\d+(?:\.\d+)?)\s*(?:ms|毫秒)/i)?.[1]
   const averageText = average ? `${average}ms` : ''
   const parts = [reachable ? '可达' : '不可达']
   if (averageText) parts.push(`平均 ${averageText}`)
@@ -911,7 +914,13 @@ async function transportStatus() {
     return { path: 'pending', peers: 0, directPeers: 0, relayPeers: 0, summary: '网络组件未连接' }
   }
   try {
-    const result = classifyN2NPeers(await queryEdgeManagement('edges', connection.managementPort || EDGE_MANAGEMENT_PORT))
+    // Older edge builds ignore the explicit management port and continue to
+    // listen on the default 5644. Try the configured port first, then the
+    // default, so a valid n2n edge is not left displayed as "连接中".
+    const configuredPort = connection.managementPort || EDGE_MANAGEMENT_PORT
+    let rows = await queryEdgeManagement('edges', configuredPort)
+    if (rows.length === 0 && configuredPort !== 5644) rows = await queryEdgeManagement('edges', 5644)
+    const result = classifyN2NPeers(rows)
     const summary = result.path === 'direct'
       ? '直连'
       : result.path === 'relay'

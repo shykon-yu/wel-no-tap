@@ -20,6 +20,10 @@ let iceState = 'waiting'
 let iceLocalDescription = ''
 let iceAgentPort = 0
 let iceHookPort = 0
+// Keep the active ICE UDP mapping stable for the lifetime of a room. A reset
+// of the agent reuses this port after the old child exits instead of creating
+// a new NAT mapping during the same match flow.
+let activeIcePort = 0
 let iceLineBuffer = ''
 let iceSdpBuffer = ''
 let readingIceSdp = false
@@ -229,14 +233,29 @@ function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
 }
 
-function chooseIcePort() {
+function chooseIcePort(preferredPort = 0) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket('udp4')
-    socket.once('error', reject)
-    socket.bind(0, '0.0.0.0', () => {
+    let retried = false
+    const bind = (port) => socket.bind(port, '0.0.0.0', () => {
       const address = socket.address()
       socket.close(() => resolve(Number(address.port) || 0))
     })
+    socket.on('error', () => {
+      if (preferredPort && !retried) {
+        retried = true
+        try { socket.close() } catch {}
+        const fallback = dgram.createSocket('udp4')
+        fallback.once('error', reject)
+        fallback.bind(0, '0.0.0.0', () => {
+          const address = fallback.address()
+          fallback.close(() => resolve(Number(address.port) || 0))
+        })
+        return
+      }
+      reject(new Error('无法分配 ICE UDP 端口'))
+    })
+    bind(preferredPort || 0)
   })
 }
 
@@ -575,7 +594,8 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
   if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
-  const icePort = await chooseIcePort()
+  const icePort = activeIcePort || await chooseIcePort(8978)
+  activeIcePort = icePort
   iceUpnpMapping = await requestUpnpMapping(icePort, 'active-' + Date.now().toString(36))
   iceHookPort = Number(hookPort) || chooseHookPort()
   iceOptions = { stunHost, stunPort, relay, room, logicalIp, token }
@@ -961,7 +981,9 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     }
   })
   const gatheringPromise = new Promise((resolve, reject) => {
-    const deadline = Date.now() + (standby ? 26000 : 12000)
+    // STUN can be slow on first use; keep the active and standby agents
+    // consistent with the 30-second session decision window.
+    const deadline = Date.now() + 30000
     const timer = setInterval(() => {
       if (probe.localDescription && probe.localPort && probeAgents.get(key) === probe) {
         clearInterval(timer)
@@ -1096,7 +1118,7 @@ function windowsCommandArgument(value) {
   return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
 }
 
-function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true, directAgentPort = 0, directHookPort = 0, mode = 'direct' }) {
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct' }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const host = locate(hostCandidates())
@@ -1111,8 +1133,8 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
   const args = ['--game', executable, '--hook', hook, '--host', host, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token)]
   if (diagnosticLogEnabled && logPath) args.push('--log', logPath)
-  const agentPort = mode === 'wireguard' ? Number(directAgentPort) : iceAgentPort
-  const hookPort = mode === 'wireguard' ? Number(directHookPort) : iceHookPort
+  const agentPort = iceAgentPort
+  const hookPort = iceHookPort
   if (direct && agentPort && hookPort) {
     args.push('--direct-agent-port', String(agentPort), '--direct-hook-port', String(hookPort))
   }
@@ -1122,7 +1144,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
 async function launchElevated(options) {
   // Match the normal launch path: validate or rotate to a clean direct agent
   // before the elevated helper injects the Hook.
-  if (options?.direct !== false && options?.mode !== 'wireguard') {
+  if (options?.direct !== false && options?.mode === 'direct') {
     await prepareGameIce()
   }
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
@@ -1135,7 +1157,7 @@ async function launchElevated(options) {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  if (options?.mode !== 'wireguard') void prewarmIce()
+  if (options?.mode === 'direct') void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -1166,7 +1188,7 @@ async function launchElevated(options) {
   })
 }
 
-async function launch({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct', directAgentPort = 0, directHookPort = 0 }) {
+async function launch({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct' }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
   const host = locate(hostCandidates())
@@ -1176,7 +1198,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true, 
   if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
-  if (direct && mode !== 'wireguard') {
+  if (direct && mode === 'direct') {
     await prepareGameIce()
   }
 
@@ -1192,8 +1214,8 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true, 
     WEL_NOTAP_DIAGNOSTIC_LOG: diagnosticLogEnabled ? 'true' : 'false',
   }
   if (diagnosticLogEnabled && logPath) environment.WEL_NOTAP_LOG_PATH = logPath
-  const agentPort = mode === 'wireguard' ? Number(directAgentPort) : iceAgentPort
-  const hookPort = mode === 'wireguard' ? Number(directHookPort) : iceHookPort
+  const agentPort = iceAgentPort
+  const hookPort = iceHookPort
   if (direct && agentPort && hookPort) {
     environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(agentPort)
     environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(hookPort)
@@ -1205,7 +1227,7 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true, 
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  if (mode !== 'wireguard') void prewarmIce()
+  if (mode === 'direct') void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
@@ -1255,6 +1277,7 @@ async function disconnect() {
   await clearStandbyAgent()
   iceState = 'waiting'
   iceLocalDescription = ''
+  activeIcePort = 0
   if (pendingRelayPing) {
     const pending = pendingRelayPing
     pendingRelayPing = null

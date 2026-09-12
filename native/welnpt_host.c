@@ -11,7 +11,7 @@
 #include "welnpt_protocol.h"
 
 #define WEL_HOST_BUFFER_SIZE (sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD)
-#define WEL_HOST_SESSION_TIMEOUT_MS 12000
+#define WEL_HOST_SESSION_TIMEOUT_MS 30000
 #define WEL_HOST_HEARTBEAT_MS 2000
 #define WEL_HOST_PATH_PENDING 0
 #define WEL_HOST_PATH_DIRECT 1
@@ -291,7 +291,9 @@ static void process_game_frame(const welnpt_host_frame *frame, const char *paylo
     unsigned short join_port;
     if (frame == NULL) return;
     kind = classify_control_payload(payload, (int)ntohs(frame->payload_length));
-    if ((frame->flags & WELNPT_FLAG_BROADCAST) != 0 && kind == WEL_HOST_PAYLOAD_SEARCH) reset_session();
+    /* Search broadcasts can be repeated during team/kit selection and do not
+       end the current match session. The Hook reports socket close when WE8
+       actually returns to its main screen. */
     session_signal = (frame->flags & WELNPT_FLAG_BROADCAST) == 0 &&
         (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT);
     source_port = ntohs(frame->source_port);
@@ -319,10 +321,7 @@ static int process_wire_packet(char *packet, int received, int direct) {
         payload_length < 0 || payload_length > WELNPT_MAX_PAYLOAD ||
         received != (int)sizeof(*header) + payload_length) return 0;
     kind = classify_control_payload(packet + sizeof(*header), payload_length);
-    if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 &&
-        kind == WEL_HOST_PAYLOAD_SEARCH && header->source_ip == g_peer_ip) {
-        reset_session();
-    }
+    /* Do not reset on a repeated search broadcast from the current peer. */
     source_port = ntohs(header->source_port);
     target_port = ntohs(header->target_port);
     join_port = kind == WEL_HOST_PAYLOAD_JOIN ? source_port : target_port;
@@ -384,7 +383,7 @@ static void process_ice_message(char *packet, int received) {
         } else if (strncmp(state, "failed", 6) == 0 &&
             InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING) {
             lock_relay("ice-failed");
-        } else if ((strncmp(state, "failed", 6) == 0 || strncmp(state, "disconnected", 12) == 0) &&
+        } else if (strncmp(state, "failed", 6) == 0 &&
             InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_DIRECT) {
             InterlockedExchange(&g_path, WEL_HOST_PATH_RELAY);
             InterlockedExchange(&g_direct_connected, 0);

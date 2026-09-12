@@ -54,10 +54,6 @@
         "to": "welhelper/welnptice.exe"
       },
       {
-        "from": "../build/x86/welnptwg.exe",
-        "to": "welhelper/welnptwg.exe"
-      },
-      {
         "from": "resources/welgame/welgame-amd64.msi",
         "to": "welhelper/welgame/welgame-amd64.msi"
       },
