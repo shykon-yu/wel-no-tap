@@ -139,13 +139,10 @@ Go API 通过 `connection_mode` 将房间分成明确流程：
 | 中继 04 | `10.122.4.0/24` | `relay` | 同上 |
 | 网卡 05 | `10.222.5.0/24` | `tap` | 检查 TAP 驱动，启动 n2n，游戏使用虚拟网卡 |
 | 网卡 06 | `10.222.6.0/24` | `tap` | 同上 |
-| 网卡 07 | `10.222.7.0/24` | `wireguard` | Hook 搜索；识别真实对手后按比赛建立单 peer，失败回退现有直连/中继 |
-| 网卡 08 | `10.222.8.0/24` | `wireguard` | 同上 |
 
 中继房间的 ICE 接口由服务端拒绝，避免异常客户端混用两种模式。直连和中继房间都保留
 `welnpt.dll` Hook，因为搜索广播、加入包和比赛 UDP 的虚拟 Socket 搬运仍依赖 Hook。
 网卡 05/06 不启动无网卡 Hook/ICE，而是使用独立的 TAP/n2n 客户端流程。
-实验中的网卡 07/08 使用 `wireguard` 模式：Hook 负责搜索，只有识别到真实比赛对手后才准备单个 peer；没有官方 WireGuard/Wintun 运行文件或服务端 peer 配置时回退现有 Hook + ICE/云中继，不为房间成员预建全互联通道。
 
 直连房间进入顺序为：申请临时租约，启动 `welnptice.exe`，等待并发布有效 candidate
 后显示正式进入。若本机 ICE 启动或 candidate 收集失败，仍保留租约并以“直连候选未就绪、
@@ -749,7 +746,7 @@ JSONL 中的 `transport-lock`、`direct-state`、`direct-fallback` 和实际单�
 
 ```text
 无网卡控制器：/api/v1/notap/*；直连/中继使用 10.122.1.0/24 - 10.122.4.0/24
-网卡房间：connection_mode=tap 使用 10.222.5.0/24 - 10.222.6.0/24；connection_mode=wireguard 使用 10.222.7.0/24 - 10.222.8.0/24
+网卡房间：connection_mode=tap 使用 10.222.5.0/24 - 10.222.6.0/24
 ```
 
 两类客户端不能进入对方房间，不能复用租约、逻辑 IP、relay token 或房间数据表。
