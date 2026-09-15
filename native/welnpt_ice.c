@@ -28,6 +28,7 @@ static SOCKET g_local_socket = INVALID_SOCKET;
 static SOCKET g_relay_socket = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static uint32_t g_logical_ip;
+static volatile LONG g_generation;
 static char g_room[WELNPT_ROOM_LENGTH];
 static struct sockaddr_in g_hook_address;
 static volatile LONG g_stopping;
@@ -64,32 +65,38 @@ static void output_line(const char *format, ...) {
 }
 
 static void notify_hook(const char *state) {
-	char message[96];
-	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_CONTROL_PREFIX, state);
+ char message[128];
+ int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu|%s", WEL_ICE_CONTROL_PREFIX,
+  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), state);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_peer(const char *logical_ip) {
-	char message[96];
-	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_PEER_PREFIX, logical_ip);
+ char message[128];
+ int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu|%s", WEL_ICE_PEER_PREFIX,
+  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), logical_ip);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_agent(unsigned short port) {
-	char message[96];
-	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%u", (unsigned)port);
+ char message[128];
+ int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%lu|%u",
+  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), (unsigned)port);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_remote_set(void) {
-	if (g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
-		sendto(g_local_socket, WEL_ICE_REMOTE_SET_PREFIX, (int)strlen(WEL_ICE_REMOTE_SET_PREFIX), 0,
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu", WEL_ICE_REMOTE_SET_PREFIX,
+		(unsigned long)InterlockedCompareExchange(&g_generation, 0, 0));
+	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, message, length, 0,
 			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
@@ -201,7 +208,19 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 			if (ip_length > 0 && ip_length < (int)sizeof(peer)) {
 				memcpy(peer, payload, (size_t)ip_length);
 				peer[ip_length] = '\0';
-				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %.*s", peer_length, payload);
+				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) {
+					const char *generation_separator = separator == NULL ? NULL : strrchr(payload, '|');
+					if (generation_separator != NULL) {
+						char generation_text[24];
+						size_t generation_length = (size_t)((payload + peer_length) - (generation_separator + 1));
+						if (generation_length > 0 && generation_length < sizeof(generation_text)) {
+							memcpy(generation_text, generation_separator + 1, generation_length);
+							generation_text[generation_length] = '\0';
+							InterlockedExchange(&g_generation, (LONG)strtoul(generation_text, NULL, 10));
+						}
+					}
+					output_line("GAME_PEER %.*s", peer_length, payload);
+				}
 			}
 		} else if (received > (int)strlen(WEL_TRANSPORT_STATE_PREFIX) &&
 			memcmp(buffer, WEL_TRANSPORT_STATE_PREFIX, strlen(WEL_TRANSPORT_STATE_PREFIX)) == 0) {
@@ -521,7 +540,10 @@ int main(int argc, char **argv) {
 			send_relay_ping(command + 11);
 		} else if (strcmp(command, "EXIT") == 0) {
 			break;
-		} else if (strcmp(command, "ACTIVATE") == 0 && !no_hook) {
+		} else if (strncmp(command, "ACTIVATE", 8) == 0 && !no_hook) {
+			const char *generation_text = command + 8;
+			while (*generation_text == ' ') generation_text++;
+			if (*generation_text != '\0') InterlockedExchange(&g_generation, (LONG)strtoul(generation_text, NULL, 10));
 			InterlockedExchange(&g_hook_active, 1);
 			notify_hook_agent(ntohs(local_address.sin_port));
 			notify_hook("connecting");

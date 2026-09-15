@@ -592,12 +592,12 @@ async function pingMember(member: RoomMember) {
   }
 }
 
-async function waitForPeerProbeAnswer(roomID: number, probeID: number, timeoutMs = 18000, epoch?: number) {
+async function waitForPeerProbeAnswer(roomID: number, probeID: number, sessionKey: string, timeoutMs = 18000, epoch?: number) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (epoch !== undefined && epoch !== gamePeerEpoch) throw new Error('比赛对手已切换，取消旧直连协商')
-    const result = await roomApi.peerProbe(roomID, probeID)
-    if (result.probe.target_description) return result.probe
+    const result = await roomApi.peerProbe(roomID, probeID, sessionKey)
+    if (result.probe.session_key === sessionKey && result.probe.target_description) return result.probe
     await new Promise(resolve => window.setTimeout(resolve, 400))
   }
   throw new Error('直连探测应答超时')
@@ -613,13 +613,13 @@ async function waitForFormalIceDescription(lease: Lease, epoch: number) {
   return localIceDescription.value
 }
 
-async function waitForIncomingGameProbe(roomID: number, requesterUserID: number, epoch: number) {
+async function waitForIncomingGameProbe(roomID: number, requesterUserID: number, sessionKey: string, epoch: number) {
   const deadline = Date.now() + 30000
   while (Date.now() < deadline) {
     if (epoch !== gamePeerEpoch || !activeLease.value || activeLease.value.room_id !== roomID) return null
     try {
-      const result = await roomApi.incomingPeerProbes(roomID, 'game')
-      const probe = result.probes.find(item => item.requester_user_id === requesterUserID && item.requester_description)
+      const result = await roomApi.incomingPeerProbes(roomID, 'game', sessionKey)
+      const probe = result.probes.find(item => item.requester_user_id === requesterUserID && item.session_key === sessionKey && item.requester_description)
       if (probe) return probe
     } catch {
       // The relay path remains available while game signaling retries.
@@ -663,14 +663,14 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
       const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, localIceDescription.value, {
         purpose: 'game', sessionKey: transactionKey,
       })
-      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, 30000, epoch)
-      if (answered.requester_user_id !== user.value.id || answered.target_user_id !== member.user_id || !answered.target_description) return false
+      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, transactionKey, 30000, epoch)
+      if (answered.session_key !== transactionKey || answered.requester_user_id !== user.value.id || answered.target_user_id !== member.user_id || !answered.target_description) return false
       remoteDescription = answered.target_description
     } else {
-      const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, epoch)
+      const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, transactionKey, epoch)
       if (!incoming?.requester_description) return false
       remoteDescription = incoming.requester_description
-      await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value)
+      await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value, transactionKey)
     }
     if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
     const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription })

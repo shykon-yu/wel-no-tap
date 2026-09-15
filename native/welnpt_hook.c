@@ -16,7 +16,7 @@
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
 #define WELNPT_ICE_SESSION_TIMEOUT_MS 30000
-#define WELNPT_MODULE_SCAN_MS 1000
+#define WELNPT_MODULE_SCAN_MS 3000
 #define WELNPT_DATAGRAM_POOL_SIZE 1024
 #define WELNPT_STATS_INTERVAL_MS 5000
 #define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
@@ -87,6 +87,9 @@ static struct sockaddr_in g_direct_agent_address;
 static uint32_t g_direct_peer_ip;
 static uint32_t g_direct_transaction_peer_ip;
 static unsigned short g_direct_transaction_join_port;
+static unsigned short g_direct_transaction_last_join_port;
+static unsigned short g_direct_transaction_source_port;
+static unsigned short g_direct_transaction_target_port;
 static volatile LONG g_direct_transaction_generation;
 static unsigned short g_direct_hook_port;
 static volatile LONG g_direct_connected;
@@ -118,6 +121,7 @@ static wel_closesocket_fn g_real_closesocket;
 
 static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     unsigned short observed_source_port, unsigned short observed_target_port);
+static uint32_t direct_peer_ip_snapshot(void);
 static void notify_light_socket_close(unsigned short logical_port);
 static void log_line_impl(const char *format, ...);
 #define log_line(...) do { \
@@ -163,12 +167,39 @@ static void tune_transport_socket(SOCKET socket) {
 }
 
 static void notify_agent_transport_state(const char *state) {
-    char message[64];
+    char message[96];
     int length;
     if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || state == NULL) return;
-    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WELNPT_TRANSPORT_STATE_PREFIX, state);
+    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu|%s", WELNPT_TRANSPORT_STATE_PREFIX,
+        (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0), state);
     if (length > 0) g_real_sendto(g_direct_transport, message, length, 0,
         (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
+}
+
+static int parse_generation_message(const char *payload, int length, unsigned long *generation,
+    const char **value) {
+    const char *separator;
+    char number[24];
+    size_t number_length;
+    char *end = NULL;
+    unsigned long parsed;
+    if (payload == NULL || length <= 0 || generation == NULL || value == NULL) return 0;
+    separator = memchr(payload, '|', (size_t)length);
+    if (separator == NULL || separator == payload) return 0;
+    number_length = (size_t)(separator - payload);
+    if (number_length >= sizeof(number)) return 0;
+    CopyMemory(number, payload, number_length);
+    number[number_length] = '\0';
+    parsed = strtoul(number, &end, 10);
+    if (end == number || *end != '\0') return 0;
+    *generation = parsed;
+    *value = separator + 1;
+    return 1;
+}
+
+static int current_generation_matches(unsigned long generation) {
+    unsigned long current = (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
+    return generation == current && (generation != 0 || current == 0);
 }
 
 static void reset_game_session(const char *reason) {
@@ -176,10 +207,15 @@ static void reset_game_session(const char *reason) {
     int had_session;
     EnterCriticalSection(&g_state_lock);
     had_session = g_direct_transaction_peer_ip != 0 || g_direct_transaction_join_port != 0;
-    generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
+    generation = had_session
+        ? InterlockedIncrement(&g_direct_transaction_generation)
+        : InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
     g_direct_peer_ip = 0;
     g_direct_transaction_peer_ip = 0;
     g_direct_transaction_join_port = 0;
+    g_direct_transaction_last_join_port = 0;
+    g_direct_transaction_source_port = 0;
+    g_direct_transaction_target_port = 0;
     g_ice_decision_deadline = 0;
     g_ice_decision_started = 0;
     g_ice_session_deadline = 0;
@@ -194,12 +230,18 @@ static void reset_game_session(const char *reason) {
 
 static void lock_relay_for_decision(const char *reason) {
     ULONGLONG now = GetTickCount64();
-    ULONGLONG elapsed = g_ice_decision_started != 0 && now >= g_ice_decision_started
-        ? now - g_ice_decision_started : 0;
+    ULONGLONG started;
+    ULONGLONG elapsed;
+    EnterCriticalSection(&g_state_lock);
+    started = g_ice_decision_started;
+    LeaveCriticalSection(&g_state_lock);
+    elapsed = started != 0 && now >= started ? now - started : 0;
     if (InterlockedCompareExchange(&g_game_path, WELNPT_GAME_PATH_RELAY,
         WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
+        EnterCriticalSection(&g_state_lock);
         g_ice_decision_deadline = 0;
         g_ice_session_deadline = 0;
+        LeaveCriticalSection(&g_state_lock);
         log_line("\"api\":\"ice-decision\",\"result\":\"relay\",\"reason\":\"%s\",\"elapsedMs\":%llu,\"windowMs\":%d,\"generation\":%lu",
             reason, (unsigned __int64)elapsed, 0,
             (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
@@ -212,13 +254,17 @@ static void lock_relay_for_decision(const char *reason) {
 
 static void check_ice_decision_deadline(void) {
     ULONGLONG now = GetTickCount64();
+    ULONGLONG decision_deadline;
+    ULONGLONG session_deadline;
     if (InterlockedCompareExchange(&g_game_path, 0, 0) != WELNPT_GAME_PATH_PENDING) return;
-    if (g_ice_decision_deadline != 0 && now >= g_ice_decision_deadline) {
+    EnterCriticalSection(&g_state_lock);
+    decision_deadline = g_ice_decision_deadline;
+    session_deadline = g_ice_session_deadline;
+    LeaveCriticalSection(&g_state_lock);
+    if (decision_deadline != 0 && now >= decision_deadline) {
         lock_relay_for_decision("decision-timeout");
-        g_ice_decision_deadline = 0;
-    } else if (g_ice_session_deadline != 0 && now >= g_ice_session_deadline) {
+    } else if (session_deadline != 0 && now >= session_deadline) {
         lock_relay_for_decision("remote-sdp-timeout");
-        g_ice_session_deadline = 0;
     }
 }
 
@@ -494,6 +540,8 @@ static void free_queue(virtual_socket *state) {
 static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     virtual_socket *state;
     int found = 0;
+    unsigned short closed_port = 0;
+    int notify_close = 0;
     if (logical_port != NULL) *logical_port = 0;
     /* Take the queue lock first. Receivers use the same order, so a socket
        cannot be reused while its queued datagrams are being released. */
@@ -502,7 +550,8 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     state = find_socket_locked(handle);
     if (state != NULL) {
         if (logical_port != NULL) *logical_port = state->logical_port;
-        if (g_light_mode && state->logical_port != 0) notify_light_socket_close(state->logical_port);
+        closed_port = state->logical_port;
+        notify_close = g_light_mode && closed_port != 0;
         if (state->logical_port != 0 &&
             g_port_index[state->logical_port] == (unsigned char)((state - g_sockets) + 1)) {
             g_port_index[state->logical_port] = 0;
@@ -517,6 +566,9 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     }
     LeaveCriticalSection(&g_state_lock);
     LeaveCriticalSection(&g_queue_lock);
+    /* Socket close runs on the game thread. Do not perform a loopback send
+       while the state and queue locks are held. */
+    if (notify_close) notify_light_socket_close(closed_port);
     return found;
 }
 
@@ -563,7 +615,7 @@ static int enqueue_datagram(const welnpt_packet_header *header, const char *payl
     return 1;
 }
 
-static int handle_transport_packet(char *packet, int received, const char *path) {
+static int handle_transport_packet(char *packet, int received, int direct_path) {
 	welnpt_packet_header *header;
 	int payload_length;
 	int session_signal;
@@ -573,6 +625,8 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	char peer_ip[INET_ADDRSTRLEN];
 	unsigned long payload_hash;
 	LONG selected_path = WELNPT_GAME_PATH_RELAY;
+	const char *path = direct_path ? "direct" : "relay";
+	uint32_t transaction_peer_ip;
 	if (received < (int)sizeof(welnpt_packet_header)) return 0;
 	header = (welnpt_packet_header *)packet;
 	payload_length = (int)ntohs(header->payload_length);
@@ -599,10 +653,13 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 				peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
 		}
 	}
-	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip) {
+	EnterCriticalSection(&g_state_lock);
+	transaction_peer_ip = g_direct_transaction_peer_ip;
+	LeaveCriticalSection(&g_state_lock);
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == transaction_peer_ip) {
 		selected_path = InterlockedCompareExchange(&g_game_path, 0, 0);
-		if ((strcmp(path, "relay") == 0 && selected_path == WELNPT_GAME_PATH_DIRECT) ||
-			(strcmp(path, "direct") == 0 && selected_path != WELNPT_GAME_PATH_DIRECT)) {
+		if ((!direct_path && selected_path == WELNPT_GAME_PATH_DIRECT) ||
+			(direct_path && selected_path != WELNPT_GAME_PATH_DIRECT)) {
 			log_line("\"api\":\"transport-ignore\",\"path\":\"%s\",\"reason\":\"match-path-locked\"", path);
 			return 1;
 		}
@@ -641,6 +698,16 @@ static DWORD WINAPI light_receive_thread(LPVOID unused) {
             (struct sockaddr *)&source, &source_length);
         welnpt_host_frame *frame;
         int payload_length;
+        if (received > (int)strlen(WELNPT_GAME_PEER_PREFIX) &&
+            memcmp(packet, WELNPT_GAME_PEER_PREFIX, strlen(WELNPT_GAME_PEER_PREFIX)) == 0) {
+            const char *payload = packet + strlen(WELNPT_GAME_PEER_PREFIX);
+            const char *generation_separator = strrchr(payload, '|');
+            if (generation_separator != NULL && generation_separator + 1 < packet + received) {
+                InterlockedExchange(&g_direct_transaction_generation,
+                    (LONG)strtoul(generation_separator + 1, NULL, 10));
+            }
+            continue;
+        }
         if (received > (int)strlen(WELNPT_TRANSPORT_STATE_PREFIX) &&
             memcmp(packet, WELNPT_TRANSPORT_STATE_PREFIX, strlen(WELNPT_TRANSPORT_STATE_PREFIX)) == 0) {
             log_line("\"api\":\"transport-state\",\"state\":\"%.*s\"",
@@ -747,7 +814,13 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
     int length;
     int is_new_transaction;
     LONG generation;
-    if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0 || target_ip == 0) return 0;
+	if (target_ip == 0) return 0;
+	EnterCriticalSection(&g_state_lock);
+	if (g_direct_transport == INVALID_SOCKET || g_direct_agent_address.sin_port == 0) {
+		LeaveCriticalSection(&g_state_lock);
+		return 0;
+	}
+	LeaveCriticalSection(&g_state_lock);
     if (InetNtopA(AF_INET, &target_ip, target, sizeof(target)) == NULL) return 0;
     EnterCriticalSection(&g_state_lock);
 	/* The game reuses the same 64/84-byte control shapes when moving from
@@ -757,23 +830,24 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 	if (is_new_transaction) {
 		g_direct_transaction_peer_ip = target_ip;
 		g_direct_transaction_join_port = join_port;
+		g_direct_transaction_last_join_port = join_port;
+		g_direct_transaction_source_port = observed_source_port;
+		g_direct_transaction_target_port = observed_target_port;
 		InterlockedIncrement(&g_direct_transaction_generation);
+		g_direct_peer_ip = 0;
+		InterlockedExchange(&g_direct_connected, 0);
+		InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
+		g_ice_decision_started = GetTickCount64();
+		g_ice_decision_deadline = 0;
+		g_ice_session_deadline = g_ice_decision_started + WELNPT_ICE_SESSION_TIMEOUT_MS;
+	} else if (join_port != 0) {
+		g_direct_transaction_last_join_port = join_port;
 	}
     generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
     LeaveCriticalSection(&g_state_lock);
     if (!is_new_transaction) {
-        /* Keep close detection aligned with the game's current socket while
-           retaining the existing ICE generation and selected path. */
-        g_direct_transaction_join_port = join_port;
         return 0;
     }
-	/* Same-peer 64/84-byte packets remain in the current session. */
-    g_direct_peer_ip = 0;
-    InterlockedExchange(&g_direct_connected, 0);
-    InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
-    g_ice_decision_started = GetTickCount64();
-    g_ice_decision_deadline = 0;
-    g_ice_session_deadline = g_ice_decision_started + WELNPT_ICE_SESSION_TIMEOUT_MS;
 	notify_agent_transport_state("pending");
 	length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s|%u|%u|%lu", WELNPT_GAME_PEER_PREFIX,
 		target, (unsigned)join_port, (unsigned)join_port, (unsigned long)generation);
@@ -850,7 +924,7 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 		direct_ready = InterlockedCompareExchange(&g_direct_connected, 0, 0);
 	}
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-		g_direct_transport != INVALID_SOCKET && header->target_ip == g_direct_peer_ip &&
+		g_direct_transport != INVALID_SOCKET && header->target_ip == direct_peer_ip_snapshot() &&
 		selected_path == WELNPT_GAME_PATH_DIRECT && direct_ready != 0) {
         sent = g_real_sendto(g_direct_transport, packet, (int)sizeof(*header) + length, 0,
             (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
@@ -1126,6 +1200,14 @@ static int WSAAPI wel_sendto(SOCKET handle, const char *buffer, int length, int 
     return send_virtual_datagram(handle, buffer, length, destination, destination_length);
 }
 
+static uint32_t direct_peer_ip_snapshot(void) {
+    uint32_t value;
+    EnterCriticalSection(&g_state_lock);
+    value = g_direct_peer_ip;
+    LeaveCriticalSection(&g_state_lock);
+    return value;
+}
+
 static int WSAAPI wel_recvfrom(SOCKET handle, char *buffer, int length, int flags,
     struct sockaddr *source, int *source_length) {
     int result = receive_virtual_datagram(handle, buffer, length, flags, source, source_length);
@@ -1149,6 +1231,20 @@ static int WSAAPI wel_wsasendto(SOCKET handle, LPWSABUF buffers, DWORD buffer_co
     if (overlapped != NULL || completion != NULL) {
         WSASetLastError(WSAEOPNOTSUPP);
         return SOCKET_ERROR;
+    }
+    if (buffer_count != 0 && buffers == NULL) {
+        WSASetLastError(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    /* WE8 normally submits one WSABUF. Forward it directly so the common
+       path does not copy the payload into another 4 KiB temporary buffer. */
+    if (buffers != NULL && buffer_count == 1 && buffers[0].len <= WELNPT_MAX_PAYLOAD &&
+        (buffers[0].len == 0 || buffers[0].buf != NULL)) {
+        result = send_virtual_datagram(handle, buffers[0].buf, (int)buffers[0].len,
+            destination, destination_length);
+        if (result == SOCKET_ERROR) return SOCKET_ERROR;
+        if (bytes_sent != NULL) *bytes_sent = (DWORD)result;
+        return 0;
     }
     for (index = 0; index < buffer_count; ++index) {
         if (buffers[index].len > WELNPT_MAX_PAYLOAD - total) {
@@ -1174,7 +1270,7 @@ static int WSAAPI wel_wsarecvfrom(SOCKET handle, LPWSABUF buffers, DWORD buffer_
         return g_real_wsarecvfrom(handle, buffers, buffer_count, bytes_received, flags, source,
             source_length, overlapped, completion);
     }
-    if (overlapped != NULL || completion != NULL || buffer_count == 0) {
+    if (overlapped != NULL || completion != NULL || buffer_count == 0 || buffers == NULL || buffers[0].buf == NULL) {
         WSASetLastError(WSAEOPNOTSUPP);
         return SOCKET_ERROR;
     }
@@ -1187,8 +1283,17 @@ static int WSAAPI wel_wsarecvfrom(SOCKET handle, LPWSABUF buffers, DWORD buffer_
 
 static int WSAAPI wel_closesocket(SOCKET handle) {
     unsigned short logical_port = 0;
-    if (remove_socket(handle, &logical_port) && logical_port != 0 &&
-        logical_port == g_direct_transaction_join_port) {
+    int reset_session = 0;
+    if (remove_socket(handle, &logical_port) && logical_port != 0) {
+        EnterCriticalSection(&g_state_lock);
+        reset_session = logical_port != 0 &&
+            (logical_port == g_direct_transaction_join_port ||
+             logical_port == g_direct_transaction_source_port ||
+             logical_port == g_direct_transaction_target_port ||
+             logical_port == g_direct_transaction_last_join_port);
+        LeaveCriticalSection(&g_state_lock);
+    }
+    if (reset_session) {
         reset_game_session("match-socket-closed");
     }
     return g_real_closesocket(handle);
@@ -1307,7 +1412,7 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
         }
         received = g_real_recvfrom(g_transport, packet, sizeof(packet), 0,
             (struct sockaddr *)&source, &source_length);
-        if (received > 0) handle_transport_packet(packet, received, "relay");
+        if (received > 0) handle_transport_packet(packet, received, 0);
         if (g_diagnostic_log_enabled) maybe_log_stats();
     }
     return 0;
@@ -1328,7 +1433,14 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
         check_ice_decision_deadline();
         if (received > (int)strlen(WELNPT_ICE_AGENT_PREFIX) &&
             memcmp(packet, WELNPT_ICE_AGENT_PREFIX, strlen(WELNPT_ICE_AGENT_PREFIX)) == 0) {
-            unsigned long port = strtoul(packet + strlen(WELNPT_ICE_AGENT_PREFIX), NULL, 10);
+            unsigned long generation = 0;
+            const char *value = NULL;
+            unsigned long port = 0;
+            int valid_generation = parse_generation_message(packet + strlen(WELNPT_ICE_AGENT_PREFIX),
+                received - (int)strlen(WELNPT_ICE_AGENT_PREFIX), &generation, &value);
+            if (valid_generation && current_generation_matches(generation)) {
+                port = strtoul(value, NULL, 10);
+            }
             if (port > 0 && port <= 65535) {
                 unsigned short previous_port = ntohs(g_direct_agent_address.sin_port);
                 g_direct_agent_address.sin_port = htons((u_short)port);
@@ -1338,22 +1450,28 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                     /* A new agent is a fresh ICE attempt for the same peer.
                        Relay remains usable until this attempt connects. */
                     InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_PENDING);
+                    EnterCriticalSection(&g_state_lock);
                     g_ice_decision_started = GetTickCount64();
                     g_ice_decision_deadline = 0;
                     g_ice_session_deadline = g_ice_decision_started + WELNPT_ICE_SESSION_TIMEOUT_MS;
+                    LeaveCriticalSection(&g_state_lock);
                     notify_agent_transport_state("pending");
                 }
                 log_line("\"api\":\"direct-agent\",\"port\":%lu", port);
             }
             continue;
         }
-        if (received == (int)strlen(WELNPT_ICE_REMOTE_SET_PREFIX) &&
+        if (received > (int)strlen(WELNPT_ICE_REMOTE_SET_PREFIX) &&
             memcmp(packet, WELNPT_ICE_REMOTE_SET_PREFIX, strlen(WELNPT_ICE_REMOTE_SET_PREFIX)) == 0) {
+            unsigned long generation = strtoul(packet + strlen(WELNPT_ICE_REMOTE_SET_PREFIX), NULL, 10);
+            if (!current_generation_matches(generation)) continue;
             if (InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_PENDING) {
+                EnterCriticalSection(&g_state_lock);
                 g_ice_decision_started = GetTickCount64();
                 /* No fixed five-second lock. Relay remains usable while ICE
                    is pending and a later connected state may upgrade it. */
                 g_ice_decision_deadline = 0;
+                LeaveCriticalSection(&g_state_lock);
                 log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"remote-set\",\"windowMs\":0,\"generation\":%lu",
                     (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
             }
@@ -1361,7 +1479,11 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
         }
         if (received > (int)strlen(WELNPT_ICE_STATE_PREFIX) &&
             memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
-            const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
+            unsigned long generation = 0;
+            const char *state = NULL;
+            if (!parse_generation_message(packet + strlen(WELNPT_ICE_STATE_PREFIX),
+                received - (int)strlen(WELNPT_ICE_STATE_PREFIX), &generation, &state) ||
+                !current_generation_matches(generation)) continue;
             int connected = strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0;
             int failed = strncmp(state, "failed", 6) == 0;
             int disconnected = strncmp(state, "disconnected", 12) == 0;
@@ -1373,10 +1495,14 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                     : InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_DIRECT);
                 if (changed == WELNPT_GAME_PATH_PENDING || changed == WELNPT_GAME_PATH_RELAY) {
                     ULONGLONG now = GetTickCount64();
-                    ULONGLONG elapsed = g_ice_decision_started != 0 && now >= g_ice_decision_started
-                        ? now - g_ice_decision_started : 0;
+                    ULONGLONG started;
+                    ULONGLONG elapsed;
+                    EnterCriticalSection(&g_state_lock);
+                    started = g_ice_decision_started;
+                    elapsed = started != 0 && now >= started ? now - started : 0;
                     g_ice_decision_deadline = 0;
                     g_ice_session_deadline = 0;
+                    LeaveCriticalSection(&g_state_lock);
                     log_line("\"api\":\"ice-decision\",\"result\":\"direct\",\"reason\":\"ice-connected\",\"elapsedMs\":%llu,\"windowMs\":0,\"generation\":%lu,\"directState\":\"%.*s\"",
                         (unsigned __int64)elapsed,
                         (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0),
@@ -1416,20 +1542,29 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
         }
 		if (received > (int)strlen(WELNPT_ICE_PEER_PREFIX) &&
 			memcmp(packet, WELNPT_ICE_PEER_PREFIX, strlen(WELNPT_ICE_PEER_PREFIX)) == 0) {
-			const char *peer = packet + strlen(WELNPT_ICE_PEER_PREFIX);
+			unsigned long generation = 0;
+			const char *peer = NULL;
+			if (!parse_generation_message(packet + strlen(WELNPT_ICE_PEER_PREFIX),
+				received - (int)strlen(WELNPT_ICE_PEER_PREFIX), &generation, &peer) ||
+				!current_generation_matches(generation)) continue;
 			char peer_text[INET_ADDRSTRLEN];
-			int peer_length = received - (int)strlen(WELNPT_ICE_PEER_PREFIX);
+			int peer_length = received - (int)(peer - packet);
 			if (peer_length > 0 && peer_length < (int)sizeof(peer_text)) {
 				CopyMemory(peer_text, peer, (size_t)peer_length);
 				peer_text[peer_length] = '\0';
 			}
-			if (peer_length > 0 && peer_length < (int)sizeof(peer_text) &&
-				InetPtonA(AF_INET, peer_text, &g_direct_peer_ip) == 1) {
-				log_line("\"api\":\"direct-peer\",\"target\":\"%s\"", peer_text);
+			if (peer_length > 0 && peer_length < (int)sizeof(peer_text)) {
+				uint32_t peer_ip;
+				if (InetPtonA(AF_INET, peer_text, &peer_ip) == 1) {
+					EnterCriticalSection(&g_state_lock);
+					g_direct_peer_ip = peer_ip;
+					LeaveCriticalSection(&g_state_lock);
+					log_line("\"api\":\"direct-peer\",\"target\":\"%s\"", peer_text);
+				}
 			}
 			continue;
 		}
-        handle_transport_packet(packet, received, "direct");
+        handle_transport_packet(packet, received, 1);
 		if (g_diagnostic_log_enabled) maybe_log_stats();
     }
     return 0;

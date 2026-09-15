@@ -3,6 +3,7 @@ const os = require('node:os')
 const path = require('node:path')
 const dgram = require('node:dgram')
 const { spawn } = require('node:child_process')
+const { StringDecoder } = require('node:string_decoder')
 const { loadConfig } = require('./config.cjs')
 
 const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform')
@@ -38,8 +39,10 @@ let lastLogPath = ''
 let sessionLogPath = ''
 let transportLogOffset = 0
 let transportLogRemainder = ''
+let transportLogDecoder = new StringDecoder('utf8')
 let transportPath = 'pending'
 let activeGamePeerIp = ''
+let activeGamePeerGeneration = 0
 let iceOptions = null
 const gamePeerListeners = new Set()
 const transportListeners = new Set()
@@ -48,6 +51,8 @@ let standbyAgentKey = ''
 let standbyPromise = null
 let standbyGeneration = 0
 let iceUpnpMapping = null
+let iceLifecycleGeneration = 0
+let iceStartPromise = null
 
 function setTransportPath(nextPath) {
   if (!['pending', 'direct', 'relay'].includes(nextPath) || transportPath === nextPath) return
@@ -188,20 +193,27 @@ function resetTransportTracking(logPath = '') {
   lastLogPath = logPath
   transportLogOffset = 0
   transportLogRemainder = ''
+  transportLogDecoder = new StringDecoder('utf8')
   transportPath = 'pending'
 }
 
 function updateTransportPathFromLog() {
   if (!lastLogPath || !fs.existsSync(lastLogPath)) return
   try {
-    const contents = fs.readFileSync(lastLogPath, 'utf8')
-    if (contents.length < transportLogOffset) {
+    const size = fs.statSync(lastLogPath).size
+    if (size < transportLogOffset) {
       transportLogOffset = 0
       transportLogRemainder = ''
+      transportLogDecoder = new StringDecoder('utf8')
       transportPath = 'pending'
     }
-    const chunk = transportLogRemainder + contents.slice(transportLogOffset)
-    transportLogOffset = contents.length
+    if (size === transportLogOffset) return
+    const fd = fs.openSync(lastLogPath, 'r')
+    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, size - transportLogOffset))
+    const read = fs.readSync(fd, buffer, 0, buffer.length, transportLogOffset)
+    fs.closeSync(fd)
+    transportLogOffset += read
+    const chunk = transportLogRemainder + transportLogDecoder.write(buffer.subarray(0, read))
     const lines = chunk.split(/\r?\n/)
     transportLogRemainder = lines.pop() || ''
     for (const line of lines) {
@@ -246,7 +258,10 @@ function chooseIcePort(preferredPort = 0) {
         retried = true
         try { socket.close() } catch {}
         const fallback = dgram.createSocket('udp4')
-        fallback.once('error', reject)
+        fallback.once('error', (error) => {
+          try { fallback.close() } catch {}
+          reject(error)
+        })
         fallback.bind(0, '0.0.0.0', () => {
           const address = fallback.address()
           fallback.close(() => resolve(Number(address.port) || 0))
@@ -526,7 +541,11 @@ function handleIceLine(rawLine) {
     return
   }
   if (line.startsWith('TRANSPORT_STATE ')) {
-    const state = line.slice(16).trim()
+    const payload = line.slice(16).trim()
+    const separator = payload.indexOf('|')
+    const generation = separator > 0 ? Number(payload.slice(0, separator)) : 0
+    const state = separator > 0 ? payload.slice(separator + 1).trim() : payload
+    if (separator > 0 && activeGamePeerGeneration > 0 && generation !== activeGamePeerGeneration) return
     if (state === 'pending' || state === 'direct' || state === 'relay') setTransportPath(state)
     appendAgentEvent('active', 'transport-state', { state })
     return
@@ -539,6 +558,7 @@ function handleIceLine(rawLine) {
     const payload = line.slice(10).trim()
     const [logicalIp, sourcePort = '', targetPort = '', generation = '0'] = payload.split('|')
     if (logicalIp && /^\d{1,5}$/.test(sourcePort) && /^\d{1,5}$/.test(targetPort) && /^\d+$/.test(generation)) {
+      activeGamePeerGeneration = Number(generation) || 0
       for (const listener of gamePeerListeners) {
         try { listener({ logicalIp, transactionKey: `${logicalIp}|${sourcePort}|${targetPort}|${generation}` }) } catch {}
       }
@@ -590,13 +610,20 @@ function handleIceLine(rawLine) {
   }
 }
 
-async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
+async function startIceAgentInternal({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
+  const lifecycle = iceLifecycleGeneration
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
   if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
   const icePort = activeIcePort || await chooseIcePort(8978)
+  if (lifecycle !== iceLifecycleGeneration) throw new Error('ICE 启动已取消')
   activeIcePort = icePort
   iceUpnpMapping = await requestUpnpMapping(icePort, 'active-' + Date.now().toString(36))
+  if (lifecycle !== iceLifecycleGeneration) {
+    releaseUpnpMapping(iceUpnpMapping)
+    iceUpnpMapping = null
+    throw new Error('ICE 启动已取消')
+  }
   iceHookPort = Number(hookPort) || chooseHookPort()
   iceOptions = { stunHost, stunPort, relay, room, logicalIp, token }
   iceLocalDescription = ''
@@ -609,6 +636,7 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
   iceDiagnostics = []
   lastRemoteDescription = ''
   activeGamePeerIp = ''
+  activeGamePeerGeneration = 0
   const environment = { ...process.env }
   if (relay && room && logicalIp && token) {
     environment.WEL_NOTAP_RELAY = String(relay)
@@ -637,6 +665,7 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
     appendAgentEvent('active', 'stopped', { code: code ?? null })
     if (iceProcess === child) {
       iceProcess = null
+      if (lifecycle !== iceLifecycleGeneration) return
       iceState = 'failed'
       releaseUpnpMapping(iceUpnpMapping)
       iceUpnpMapping = null
@@ -647,11 +676,23 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
   return waitForIceCandidate(child)
 }
 
+async function startIceAgent(options) {
+  if (iceStartPromise) return iceStartPromise
+  const pending = startIceAgentInternal(options)
+  iceStartPromise = pending
+  try {
+    return await pending
+  } finally {
+    if (iceStartPromise === pending) iceStartPromise = null
+  }
+}
+
 function stopIceChild(child) {
-  if (!child || child.killed) return Promise.resolve()
+  if (!child) return Promise.resolve()
   return new Promise((resolve) => {
     let settled = false
     const finish = () => { if (!settled) { settled = true; resolve() } }
+    if (child.exitCode !== null || child.signalCode !== null) { finish(); return }
     const timer = setTimeout(() => { try { child.kill() } catch {}; finish() }, 1500)
     child.once('close', () => { clearTimeout(timer); finish() })
     try { child.stdin.write('EXIT\n') } catch { try { child.kill() } catch {} }
@@ -664,8 +705,10 @@ async function clearStandbyAgent() {
   standbyAgentKey = ''
   const pendingKey = standbyPromise?.probeKey
   standbyPromise = null
-  if (key) stopProbeIce(key)
-  if (pendingKey && pendingKey !== key) stopProbeIce(pendingKey)
+  const stopping = []
+  if (key) stopping.push(stopProbeIce(key))
+  if (pendingKey && pendingKey !== key) stopping.push(stopProbeIce(pendingKey))
+  await Promise.all(stopping)
 }
 
 async function prepareIce(options) {
@@ -679,12 +722,18 @@ async function prepareIce(options) {
 
 async function resetIce() {
   if (!iceOptions) throw new Error('直连组件尚未准备')
+  ++iceLifecycleGeneration
   await clearStandbyAgent()
   const previous = iceProcess
+  const pendingStart = iceStartPromise
   iceProcess = null
-  releaseUpnpMapping(iceUpnpMapping)
+  const mapping = iceUpnpMapping
   iceUpnpMapping = null
+  releaseUpnpMapping(mapping)
   await stopIceChild(previous)
+  if (pendingStart) {
+    try { await pendingStart } catch {}
+  }
   await startIceAgent({ ...iceOptions, hookPort: iceHookPort })
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
@@ -780,6 +829,7 @@ async function activateIce() {
   releaseUpnpMapping(iceUpnpMapping)
   iceUpnpMapping = null
   await stopIceChild(previous)
+  standby.promoted = true
   probeAgents.delete(key)
   standbyAgentKey = ''
   standbyPromise = null
@@ -787,6 +837,10 @@ async function activateIce() {
   iceProcess = standby.child
   iceLocalDescription = standby.localDescription
   iceAgentPort = standby.localPort
+  // The promoted agent owns the transport mapping for the next match. Reuse
+  // its port on a later reset instead of silently returning to a different
+  // local port and invalidating the NAT mapping.
+  activeIcePort = standby.localPort
   iceHookPort = standby.hookPort || iceHookPort
   iceOptions = standby.options || iceOptions
   iceUpnpMapping = standby.upnpMapping
@@ -801,7 +855,7 @@ async function activateIce() {
   activeGamePeerIp = ''
   appendAgentEvent('active', 'activated', { key, port: iceAgentPort, hookPort: iceHookPort })
   attachActiveIceProcess(iceProcess)
-  try { iceProcess.stdin.write('ACTIVATE\n') } catch {
+  try { iceProcess.stdin.write('ACTIVATE ' + String(activeGamePeerGeneration || 0) + '\n') } catch {
     await stopIceChild(iceProcess)
     iceProcess = null
     iceState = 'failed'
@@ -848,7 +902,7 @@ function randomProbeKey() {
 
 function stopProbeIce(probeKey) {
   const probe = probeAgents.get(probeKey)
-  if (!probe) return { stopped: true }
+  if (!probe) return Promise.resolve({ stopped: true })
   appendAgentEvent(probe.standby ? 'standby' : 'probe', 'stopping', { key: probeKey, reason: 'rotation-or-disconnect' })
   probeAgents.delete(probeKey)
   releaseUpnpMapping(probe.upnpMapping)
@@ -865,9 +919,14 @@ function stopProbeIce(probeKey) {
     clearTimeout(waiter.timer)
     waiter.reject(new Error('临时 ICE 探测已结束'))
   }
-  try { probe.child.stdin.write('EXIT\n') } catch {}
-  try { probe.child.kill() } catch {}
-  return { stopped: true }
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = () => { if (!settled) { settled = true; resolve({ stopped: true }) } }
+    if (probe.child.exitCode !== null || probe.child.signalCode !== null) { finish(); return }
+    const timer = setTimeout(() => { try { probe.child.kill() } catch {}; finish() }, 1500)
+    probe.child.once('close', () => { clearTimeout(timer); finish() })
+    try { probe.child.stdin.write('EXIT\n') } catch { try { probe.child.kill() } catch {}; finish() }
+  })
 }
 
 function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '', icePort = 0, upnpMapping = null }) {
@@ -898,11 +957,12 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
     remoteWaiter: null, pingUnavailable: false, pendingPing: null,
     retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0, upnpMapping,
-    options: { stunHost, stunPort, relay, room, logicalIp, token },
+    options: { stunHost, stunPort, relay, room, logicalIp, token }, promoted: false,
   }
   appendAgentEvent(standby ? 'standby' : 'probe', 'started', { key, stunHost, stunPort, hookPort: Number(hookPort) || 0 })
   probeAgents.set(key, probe)
   const consume = (chunk) => {
+    if (probe.promoted) return
     probe.buffer += chunk.toString('utf8')
     let newline
     while ((newline = probe.buffer.indexOf('\n')) >= 0) {
@@ -965,6 +1025,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
   child.stdout.on('data', consume)
   child.stderr.on('data', (chunk) => { probe.error = String(chunk).trim().slice(0, 300) || probe.error })
   child.once('close', (code) => {
+    if (probe.promoted) return
     appendAgentEvent(standby ? 'standby' : 'probe', 'stopped', { key, code: code ?? null })
     if (probeAgents.get(key) !== probe) return
     probe.error ||= '临时 ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）'
@@ -1266,17 +1327,25 @@ async function disconnect() {
     try { lastProcess.kill() } catch {}
   }
   lastProcess = null
-  if (iceProcess && !iceProcess.killed) {
-    appendAgentEvent('active', 'stopping', { reason: 'disconnect' })
-    try { iceProcess.stdin.write('EXIT\n') } catch {}
-    try { iceProcess.kill() } catch {}
-  }
+  ++iceLifecycleGeneration
+  const previousIceProcess = iceProcess
+  const pendingStart = iceStartPromise
   iceProcess = null
-  releaseUpnpMapping(iceUpnpMapping)
+  if (previousIceProcess) {
+    appendAgentEvent('active', 'stopping', { reason: 'disconnect' })
+    await stopIceChild(previousIceProcess)
+  }
+  if (pendingStart) {
+    try { await pendingStart } catch {}
+  }
+  const mapping = iceUpnpMapping
   iceUpnpMapping = null
+  releaseUpnpMapping(mapping)
   await clearStandbyAgent()
   iceState = 'waiting'
   iceLocalDescription = ''
+  iceAgentPort = 0
+  iceHookPort = 0
   activeIcePort = 0
   if (pendingRelayPing) {
     const pending = pendingRelayPing
@@ -1296,11 +1365,13 @@ async function disconnect() {
   }
   lastRemoteDescription = ''
   activeGamePeerIp = ''
+  activeGamePeerGeneration = 0
+  iceOptions = null
   resetTransportTracking()
   sessionLogPath = ''
   iceExitError = ''
   iceDiagnostics = []
-  for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)
+  await Promise.all([...probeAgents.keys()].map((probeKey) => stopProbeIce(probeKey)))
   return { stopped: true }
 }
 

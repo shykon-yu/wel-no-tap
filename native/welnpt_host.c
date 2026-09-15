@@ -16,10 +16,6 @@
 #define WEL_HOST_PATH_PENDING 0
 #define WEL_HOST_PATH_DIRECT 1
 #define WEL_HOST_PATH_RELAY 2
-/* The WireGuard bridge sends return datagrams to the Host from its
- * temporary virtual adapter.  Keep this port in sync with welnpt_wg.c. */
-#define WEL_WG_BRIDGE_DATA_PORT 51830
-
 static SOCKET g_socket = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static struct sockaddr_in g_agent_address;
@@ -34,6 +30,9 @@ static LONG g_path = WEL_HOST_PATH_PENDING;
 static LONG g_direct_connected;
 static uint32_t g_peer_ip;
 static unsigned short g_join_port;
+static unsigned short g_last_join_port;
+static unsigned short g_source_port;
+static unsigned short g_target_port;
 static LONG g_generation;
 static ULONGLONG g_decision_started;
 static ULONGLONG g_decision_deadline;
@@ -64,6 +63,27 @@ static int parse_port(const char *value, unsigned short *port) {
     return 1;
 }
 
+static int parse_generation_message(const char *payload, int length, unsigned long *generation,
+    const char **value) {
+    const char *separator;
+    char number[24];
+    size_t number_length;
+    char *end = NULL;
+    unsigned long parsed;
+    if (payload == NULL || length <= 0 || generation == NULL || value == NULL) return 0;
+    separator = memchr(payload, '|', (size_t)length);
+    if (separator == NULL || separator == payload) return 0;
+    number_length = (size_t)(separator - payload);
+    if (number_length >= sizeof(number)) return 0;
+    memcpy(number, payload, number_length);
+    number[number_length] = '\0';
+    parsed = strtoul(number, &end, 10);
+    if (end == number || *end != '\0') return 0;
+    *generation = parsed;
+    *value = separator + 1;
+    return 1;
+}
+
 static int env_port(const char *name, unsigned short *port) {
     char value[16];
     DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
@@ -81,15 +101,6 @@ static int same_room(const char left[WELNPT_ROOM_LENGTH], const char right[WELNP
 
 static int is_loopback(const struct sockaddr_in *address) {
     return address != NULL && address->sin_addr.S_un.S_addr == htonl(INADDR_LOOPBACK);
-}
-
-static int is_wireguard_bridge(const struct sockaddr_in *address) {
-    /* The bridge's tunnel socket is bound to the same virtual address as the
-     * lease and uses a fixed data port.  This is the only non-loopback source
-     * accepted as an already authenticated direct transport. */
-    return address != NULL && g_logical_ip != 0 &&
-        address->sin_addr.S_un.S_addr == g_logical_ip &&
-        ntohs(address->sin_port) == WEL_WG_BRIDGE_DATA_PORT;
 }
 
 static void signal_ready(void) {
@@ -144,12 +155,14 @@ static void send_to_agent(const char *data, int length) {
 }
 
 static void notify_transport(const char *path) {
-    char message[64];
+    char message[96];
     int length;
     if (path == NULL) return;
-    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELTRANSPORT:%s", path);
+    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELTRANSPORT:%lu|%s",
+        (unsigned long)g_generation, path);
     if (length > 0) send_to_agent(message, length);
-    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELTRANSPORT:%s", path);
+    length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELTRANSPORT:%lu|%s",
+        (unsigned long)g_generation, path);
     if (length > 0) send_hook_text(message);
 }
 
@@ -164,8 +177,12 @@ static void lock_relay(const char *reason) {
 }
 
 static void reset_session(void) {
+    InterlockedIncrement(&g_generation);
     g_peer_ip = 0;
     g_join_port = 0;
+    g_last_join_port = 0;
+    g_source_port = 0;
+    g_target_port = 0;
     g_decision_started = 0;
     g_decision_deadline = 0;
     g_session_deadline = 0;
@@ -203,10 +220,14 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
      */
     if (!is_new_peer) {
         g_join_port = join_port;
+        if (join_port != 0) g_last_join_port = join_port;
         return;
     }
     g_peer_ip = peer_ip;
     g_join_port = join_port;
+    g_last_join_port = join_port;
+    g_source_port = source_port;
+    g_target_port = target_port;
     InterlockedIncrement(&g_generation);
     g_decision_started = GetTickCount64();
     g_decision_deadline = 0;
@@ -215,7 +236,10 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
     InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
     length = _snprintf_s(text, sizeof(text), _TRUNCATE, "WELGAMEPEER:%s|%u|%u|%lu",
         ip, (unsigned)source_port, (unsigned)target_port, (unsigned long)g_generation);
-    if (length > 0) send_to_agent(text, length);
+    if (length > 0) {
+        send_to_agent(text, length);
+        send_to_hook(text, length);
+    }
     notify_transport("pending");
 }
 
@@ -340,9 +364,12 @@ static int process_wire_packet(char *packet, int received, int direct) {
 
 static void process_ice_message(char *packet, int received) {
     const char *state;
+    unsigned long generation;
+    const char *value;
     if (received > (int)strlen("WELICEAGENT:") && memcmp(packet, "WELICEAGENT:", strlen("WELICEAGENT:")) == 0) {
         unsigned short port;
-        if (parse_port(packet + strlen("WELICEAGENT:"), &port)) {
+        if (parse_generation_message(packet + strlen("WELICEAGENT:"), received - (int)strlen("WELICEAGENT:"), &generation, &value) &&
+            generation == (unsigned long)g_generation && parse_port(value, &port)) {
             unsigned short previous = g_agent_port;
             g_agent_port = port;
             /* A newly activated standby agent is an explicit ICE retry for
@@ -361,7 +388,15 @@ static void process_ice_message(char *packet, int received) {
         send_to_hook(packet, received);
         return;
     }
-    if (received == (int)strlen("WELICEREMOTESET") && memcmp(packet, "WELICEREMOTESET", received) == 0) {
+    if (received > (int)strlen("WELICEREMOTESET") && memcmp(packet, "WELICEREMOTESET", strlen("WELICEREMOTESET")) == 0) {
+        char generation_text[24];
+        int generation_length = received - (int)strlen("WELICEREMOTESET");
+        char *end = NULL;
+        if (generation_length <= 0 || generation_length >= (int)sizeof(generation_text)) return;
+        memcpy(generation_text, packet + strlen("WELICEREMOTESET"), (size_t)generation_length);
+        generation_text[generation_length] = '\0';
+        generation = strtoul(generation_text, &end, 10);
+        if (end == generation_text || *end != '\0' || generation != (unsigned long)g_generation) return;
         if (InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING) {
             g_decision_started = GetTickCount64();
             g_decision_deadline = 0;
@@ -371,7 +406,9 @@ static void process_ice_message(char *packet, int received) {
         return;
     }
     if (received > (int)strlen("WELICESTATE:") && memcmp(packet, "WELICESTATE:", strlen("WELICESTATE:")) == 0) {
-        state = packet + strlen("WELICESTATE:");
+        if (!parse_generation_message(packet + strlen("WELICESTATE:"), received - (int)strlen("WELICESTATE:"), &generation, &value) ||
+            generation != (unsigned long)g_generation) return;
+        state = value;
         if ((strncmp(state, "connected", 9) == 0 || strncmp(state, "completed", 9) == 0) &&
             (InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING ||
              InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_RELAY)) {
@@ -392,7 +429,9 @@ static void process_ice_message(char *packet, int received) {
         send_to_hook(packet, received);
         return;
     }
-    if (received > (int)strlen("WELICEPEER:") && memcmp(packet, "WELICEPEER:", strlen("WELICEPEER:")) == 0) {
+    if (received > (int)strlen("WELICEPEER:") && memcmp(packet, "WELICEPEER:", strlen("WELICEPEER:")) == 0 &&
+        parse_generation_message(packet + strlen("WELICEPEER:"), received - (int)strlen("WELICEPEER:"), &generation, &value) &&
+        generation == (unsigned long)g_generation) {
         send_to_hook(packet, received);
     }
 }
@@ -527,7 +566,7 @@ int main(int argc, char **argv) {
                             break;
                         }
                     }
-                    if (logical_port != 0 && logical_port == g_join_port) reset_session();
+                    if (logical_port != 0 && (logical_port == g_join_port || logical_port == g_last_join_port || logical_port == g_source_port || logical_port == g_target_port)) reset_session();
                 } else if (welnpt_valid_host_frame(frame) && frame->type == WELNPT_HOST_FRAME_DATA &&
                     payload_length >= 0 && payload_length <= WELNPT_MAX_PAYLOAD &&
                     received == (int)sizeof(*frame) + payload_length) {
@@ -536,9 +575,10 @@ int main(int argc, char **argv) {
             }
         } else if (received > 0 && received >= (int)sizeof(welnpt_packet_header) &&
             memcmp(packet, "WNP3", 4) == 0) {
+            /* The no-TAP Host has only relay and libjuice direct transports.
+             * Retired virtual-layer packets must not be accepted as direct. */
             process_wire_packet(packet, received,
-                (is_loopback(&source) && g_agent_port != 0 && ntohs(source.sin_port) == g_agent_port) ||
-                is_wireguard_bridge(&source));
+                is_loopback(&source) && g_agent_port != 0 && ntohs(source.sin_port) == g_agent_port);
         } else if (received > 0 && is_loopback(&source)) {
             process_ice_message(packet, received);
         }
