@@ -13,6 +13,10 @@
 #define WEL_HOST_BUFFER_SIZE (sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD)
 #define WEL_HOST_SESSION_TIMEOUT_MS 30000
 #define WEL_HOST_HEARTBEAT_MS 2000
+/* WE8 exchanges datagrams continuously while a match is in progress. Once no
+ * peer traffic has been seen for this long the match has ended (or the socket
+ * close was missed) and the session may be ended by a new search. */
+#define WEL_HOST_SESSION_IDLE_MS 8000
 #define WEL_HOST_PATH_PENDING 0
 #define WEL_HOST_PATH_DIRECT 1
 #define WEL_HOST_PATH_RELAY 2
@@ -37,6 +41,7 @@ static LONG g_generation;
 static ULONGLONG g_decision_started;
 static ULONGLONG g_decision_deadline;
 static ULONGLONG g_session_deadline;
+static ULONGLONG g_last_peer_activity;
 
 typedef struct wel_host_socket_map {
     int active;
@@ -186,9 +191,18 @@ static void reset_session(void) {
     g_decision_started = 0;
     g_decision_deadline = 0;
     g_session_deadline = 0;
+    g_last_peer_activity = 0;
     InterlockedExchange(&g_direct_connected, 0);
     InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
     notify_transport("pending");
+}
+
+/* A session is "active" while match traffic with the recorded peer keeps
+ * flowing. Control packets shaped like the matchmaking handshake (search /
+ * join / accept) from anyone else must not disturb an active session. */
+static int session_active(void) {
+    return g_peer_ip != 0 && g_last_peer_activity != 0 &&
+        GetTickCount64() - g_last_peer_activity < WEL_HOST_SESSION_IDLE_MS;
 }
 
 static void check_deadline(void) {
@@ -221,6 +235,7 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
     if (!is_new_peer) {
         g_join_port = join_port;
         if (join_port != 0) g_last_join_port = join_port;
+        g_last_peer_activity = GetTickCount64();
         return;
     }
     g_peer_ip = peer_ip;
@@ -232,6 +247,7 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
     g_decision_started = GetTickCount64();
     g_decision_deadline = 0;
     g_session_deadline = g_decision_started + WEL_HOST_SESSION_TIMEOUT_MS;
+    g_last_peer_activity = g_decision_started;
     InterlockedExchange(&g_direct_connected, 0);
     InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
     length = _snprintf_s(text, sizeof(text), _TRUNCATE, "WELGAMEPEER:%s|%u|%u|%lu",
@@ -241,6 +257,20 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
         send_to_hook(text, length);
     }
     notify_transport("pending");
+}
+
+/* Replay the current session to the ICE agent. A replaced agent restarts at
+ * generation 0 and never saw the WELGAMEPEER that started this session, so it
+ * must re-adopt the current generation before any of its state notifications
+ * are accepted by this Host. */
+static void send_game_peer_to_agent(void) {
+    char text[128];
+    char ip[INET_ADDRSTRLEN];
+    int length;
+    if (g_peer_ip == 0 || InetNtopA(AF_INET, &g_peer_ip, ip, sizeof(ip)) == NULL) return;
+    length = _snprintf_s(text, sizeof(text), _TRUNCATE, "WELGAMEPEER:%s|%u|%u|%lu",
+        ip, (unsigned)g_source_port, (unsigned)g_target_port, (unsigned long)g_generation);
+    if (length > 0) send_to_agent(text, length);
 }
 
 static int send_wire_packet(const char *payload, int length, uint32_t target_ip,
@@ -261,6 +291,9 @@ static int send_wire_packet(const char *payload, int length, uint32_t target_ip,
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
     path = InterlockedCompareExchange(&g_path, 0, 0);
+    if ((flags & WELNPT_FLAG_BROADCAST) == 0 && g_peer_ip != 0 && target_ip == g_peer_ip) {
+        g_last_peer_activity = GetTickCount64();
+    }
     if ((flags & WELNPT_FLAG_BROADCAST) == 0 && path == WEL_HOST_PATH_DIRECT &&
         InterlockedCompareExchange(&g_direct_connected, 0, 0) != 0 && target_ip == g_peer_ip && g_agent_port != 0) {
         g_agent_address.sin_port = htons(g_agent_port);
@@ -317,9 +350,11 @@ static void process_game_frame(const welnpt_host_frame *frame, const char *paylo
     kind = classify_control_payload(payload, (int)ntohs(frame->payload_length));
     /* Search broadcasts can be repeated during team/kit selection and do not
        end the current match session. The Hook reports socket close when WE8
-       actually returns to its main screen. */
+       actually returns to its main screen. A join/accept shaped datagram aimed
+       at a foreign peer must not restart ICE while a session is active. */
     session_signal = (frame->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-        (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT);
+        (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT) &&
+        (!session_active() || frame->target_ip == g_peer_ip);
     source_port = ntohs(frame->source_port);
     target_port = ntohs(frame->target_port);
     join_port = kind == WEL_HOST_PAYLOAD_JOIN ? source_port : target_port;
@@ -345,18 +380,31 @@ static int process_wire_packet(char *packet, int received, int direct) {
         payload_length < 0 || payload_length > WELNPT_MAX_PAYLOAD ||
         received != (int)sizeof(*header) + payload_length) return 0;
     kind = classify_control_payload(packet + sizeof(*header), payload_length);
-    /* Do not reset on a repeated search broadcast from the current peer. */
     source_port = ntohs(header->source_port);
     target_port = ntohs(header->target_port);
     join_port = kind == WEL_HOST_PAYLOAD_JOIN ? source_port : target_port;
-    if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
-        (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT)) {
+    if ((header->flags & WELNPT_FLAG_BROADCAST) != 0) {
+        /* A search never creates a session. While a match is running it must
+         * not reach the game either, so a repeated search cannot push WE8 back
+         * into matchmaking. Once the match has gone idle, a new search from
+         * the current peer ends the stale session so the reply can go out over
+         * relay (a locked direct path must not black-hole the search reply). */
+        if (kind == WEL_HOST_PAYLOAD_SEARCH) {
+            if (session_active()) return 1;
+            if (g_peer_ip != 0 && header->source_ip == g_peer_ip) reset_session();
+        }
+    } else if (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT) {
+        /* Join/accept shaped datagrams from a foreign peer must not steal or
+         * restart an active session: report_game_peer would bump the
+         * generation, drop the direct link and re-run matchmaking. */
+        if (session_active() && header->source_ip != g_peer_ip) return 1;
         report_game_peer(header->source_ip, join_port, source_port, target_port);
     }
     path = InterlockedCompareExchange(&g_path, 0, 0);
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_peer_ip) {
         if (direct && path != WEL_HOST_PATH_DIRECT) return 1;
         if (!direct && path == WEL_HOST_PATH_DIRECT) return 1;
+        g_last_peer_activity = GetTickCount64();
     }
     send_local_frame(header, packet + sizeof(*header), payload_length);
     return 1;
@@ -369,20 +417,31 @@ static void process_ice_message(char *packet, int received) {
     if (received > (int)strlen("WELICEAGENT:") && memcmp(packet, "WELICEAGENT:", strlen("WELICEAGENT:")) == 0) {
         unsigned short port;
         if (parse_generation_message(packet + strlen("WELICEAGENT:"), received - (int)strlen("WELICEAGENT:"), &generation, &value) &&
-            generation == (unsigned long)g_generation && parse_port(value, &port)) {
+            parse_port(value, &port)) {
             unsigned short previous = g_agent_port;
-            g_agent_port = port;
-            /* A newly activated standby agent is an explicit ICE retry for
-               the same peer. Re-open the pending state so it can upgrade a
-               relay session if connectivity succeeds later. */
-            if (previous != 0 && previous != port &&
-                InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_RELAY) {
-                InterlockedExchange(&g_direct_connected, 0);
-                InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
-                g_decision_deadline = 0;
-                g_decision_started = GetTickCount64();
-                g_session_deadline = g_decision_started + WEL_HOST_SESSION_TIMEOUT_MS;
-                notify_transport("pending");
+            if (generation == (unsigned long)g_generation) {
+                g_agent_port = port;
+                /* A newly activated standby agent is an explicit ICE retry for
+                   the same peer. Re-open the pending state so it can upgrade a
+                   relay session if connectivity succeeds later. */
+                if (previous != 0 && previous != port &&
+                    InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_RELAY) {
+                    InterlockedExchange(&g_direct_connected, 0);
+                    InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
+                    g_decision_deadline = 0;
+                    g_decision_started = GetTickCount64();
+                    g_session_deadline = g_decision_started + WEL_HOST_SESSION_TIMEOUT_MS;
+                    notify_transport("pending");
+                }
+            } else if (port != 0) {
+                /* A replaced (reset) agent restarts at generation 0 and never
+                   saw the WELGAMEPEER of the running session. Adopt its port
+                   and replay the session so the fresh agent re-aligns its
+                   generation; otherwise every later WELICESTATE /
+                   WELICEREMOTESET is ignored for a generation mismatch and
+                   direct can never establish after an agent rotation. */
+                g_agent_port = port;
+                send_game_peer_to_agent();
             }
         }
         send_to_hook(packet, received);
@@ -420,12 +479,11 @@ static void process_ice_message(char *packet, int received) {
         } else if (strncmp(state, "failed", 6) == 0 &&
             InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_PENDING) {
             lock_relay("ice-failed");
-        } else if (strncmp(state, "failed", 6) == 0 &&
-            InterlockedCompareExchange(&g_path, 0, 0) == WEL_HOST_PATH_DIRECT) {
-            InterlockedExchange(&g_path, WEL_HOST_PATH_RELAY);
-            InterlockedExchange(&g_direct_connected, 0);
-            notify_transport("relay");
         }
+        /* No fallback once direct is locked: a "failed" state while DIRECT is
+         * intentionally ignored. Falling back mid-match would lose the
+         * transition packets and desync WE8 anyway. Only a new session (idle
+         * re-search or socket close) restarts the transport. */
         send_to_hook(packet, received);
         return;
     }

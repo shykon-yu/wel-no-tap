@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { FolderOpen, Gamepad2, LoaderCircle, LogOut, Play, RefreshCw, Router, ShieldCheck, Users } from 'lucide-vue-next'
-import { ApiError, authApi, clearToken, hasToken, roomApi, setToken, type Lease, type Room, type RoomMember, type User } from './api'
+import { ApiError, authApi, clearToken, hasToken, roomApi, setToken, type Lease, type PeerProbe, type Room, type RoomMember, type User } from './api'
 import type { DesktopLeaseStatus, PingResult } from './electron'
 import { runtimeConfig } from './config'
 
@@ -619,7 +619,14 @@ async function waitForIncomingGameProbe(roomID: number, requesterUserID: number,
     if (epoch !== gamePeerEpoch || !activeLease.value || activeLease.value.room_id !== roomID) return null
     try {
       const result = await roomApi.incomingPeerProbes(roomID, 'game', sessionKey)
-      const probe = result.probes.find(item => item.requester_user_id === requesterUserID && item.session_key === sessionKey && item.requester_description)
+      const matches = result.probes.filter(item => item.requester_user_id === requesterUserID && item.session_key === sessionKey && item.requester_description)
+      // Prefer the newest unanswered probe; fall back to the newest record so
+      // a stale answered probe from an earlier match is never re-used.
+      const pending = matches.filter(item => !item.target_description)
+      let probe: PeerProbe | undefined
+      for (const item of (pending.length > 0 ? pending : matches)) {
+        if (!probe || item.id > probe.id) probe = item
+      }
       if (probe) return probe
     } catch {
       // The relay path remains available while game signaling retries.
@@ -633,9 +640,11 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   const lease = activeLease.value
   if (!lease || !user.value) return false
   let member: RoomMember | undefined
+  let selfIp = ''
   try {
     const current = await roomApi.members(lease.room_id)
     member = current.members.find(item => !item.is_self && item.virtual_ip === logicalIp)
+    selfIp = String(current.members.find(item => item.is_self)?.virtual_ip || lease.logical_ip || lease.virtual_ip || '').trim()
     roomMembers.value = current.members
   } catch { return false }
   if (!member || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
@@ -645,39 +654,58 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   // The lower user ID is the single offerer for this match. Both peers use
   // their current clean agent for the first match, then rotate A/B slots.
   const isOfferer = user.value.id < member.user_id
+  // Pair-scoped session key: both peers derive the same string from the sorted
+  // pair of logical IPs. The previous per-side key (peer IP + mirrored ports +
+  // local generation) was never identical on both ends, so the probe exchange
+  // could never match and direct never established.
+  const sessionKey = selfIp ? `game|${[selfIp, logicalIp].sort().join('_')}` : transactionKey
   const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
     // Once a real game peer has been observed, this agent belongs to that
     // match even if signaling later fails. The next transaction must rotate
     // to a clean standby or fresh agent instead of reusing its remote SDP.
     activeGamePeerAgentUsed = true
-    if (needsFreshAgent) {
-      const activated = await desktop()!.activateIce()
-      const ice = activated || await desktop()!.resetIce()
-      localIceDescription.value = ice.localDescription
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0 || needsFreshAgent) {
+        const activated = await desktop()!.activateIce()
+        const ice = activated || await desktop()!.resetIce()
+        localIceDescription.value = ice.localDescription
+      }
+      if (!localIceDescription.value || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+      let remoteDescription = ''
+      try {
+        if (isOfferer) {
+          const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, localIceDescription.value, {
+            purpose: 'game', sessionKey,
+          })
+          const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, sessionKey, 30000, epoch)
+          if (answered.session_key === sessionKey && answered.requester_user_id === user.value.id &&
+            answered.target_user_id === member.user_id && answered.target_description) {
+            remoteDescription = answered.target_description
+          }
+        } else {
+          const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, sessionKey, epoch)
+          if (incoming?.requester_description) {
+            remoteDescription = incoming.requester_description
+            await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value, incoming.session_key || sessionKey)
+          }
+        }
+        if (remoteDescription && epoch === gamePeerEpoch && activeLease.value?.room_id === lease.room_id) {
+          const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription })
+          if (configured) {
+            activeGamePeerIp = member.virtual_ip
+            activeGamePeerTransaction = transactionKey
+            return true
+          }
+        }
+      } catch {
+        // Signaling failed on this attempt; rotate the agent and retry once
+        // below. The match keeps running over relay in the meantime.
+      }
+      if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
+      await new Promise(resolve => window.setTimeout(resolve, 4000))
     }
-    if (!localIceDescription.value || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
-
-    let remoteDescription = ''
-    if (isOfferer) {
-      const created = await roomApi.createPeerProbe(lease.room_id, member.user_id, localIceDescription.value, {
-        purpose: 'game', sessionKey: transactionKey,
-      })
-      const answered = await waitForPeerProbeAnswer(lease.room_id, created.probe.id, transactionKey, 30000, epoch)
-      if (answered.session_key !== transactionKey || answered.requester_user_id !== user.value.id || answered.target_user_id !== member.user_id || !answered.target_description) return false
-      remoteDescription = answered.target_description
-    } else {
-      const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, transactionKey, epoch)
-      if (!incoming?.requester_description) return false
-      remoteDescription = incoming.requester_description
-      await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value, transactionKey)
-    }
-    if (epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
-    const configured = await desktop()!.configureIce({ remoteIp: member.virtual_ip, remoteDescription })
-    if (!configured) return false
-    activeGamePeerIp = member.virtual_ip
-    activeGamePeerTransaction = transactionKey
-    return true
+    return false
   } catch {
     return false
   } finally {
