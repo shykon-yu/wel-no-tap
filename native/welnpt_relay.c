@@ -100,7 +100,7 @@ static int self_test(void) {
     welnpt_initialize_header(header, WELNPT_PACKET_DATA);
     header->payload_length = htons(4);
     CopyMemory(packet + sizeof(*header), "test", 4);
-    if (sizeof(*header) != 58 || !welnpt_valid_header(header)) return 1;
+    if (sizeof(*header) != 74 || !welnpt_valid_header(header)) return 1;
     puts("SELF-TEST OK");
     return 0;
 }

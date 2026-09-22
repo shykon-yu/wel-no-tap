@@ -6,6 +6,7 @@
 
 #define WELNPT_PROTOCOL_VERSION 2
 #define WELNPT_ROOM_LENGTH 32
+#define WELNPT_AUTH_TAG_LENGTH 16
 #define WELNPT_MAX_PAYLOAD 4096
 #define WELNPT_PACKET_REGISTER 1
 #define WELNPT_PACKET_DATA 2
@@ -27,6 +28,9 @@ typedef struct welnpt_packet_header {
     uint16_t target_port;
     uint16_t payload_length;
     uint32_t sequence;
+    /* Kept as a wire-compatible reserved trailer. The lightweight build does
+       not calculate an HMAC, but existing relays expect this space. */
+    uint8_t auth_tag[WELNPT_AUTH_TAG_LENGTH];
 } welnpt_packet_header;
 #pragma pack(pop)
 

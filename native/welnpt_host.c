@@ -567,7 +567,7 @@ int main(int argc, char **argv) {
         header->payload_length = htons(4);
         CopyMemory(packet + sizeof(*header), "test", 4);
         welnpt_initialize_host_frame(&frame, WELNPT_HOST_FRAME_DATA);
-        if (sizeof(*header) != 58 || !welnpt_valid_header(header) || !welnpt_valid_host_frame(&frame)) return 1;
+        if (sizeof(*header) != 74 || !welnpt_valid_header(header) || !welnpt_valid_host_frame(&frame)) return 1;
         welnpt_initialize_host_frame(&frame, WELNPT_HOST_FRAME_CLOSE);
         frame.source_port = htons(49152);
         if (!welnpt_valid_host_frame(&frame)) return 1;
