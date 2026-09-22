@@ -172,7 +172,7 @@ SOCCER_AUTH_URL=http://<laravel internal endpoint>/api/v1/auth/platform-login
 
 WEL_NOTAP_RELAY_HOST=<new public IP or DNS name>
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=<Go 控制面租约值；当前不参与 WNP3 数据包认证>
+WEL_NOTAP_RELAY_TOKEN=<Go 控制面租约值；客户端和中继用于 WNP2 数据包认证>
 WEL_NOTAP_ICE_STUN_HOST=<new public IP or DNS name>
 WEL_NOTAP_ICE_STUN_PORT=3478
 ```

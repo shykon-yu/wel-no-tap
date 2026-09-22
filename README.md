@@ -28,7 +28,7 @@ The data path is:
 ```text
 WE8.exe
   -> welnpt.dll lightweight loopback Socket shim
-  -> welnpthost.exe (WNP3 framing, session/path state)
+  -> welnptgame.exe (single-hook WNP2 transport launcher)
   -> libjuice ICE direct UDP after connectivity checks, or Linux/Windows
      room relay on UDP 22333
   -> peer welnpt.dll
@@ -36,16 +36,13 @@ WE8.exe
 ```
 
 The Hook virtualizes `socket`, `bind`, `getsockname`, `sendto`, `recvfrom`,
-`WSASendTo`, `WSARecvFrom`, and `closesocket`. In Host mode each game Socket
-gets one nonblocking loopback Socket. The Hook only builds a small local frame
-and reads the corresponding loopback datagram; WNP3 framing, broadcast fan-out,
-ICE path selection, and session state stay in `welnpthost.exe`. If the Host is
-not supplied, the original in-process transport remains available as a
-compatibility fallback. Empty nonblocking reads return `WSAEWOULDBLOCK (10035)`.
+`WSASendTo`, `WSARecvFrom`, and `closesocket`. It keeps each game's nonblocking
+socket queue and performs the lightweight WNP2 framing itself. Empty
+nonblocking reads return `WSAEWOULDBLOCK (10035)`.
 
-Protocol v3 uses a compact 58-byte header. Game packets do not carry per-packet
-HMAC: Host and relay retain strict magic/version/room/target/length checks.
-This is an intentional performance trade-off for the small closed player group.
+Protocol v2 uses the compact WNP2 header and the existing truncated HMAC-SHA256
+check. Search broadcast fan-out, ICE path selection, session reset, and relay
+fallback stay in the single Hook data path.
 
 ## Build on Windows
 
@@ -61,7 +58,6 @@ Outputs are written to `build\x86`:
 ```text
 WEL无网卡联机.exe
 welnpt.dll
-welnpthost.exe
 welnptrelay.exe
 WEL无网卡观测工具.exe
 welnpttrace.dll

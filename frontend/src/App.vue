@@ -175,13 +175,9 @@ function startTransportStatusMonitor() {
     } catch { /* status is best effort */ }
   }
   void refresh()
-  /* TAP status comes from the management plane, not game packets.
-     A slow poll keeps the room label current without adding data-path work. */
-  if (tapRoom) {
-    transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
-  } else {
-    transportStatusTimer = undefined
-  }
+  /* This is UI-only polling. The game data path remains event-driven; polling
+     lets the single-hook ICE agent update the label after the initial launch. */
+  transportStatusTimer = window.setInterval(() => { void refresh() }, 2000)
 }
 
 async function loadRoomMembers() {

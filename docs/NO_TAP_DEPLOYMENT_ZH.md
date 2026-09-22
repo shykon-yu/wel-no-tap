@@ -95,7 +95,7 @@ SOCCER_AUTH_URL=https://api.example.com/api/v1/auth/platform-login
 
 WEL_NOTAP_RELAY_HOST=relay.example.com
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=Go 控制面租约使用的随机值（不参与 WNP3 数据包认证）
+WEL_NOTAP_RELAY_TOKEN=Go 控制面租约使用的随机值（由客户端用于 WNP2 数据包认证）
 
 WEL_NOTAP_ICE_STUN_HOST=stun.example.com
 WEL_NOTAP_ICE_STUN_PORT=3478
@@ -257,7 +257,10 @@ STUN coturn 3478/UDP
 ```text
 配置：deploy/coturn/wel-stun.conf
 systemd：deploy/systemd/wel-stun.service
-端口：3478/UDP
+端口：3478/UDP。若服务器本身有公网 IPv6，可在 coturn 中同时监听 `::`，并让
+`ice_stun_host` 使用带 AAAA 记录的域名；这样 IPv6 客户端还可以从 STUN 获得 IPv6
+映射。服务器没有公网 IPv6 时不要填写伪造的 AAAA，客户端仍会使用 IPv6 host candidate
+并通过 IPv4 STUN/中继回退。
 ```
 
 STUN 只用于收集公网 candidate 和 connectivity check。它不是比赛中继，也不能用
