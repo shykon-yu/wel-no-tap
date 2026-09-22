@@ -3,17 +3,13 @@ const os = require('node:os')
 const path = require('node:path')
 const dgram = require('node:dgram')
 const { spawn } = require('node:child_process')
-const { StringDecoder } = require('node:string_decoder')
 const { loadConfig } = require('./config.cjs')
 
 const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform')
 const logDirectory = path.join(appData, 'logs')
 const localConfig = loadConfig().values
 const diagnosticLogEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_DIAGNOSTIC_LOG || 'false'))
-// Port mapping is optional and can be enabled for targeted NAT diagnostics.
-// Keep it off by default so entering a room/prewarming an agent never waits
-// on a router's UPnP/NAT-PMP/PCP implementation.
-const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'false'))
+const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'true'))
 
 let lastProcess = null
 let iceProcess = null
@@ -21,10 +17,6 @@ let iceState = 'waiting'
 let iceLocalDescription = ''
 let iceAgentPort = 0
 let iceHookPort = 0
-// Keep the active ICE UDP mapping stable for the lifetime of a room. A reset
-// of the agent reuses this port after the old child exits instead of creating
-// a new NAT mapping during the same match flow.
-let activeIcePort = 0
 let iceLineBuffer = ''
 let iceSdpBuffer = ''
 let readingIceSdp = false
@@ -39,33 +31,15 @@ let lastLogPath = ''
 let sessionLogPath = ''
 let transportLogOffset = 0
 let transportLogRemainder = ''
-let transportLogDecoder = new StringDecoder('utf8')
 let transportPath = 'pending'
 let activeGamePeerIp = ''
-let activeGamePeerGeneration = 0
 let iceOptions = null
 const gamePeerListeners = new Set()
-const transportListeners = new Set()
 const probeAgents = new Map()
 let standbyAgentKey = ''
 let standbyPromise = null
 let standbyGeneration = 0
 let iceUpnpMapping = null
-let iceLifecycleGeneration = 0
-let iceStartPromise = null
-
-function setTransportPath(nextPath) {
-  if (!['pending', 'direct', 'relay'].includes(nextPath) || transportPath === nextPath) return
-  transportPath = nextPath
-  for (const listener of transportListeners) {
-    try { listener(transportStatusSnapshot()) } catch {}
-  }
-}
-
-function transportStatusSnapshot() {
-  const summary = transportPath === 'direct' ? 'P2P直连' : transportPath === 'relay' ? '云中继' : '连接中'
-  return { path: transportPath, directState: iceState, summary }
-}
 
 function helperCandidates() {
   return [
@@ -80,14 +54,6 @@ function hookCandidates() {
     path.join(process.resourcesPath || '', 'welhelper', 'welnpt.dll'),
     path.join(__dirname, '..', 'resources', 'welhelper', 'welnpt.dll'),
     path.join(__dirname, '..', 'build', 'welnpt.dll'),
-  ].filter(Boolean)
-}
-
-function hostCandidates() {
-  return [
-    path.join(process.resourcesPath || '', 'welhelper', 'welnpthost.exe'),
-    path.join(__dirname, '..', 'resources', 'welhelper', 'welnpthost.exe'),
-    path.join(__dirname, '..', 'build', 'welnpthost.exe'),
   ].filter(Boolean)
 }
 
@@ -106,7 +72,7 @@ function locate(candidates) {
 function describeLaunchFailure(detail, code) {
   const raw = String(detail || '').trim()
   if (code === 3 || raw.includes('Game executable not found')) return '游戏程序 WE8.exe 不存在或路径无法访问。' + (raw ? '\n' + raw : '')
-  if (code === 4 || raw.includes('Hook module not found') || raw.includes('Host transport not found')) return '游戏网络组件或 Host 组件缺失或无法读取。' + (raw ? '\n' + raw : '')
+  if (code === 4 || raw.includes('Hook module not found')) return '游戏网络组件 welnpt.dll 缺失或无法读取。' + (raw ? '\n' + raw : '')
   if (code === 6 || raw.includes('CreateProcess failed')) return '游戏程序 WE8.exe 启动失败。' + (raw ? '\n' + raw : '')
   if (code === 7 || raw.includes('Hook module injection failed')) return '游戏网络组件 welnpt.dll 加载失败。' + (raw ? '\n' + raw : '')
   if (code === 8 || raw.includes('Hook module did not initialize')) return '游戏网络组件 welnpt.dll 初始化超时。' + (raw ? '\n' + raw : '')
@@ -193,27 +159,20 @@ function resetTransportTracking(logPath = '') {
   lastLogPath = logPath
   transportLogOffset = 0
   transportLogRemainder = ''
-  transportLogDecoder = new StringDecoder('utf8')
   transportPath = 'pending'
 }
 
 function updateTransportPathFromLog() {
   if (!lastLogPath || !fs.existsSync(lastLogPath)) return
   try {
-    const size = fs.statSync(lastLogPath).size
-    if (size < transportLogOffset) {
+    const contents = fs.readFileSync(lastLogPath, 'utf8')
+    if (contents.length < transportLogOffset) {
       transportLogOffset = 0
       transportLogRemainder = ''
-      transportLogDecoder = new StringDecoder('utf8')
       transportPath = 'pending'
     }
-    if (size === transportLogOffset) return
-    const fd = fs.openSync(lastLogPath, 'r')
-    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, size - transportLogOffset))
-    const read = fs.readSync(fd, buffer, 0, buffer.length, transportLogOffset)
-    fs.closeSync(fd)
-    transportLogOffset += read
-    const chunk = transportLogRemainder + transportLogDecoder.write(buffer.subarray(0, read))
+    const chunk = transportLogRemainder + contents.slice(transportLogOffset)
+    transportLogOffset = contents.length
     const lines = chunk.split(/\r?\n/)
     transportLogRemainder = lines.pop() || ''
     for (const line of lines) {
@@ -221,16 +180,16 @@ function updateTransportPathFromLog() {
       let event
       try { event = JSON.parse(line) } catch { continue }
       if (event.api === 'direct-target') {
-        setTransportPath('pending')
+        transportPath = 'pending'
       } else if (event.api === 'session-state' && event.state === 'WAIT_JOIN') {
-        setTransportPath('pending')
+        transportPath = 'pending'
       } else if (event.api === 'transport-lock') {
-        if (event.path === 'direct' || event.path === 'relay') setTransportPath(event.path)
+        if (event.path === 'direct' || event.path === 'relay') transportPath = event.path
       } else if (event.api === 'direct-fallback') {
-        setTransportPath('relay')
+        transportPath = 'relay'
       } else if (event.api === 'transport-recv' && event.broadcast === false) {
-        if (event.path === 'direct') setTransportPath('direct')
-        else if (event.path === 'relay' && event.length !== 64 && event.length !== 84 && transportPath === 'pending') setTransportPath('relay')
+        if (event.path === 'direct') transportPath = 'direct'
+        else if (event.path === 'relay' && event.length !== 64 && event.length !== 84 && transportPath === 'pending') transportPath = 'relay'
       }
     }
   } catch {}
@@ -238,39 +197,27 @@ function updateTransportPathFromLog() {
 
 function transportStatus() {
   updateTransportPathFromLog()
-  return transportStatusSnapshot()
+  const pathName = transportPath
+  const summary = pathName === 'direct'
+    ? '当前联机：P2P 直连'
+    : pathName === 'relay'
+      ? '当前联机：云中继'
+      : '游戏已启动，正在选择本场连接'
+  return { path: pathName, directState: iceState, summary }
 }
 
 function chooseHookPort() {
   return 40000 + ((process.pid + Date.now()) % 18000)
 }
 
-function chooseIcePort(preferredPort = 0) {
+function chooseIcePort() {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket('udp4')
-    let retried = false
-    const bind = (port) => socket.bind(port, '0.0.0.0', () => {
+    socket.once('error', reject)
+    socket.bind(0, '0.0.0.0', () => {
       const address = socket.address()
       socket.close(() => resolve(Number(address.port) || 0))
     })
-    socket.on('error', () => {
-      if (preferredPort && !retried) {
-        retried = true
-        try { socket.close() } catch {}
-        const fallback = dgram.createSocket('udp4')
-        fallback.once('error', (error) => {
-          try { fallback.close() } catch {}
-          reject(error)
-        })
-        fallback.bind(0, '0.0.0.0', () => {
-          const address = fallback.address()
-          fallback.close(() => resolve(Number(address.port) || 0))
-        })
-        return
-      }
-      reject(new Error('无法分配 ICE UDP 端口'))
-    })
-    bind(preferredPort || 0)
   })
 }
 
@@ -294,12 +241,7 @@ function runPowerShell(script, timeoutMs = 1800) {
     }, timeoutMs)
     child.stdout.on('data', (chunk) => { output += chunk.toString('utf8') })
     child.once('error', (error) => finish({ ok: false, reason: error.message }))
-    child.once('close', (code) => finish({
-      ok: code === 0,
-      marker: output.includes('WEL_UPNP_MAPPED'),
-      exitCode: code,
-      reason: code === 0 ? 'completed' : 'exit-' + code,
-    }))
+    child.once('close', (code) => finish({ ok: code === 0 && output.includes('WEL_UPNP_MAPPED'), reason: code === 0 ? 'unavailable' : 'exit-' + code }))
   })
 }
 
@@ -401,7 +343,7 @@ async function requestUpnpMapping(port, key) {
     `$nat=New-Object -ComObject HNetCfg.NATUPnP; $mappings=$nat.StaticPortMappingCollection; if($null -eq $mappings){exit 3}; ` +
     `$null=$mappings.Add($port,'UDP',$port,$ip,$true,$description); Write-Output 'WEL_UPNP_MAPPED'`
   const result = await runPowerShell(script)
-  mapping.mapped = Boolean(result.ok && result.marker)
+  mapping.mapped = Boolean(result.ok)
   mapping.description = description
   mapping.reason = result.reason
   appendAgentEvent('active', 'upnp-mapping', { port: mapping.port, mapped: mapping.mapped, reason: mapping.reason })
@@ -533,20 +475,14 @@ function handleIceLine(rawLine) {
   if (line.startsWith('STATE ')) {
     iceState = line.slice(6) || 'unknown'
     rememberAgentLine('active', line)
-    if (iceState === 'connected' || iceState === 'completed') setTransportPath('direct')
-    else if ((iceState === 'failed' || iceState === 'disconnected') && transportPath === 'pending') setTransportPath('relay')
     // The next slot is prepared as soon as the active agent has a peer. This
     // keeps a quick game exit from leaving the next launch cold.
     if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
     return
   }
   if (line.startsWith('TRANSPORT_STATE ')) {
-    const payload = line.slice(16).trim()
-    const separator = payload.indexOf('|')
-    const generation = separator > 0 ? Number(payload.slice(0, separator)) : 0
-    const state = separator > 0 ? payload.slice(separator + 1).trim() : payload
-    if (separator > 0 && activeGamePeerGeneration > 0 && generation !== activeGamePeerGeneration) return
-    if (state === 'pending' || state === 'direct' || state === 'relay') setTransportPath(state)
+    const state = line.slice(16).trim()
+    if (state === 'pending' || state === 'direct' || state === 'relay') transportPath = state
     appendAgentEvent('active', 'transport-state', { state })
     return
   }
@@ -558,7 +494,6 @@ function handleIceLine(rawLine) {
     const payload = line.slice(10).trim()
     const [logicalIp, sourcePort = '', targetPort = '', generation = '0'] = payload.split('|')
     if (logicalIp && /^\d{1,5}$/.test(sourcePort) && /^\d{1,5}$/.test(targetPort) && /^\d+$/.test(generation)) {
-      activeGamePeerGeneration = Number(generation) || 0
       for (const listener of gamePeerListeners) {
         try { listener({ logicalIp, transactionKey: `${logicalIp}|${sourcePort}|${targetPort}|${generation}` }) } catch {}
       }
@@ -610,20 +545,12 @@ function handleIceLine(rawLine) {
   }
 }
 
-async function startIceAgentInternal({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
-  const lifecycle = iceLifecycleGeneration
+async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token, hookPort = 0 }) {
   const executable = locate(iceCandidates())
   if (!executable) throw new Error('缺少 welnptice.exe，请重新解压完整客户端')
   if (iceProcess && !iceProcess.killed) return waitForIceCandidate(iceProcess)
-  const icePort = activeIcePort || await chooseIcePort(8978)
-  if (lifecycle !== iceLifecycleGeneration) throw new Error('ICE 启动已取消')
-  activeIcePort = icePort
+  const icePort = await chooseIcePort()
   iceUpnpMapping = await requestUpnpMapping(icePort, 'active-' + Date.now().toString(36))
-  if (lifecycle !== iceLifecycleGeneration) {
-    releaseUpnpMapping(iceUpnpMapping)
-    iceUpnpMapping = null
-    throw new Error('ICE 启动已取消')
-  }
   iceHookPort = Number(hookPort) || chooseHookPort()
   iceOptions = { stunHost, stunPort, relay, room, logicalIp, token }
   iceLocalDescription = ''
@@ -636,7 +563,6 @@ async function startIceAgentInternal({ stunHost, stunPort, relay, room, logicalI
   iceDiagnostics = []
   lastRemoteDescription = ''
   activeGamePeerIp = ''
-  activeGamePeerGeneration = 0
   const environment = { ...process.env }
   if (relay && room && logicalIp && token) {
     environment.WEL_NOTAP_RELAY = String(relay)
@@ -665,7 +591,6 @@ async function startIceAgentInternal({ stunHost, stunPort, relay, room, logicalI
     appendAgentEvent('active', 'stopped', { code: code ?? null })
     if (iceProcess === child) {
       iceProcess = null
-      if (lifecycle !== iceLifecycleGeneration) return
       iceState = 'failed'
       releaseUpnpMapping(iceUpnpMapping)
       iceUpnpMapping = null
@@ -676,23 +601,11 @@ async function startIceAgentInternal({ stunHost, stunPort, relay, room, logicalI
   return waitForIceCandidate(child)
 }
 
-async function startIceAgent(options) {
-  if (iceStartPromise) return iceStartPromise
-  const pending = startIceAgentInternal(options)
-  iceStartPromise = pending
-  try {
-    return await pending
-  } finally {
-    if (iceStartPromise === pending) iceStartPromise = null
-  }
-}
-
 function stopIceChild(child) {
-  if (!child) return Promise.resolve()
+  if (!child || child.killed) return Promise.resolve()
   return new Promise((resolve) => {
     let settled = false
     const finish = () => { if (!settled) { settled = true; resolve() } }
-    if (child.exitCode !== null || child.signalCode !== null) { finish(); return }
     const timer = setTimeout(() => { try { child.kill() } catch {}; finish() }, 1500)
     child.once('close', () => { clearTimeout(timer); finish() })
     try { child.stdin.write('EXIT\n') } catch { try { child.kill() } catch {} }
@@ -705,10 +618,8 @@ async function clearStandbyAgent() {
   standbyAgentKey = ''
   const pendingKey = standbyPromise?.probeKey
   standbyPromise = null
-  const stopping = []
-  if (key) stopping.push(stopProbeIce(key))
-  if (pendingKey && pendingKey !== key) stopping.push(stopProbeIce(pendingKey))
-  await Promise.all(stopping)
+  if (key) stopProbeIce(key)
+  if (pendingKey && pendingKey !== key) stopProbeIce(pendingKey)
 }
 
 async function prepareIce(options) {
@@ -722,18 +633,12 @@ async function prepareIce(options) {
 
 async function resetIce() {
   if (!iceOptions) throw new Error('直连组件尚未准备')
-  ++iceLifecycleGeneration
   await clearStandbyAgent()
   const previous = iceProcess
-  const pendingStart = iceStartPromise
   iceProcess = null
-  const mapping = iceUpnpMapping
+  releaseUpnpMapping(iceUpnpMapping)
   iceUpnpMapping = null
-  releaseUpnpMapping(mapping)
   await stopIceChild(previous)
-  if (pendingStart) {
-    try { await pendingStart } catch {}
-  }
   await startIceAgent({ ...iceOptions, hookPort: iceHookPort })
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
@@ -829,7 +734,6 @@ async function activateIce() {
   releaseUpnpMapping(iceUpnpMapping)
   iceUpnpMapping = null
   await stopIceChild(previous)
-  standby.promoted = true
   probeAgents.delete(key)
   standbyAgentKey = ''
   standbyPromise = null
@@ -837,10 +741,6 @@ async function activateIce() {
   iceProcess = standby.child
   iceLocalDescription = standby.localDescription
   iceAgentPort = standby.localPort
-  // The promoted agent owns the transport mapping for the next match. Reuse
-  // its port on a later reset instead of silently returning to a different
-  // local port and invalidating the NAT mapping.
-  activeIcePort = standby.localPort
   iceHookPort = standby.hookPort || iceHookPort
   iceOptions = standby.options || iceOptions
   iceUpnpMapping = standby.upnpMapping
@@ -855,7 +755,7 @@ async function activateIce() {
   activeGamePeerIp = ''
   appendAgentEvent('active', 'activated', { key, port: iceAgentPort, hookPort: iceHookPort })
   attachActiveIceProcess(iceProcess)
-  try { iceProcess.stdin.write('ACTIVATE ' + String(activeGamePeerGeneration || 0) + '\n') } catch {
+  try { iceProcess.stdin.write('ACTIVATE\n') } catch {
     await stopIceChild(iceProcess)
     iceProcess = null
     iceState = 'failed'
@@ -890,19 +790,13 @@ function onGamePeer(listener) {
   return () => gamePeerListeners.delete(listener)
 }
 
-function onTransportChange(listener) {
-  if (typeof listener !== 'function') return () => {}
-  transportListeners.add(listener)
-  return () => transportListeners.delete(listener)
-}
-
 function randomProbeKey() {
   return 'probe-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
 }
 
 function stopProbeIce(probeKey) {
   const probe = probeAgents.get(probeKey)
-  if (!probe) return Promise.resolve({ stopped: true })
+  if (!probe) return { stopped: true }
   appendAgentEvent(probe.standby ? 'standby' : 'probe', 'stopping', { key: probeKey, reason: 'rotation-or-disconnect' })
   probeAgents.delete(probeKey)
   releaseUpnpMapping(probe.upnpMapping)
@@ -919,14 +813,9 @@ function stopProbeIce(probeKey) {
     clearTimeout(waiter.timer)
     waiter.reject(new Error('临时 ICE 探测已结束'))
   }
-  return new Promise((resolve) => {
-    let settled = false
-    const finish = () => { if (!settled) { settled = true; resolve({ stopped: true }) } }
-    if (probe.child.exitCode !== null || probe.child.signalCode !== null) { finish(); return }
-    const timer = setTimeout(() => { try { probe.child.kill() } catch {}; finish() }, 1500)
-    probe.child.once('close', () => { clearTimeout(timer); finish() })
-    try { probe.child.stdin.write('EXIT\n') } catch { try { probe.child.kill() } catch {}; finish() }
-  })
+  try { probe.child.stdin.write('EXIT\n') } catch {}
+  try { probe.child.kill() } catch {}
+  return { stopped: true }
 }
 
 function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '', icePort = 0, upnpMapping = null }) {
@@ -957,12 +846,11 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
     remoteWaiter: null, pingUnavailable: false, pendingPing: null,
     retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0, upnpMapping,
-    options: { stunHost, stunPort, relay, room, logicalIp, token }, promoted: false,
+    options: { stunHost, stunPort, relay, room, logicalIp, token },
   }
   appendAgentEvent(standby ? 'standby' : 'probe', 'started', { key, stunHost, stunPort, hookPort: Number(hookPort) || 0 })
   probeAgents.set(key, probe)
   const consume = (chunk) => {
-    if (probe.promoted) return
     probe.buffer += chunk.toString('utf8')
     let newline
     while ((newline = probe.buffer.indexOf('\n')) >= 0) {
@@ -1025,7 +913,6 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
   child.stdout.on('data', consume)
   child.stderr.on('data', (chunk) => { probe.error = String(chunk).trim().slice(0, 300) || probe.error })
   child.once('close', (code) => {
-    if (probe.promoted) return
     appendAgentEvent(standby ? 'standby' : 'probe', 'stopped', { key, code: code ?? null })
     if (probeAgents.get(key) !== probe) return
     probe.error ||= '临时 ICE 辅助程序提前退出（代码 ' + (code ?? '未知') + '）'
@@ -1042,9 +929,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     }
   })
   const gatheringPromise = new Promise((resolve, reject) => {
-    // STUN can be slow on first use; keep the active and standby agents
-    // consistent with the 30-second session decision window.
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + (standby ? 26000 : 12000)
     const timer = setInterval(() => {
       if (probe.localDescription && probe.localPort && probeAgents.get(key) === probe) {
         clearInterval(timer)
@@ -1179,25 +1064,21 @@ function windowsCommandArgument(value) {
   return '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
 }
 
-function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct' }) {
+function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
-  const host = locate(hostCandidates())
   const executable = resolveGamePath(gamePath)
   if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
-  if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
-  if (!direct) setTransportPath('relay')
-  const args = ['--game', executable, '--hook', hook, '--host', host, '--relay', String(relay), '--room', String(room),
+  if (!direct) transportPath = 'relay'
+  const args = ['--game', executable, '--hook', hook, '--relay', String(relay), '--room', String(room),
     '--logical-ip', String(logicalIp), '--token', String(token)]
   if (diagnosticLogEnabled && logPath) args.push('--log', logPath)
-  const agentPort = iceAgentPort
-  const hookPort = iceHookPort
-  if (direct && agentPort && hookPort) {
-    args.push('--direct-agent-port', String(agentPort), '--direct-hook-port', String(hookPort))
+  if (direct && iceProcess && iceAgentPort && iceHookPort) {
+    args.push('--direct-agent-port', String(iceAgentPort), '--direct-hook-port', String(iceHookPort))
   }
   return { helper, args, logPath }
 }
@@ -1205,7 +1086,7 @@ function elevatedLauncherArguments({ gamePath, relay, room, logicalIp, token, di
 async function launchElevated(options) {
   // Match the normal launch path: validate or rotate to a clean direct agent
   // before the elevated helper injects the Hook.
-  if (options?.direct !== false && options?.mode === 'direct') {
+  if (options?.direct !== false) {
     await prepareGameIce()
   }
   const { helper, args, logPath } = elevatedLauncherArguments(options || {})
@@ -1218,29 +1099,13 @@ async function launchElevated(options) {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  if (options?.mode === 'direct') void prewarmIce()
+  void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    let settled = false
-    const timeout = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try { child.kill() } catch {}
-      reject(new Error('管理员权限启动器等待游戏组件超时，请检查 welnptgame.exe、welnpthost.exe 是否被安全软件拦截'))
-    }, 35000)
-    child.once('error', (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      lastProcess = null
-      reject(new Error('管理员权限启动器 powershell.exe 无法运行：' + error.message))
-    })
-    child.once('exit', (code) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
+    child.once('error', (error) => reject(new Error('管理员权限启动器 powershell.exe 无法运行：' + error.message)))
+    child.once('close', (code) => {
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail || '用户取消了管理员授权，或提权启动失败', code)))
@@ -1249,23 +1114,21 @@ async function launchElevated(options) {
   })
 }
 
-async function launch({ gamePath, relay, room, logicalIp, token, direct = true, mode = 'direct' }) {
+async function launch({ gamePath, relay, room, logicalIp, token, direct = true }) {
   const helper = locate(helperCandidates())
   const hook = locate(hookCandidates())
-  const host = locate(hostCandidates())
   const executable = resolveGamePath(gamePath)
   if (!helper) throw new Error('游戏启动辅助程序 welnptgame.exe 缺失，请重新安装完整客户端')
   if (!hook) throw new Error('游戏网络组件 welnpt.dll 缺失，请重新安装完整客户端')
-  if (!host) throw new Error('游戏网络 Host 组件 welnpthost.exe 缺失，请重新安装完整客户端')
   if (!relay || !room || !logicalIp || !token) throw new Error('房间连接凭据不完整，请退出房间后重新进入')
 
-  if (direct && mode === 'direct') {
+  if (direct) {
     await prepareGameIce()
   }
 
   const logPath = ensureSessionLogPath()
   resetTransportTracking(logPath)
-  if (!direct) setTransportPath('relay')
+  if (!direct) transportPath = 'relay'
   const environment = {
     ...process.env,
     WEL_NOTAP_RELAY: String(relay),
@@ -1275,45 +1138,24 @@ async function launch({ gamePath, relay, room, logicalIp, token, direct = true, 
     WEL_NOTAP_DIAGNOSTIC_LOG: diagnosticLogEnabled ? 'true' : 'false',
   }
   if (diagnosticLogEnabled && logPath) environment.WEL_NOTAP_LOG_PATH = logPath
-  const agentPort = iceAgentPort
-  const hookPort = iceHookPort
-  if (direct && agentPort && hookPort) {
-    environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(agentPort)
-    environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(hookPort)
+  if (direct && iceProcess && iceAgentPort && iceHookPort) {
+    environment.WEL_NOTAP_DIRECT_AGENT_PORT = String(iceAgentPort)
+    environment.WEL_NOTAP_DIRECT_HOOK_PORT = String(iceHookPort)
   }
-  const child = spawn(helper, ['--game', executable, '--hook', hook, '--host', host], {
+  const child = spawn(helper, ['--game', executable, '--hook', hook], {
     cwd: path.dirname(executable),
     env: environment,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   lastProcess = child
-  if (mode === 'direct') void prewarmIce()
+  void prewarmIce()
   const output = []
   child.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')))
   child.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')))
   return new Promise((resolve, reject) => {
-    let settled = false
-    const timeout = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try { child.kill() } catch {}
-      lastProcess = null
-      reject(new Error('游戏启动组件等待超时，请检查 welnptgame.exe、welnpthost.exe 和 welnpt.dll 是否被安全软件拦截'))
-    }, 35000)
-    child.once('error', (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      lastProcess = null
-      reject(new Error('游戏启动辅助程序 welnptgame.exe 无法运行：' + error.message))
-    })
-    // The launcher exits after injection succeeds. Use exit instead of close:
-    // a descendant retaining stdout/stderr must not leave the UI waiting forever.
-    child.once('exit', (code) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
+    child.once('error', (error) => reject(new Error('游戏启动辅助程序 welnptgame.exe 无法运行：' + error.message)))
+    child.once('close', (code) => {
       lastProcess = null
       const detail = output.join('').trim()
       if (code !== 0) reject(new Error(describeLaunchFailure(detail, code)))
@@ -1327,26 +1169,17 @@ async function disconnect() {
     try { lastProcess.kill() } catch {}
   }
   lastProcess = null
-  ++iceLifecycleGeneration
-  const previousIceProcess = iceProcess
-  const pendingStart = iceStartPromise
-  iceProcess = null
-  if (previousIceProcess) {
+  if (iceProcess && !iceProcess.killed) {
     appendAgentEvent('active', 'stopping', { reason: 'disconnect' })
-    await stopIceChild(previousIceProcess)
+    try { iceProcess.stdin.write('EXIT\n') } catch {}
+    try { iceProcess.kill() } catch {}
   }
-  if (pendingStart) {
-    try { await pendingStart } catch {}
-  }
-  const mapping = iceUpnpMapping
+  iceProcess = null
+  releaseUpnpMapping(iceUpnpMapping)
   iceUpnpMapping = null
-  releaseUpnpMapping(mapping)
   await clearStandbyAgent()
   iceState = 'waiting'
   iceLocalDescription = ''
-  iceAgentPort = 0
-  iceHookPort = 0
-  activeIcePort = 0
   if (pendingRelayPing) {
     const pending = pendingRelayPing
     pendingRelayPing = null
@@ -1365,13 +1198,11 @@ async function disconnect() {
   }
   lastRemoteDescription = ''
   activeGamePeerIp = ''
-  activeGamePeerGeneration = 0
-  iceOptions = null
   resetTransportTracking()
   sessionLogPath = ''
   iceExitError = ''
   iceDiagnostics = []
-  await Promise.all([...probeAgents.keys()].map((probeKey) => stopProbeIce(probeKey)))
+  for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)
   return { stopped: true }
 }
 
@@ -1386,7 +1217,6 @@ function pingHost(host) {
 module.exports = {
   configureIce: setRemoteIce,
   onGamePeer,
-  onTransportChange,
   disconnect,
   launch,
   launchElevated,

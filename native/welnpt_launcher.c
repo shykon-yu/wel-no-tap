@@ -9,7 +9,6 @@
 typedef struct {
     const wchar_t *game_path;
     const wchar_t *hook_path;
-    const wchar_t *host_path;
     const wchar_t *relay;
     const wchar_t *room;
     const wchar_t *logical_ip;
@@ -27,7 +26,6 @@ static int parse_options(int argc, wchar_t **argv, launch_options *options) {
     for (index = 1; index < argc; ++index) {
         if (wcscmp(argv[index], L"--game") == 0 && index + 1 < argc) options->game_path = argv[++index];
         else if (wcscmp(argv[index], L"--hook") == 0 && index + 1 < argc) options->hook_path = argv[++index];
-        else if (wcscmp(argv[index], L"--host") == 0 && index + 1 < argc) options->host_path = argv[++index];
         else if (wcscmp(argv[index], L"--relay") == 0 && index + 1 < argc) options->relay = argv[++index];
         else if (wcscmp(argv[index], L"--room") == 0 && index + 1 < argc) options->room = argv[++index];
         else if (wcscmp(argv[index], L"--logical-ip") == 0 && index + 1 < argc) options->logical_ip = argv[++index];
@@ -156,23 +154,17 @@ int wmain(int argc, wchar_t **argv) {
     launch_options options;
     wchar_t game[MAX_PATH];
     wchar_t hook[MAX_PATH];
-    wchar_t host[MAX_PATH];
     wchar_t relay[256];
     wchar_t room[64];
     wchar_t logical_ip[64];
+    wchar_t token[256];
     wchar_t log_path[MAX_PATH];
     wchar_t ready_name[96];
-    wchar_t host_ready_name[96];
-    wchar_t host_port[16];
     wchar_t *command_line;
     wchar_t *working_directory;
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
     HANDLE ready_event;
-    HANDLE host_ready_event = NULL;
-    PROCESS_INFORMATION host_process;
-    int host_started = 0;
-    int host_enabled = 0;
     DWORD injection_error;
     DWORD ready_wait;
     DWORD stability_wait;
@@ -182,7 +174,7 @@ int wmain(int argc, wchar_t **argv) {
     int resumed_for_apc = 0;
 
     if (!parse_options(argc, argv, &options)) {
-        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> [--host <welnpthost.exe>] --relay <host:port> --room <name> --logical-ip <ip> --token <token> [--log <file>]\n", stderr);
+        fputs("Usage: welnptgame --game <WE8.exe> --hook <welnpt.dll> --relay <host:port> --room <name> --logical-ip <ip> --token <token> [--log <file>]\n", stderr);
         return 2;
     }
     if (options.self_test) {
@@ -199,18 +191,14 @@ int wmain(int argc, wchar_t **argv) {
         fwprintf(stderr, L"Hook module not found: %ls\n", options.hook_path);
         return 4;
     }
-    host[0] = L'\0';
-    if (options.host_path != NULL && (GetFullPathNameW(options.host_path, ARRAYSIZE(host), host, NULL) == 0 ||
-        GetFileAttributesW(host) == INVALID_FILE_ATTRIBUTES)) {
-        fwprintf(stderr, L"Host transport not found: %ls\n", options.host_path);
-        return 4;
-    }
     if (options.relay != NULL) wcsncpy_s(relay, ARRAYSIZE(relay), options.relay, _TRUNCATE);
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_RELAY", relay, ARRAYSIZE(relay)) == 0) return 2;
     if (options.room != NULL) wcsncpy_s(room, ARRAYSIZE(room), options.room, _TRUNCATE);
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room, ARRAYSIZE(room)) == 0) return 2;
     if (options.logical_ip != NULL) wcsncpy_s(logical_ip, ARRAYSIZE(logical_ip), options.logical_ip, _TRUNCATE);
     else if (GetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip, ARRAYSIZE(logical_ip)) == 0) return 2;
+    if (options.token != NULL) wcsncpy_s(token, ARRAYSIZE(token), options.token, _TRUNCATE);
+    else if (GetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token, ARRAYSIZE(token)) == 0) return 2;
     log_path[0] = L'\0';
     if (options.log_path != NULL) wcsncpy_s(log_path, ARRAYSIZE(log_path), options.log_path, _TRUNCATE);
     else GetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path, ARRAYSIZE(log_path));
@@ -219,32 +207,10 @@ int wmain(int argc, wchar_t **argv) {
         (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
     ready_event = CreateEventW(NULL, TRUE, FALSE, ready_name);
     if (ready_event == NULL) return 5;
-    ZeroMemory(&host_process, sizeof(host_process));
-    host_enabled = host[0] != L'\0';
-    if (host_enabled) {
-        _snwprintf_s(host_ready_name, ARRAYSIZE(host_ready_name), _TRUNCATE, L"Local\\WELNoTapHostReady-%lu-%lu",
-            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
-        host_ready_event = CreateEventW(NULL, TRUE, FALSE, host_ready_name);
-        if (host_ready_event == NULL) {
-            CloseHandle(ready_event);
-            return 5;
-        }
-        if (options.direct_hook_port != NULL && options.direct_hook_port[0] != L'\0') {
-            wcsncpy_s(host_port, ARRAYSIZE(host_port), options.direct_hook_port, _TRUNCATE);
-        } else {
-            _snwprintf_s(host_port, ARRAYSIZE(host_port), _TRUNCATE, L"%u",
-                (unsigned)(40000u + (GetTickCount() % 20000u)));
-        }
-        SetEnvironmentVariableW(L"WEL_NOTAP_HOST_PORT", host_port);
-        SetEnvironmentVariableW(L"WEL_NOTAP_HOST_READY_EVENT", host_ready_name);
-    } else {
-        SetEnvironmentVariableW(L"WEL_NOTAP_HOST_PORT", NULL);
-        SetEnvironmentVariableW(L"WEL_NOTAP_HOST_READY_EVENT", NULL);
-    }
     SetEnvironmentVariableW(L"WEL_NOTAP_RELAY", relay);
     SetEnvironmentVariableW(L"WEL_NOTAP_ROOM", room);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOGICAL_IP", logical_ip);
-    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", NULL);
+    SetEnvironmentVariableW(L"WEL_NOTAP_TOKEN", token);
     SetEnvironmentVariableW(L"WEL_NOTAP_LOG_PATH", log_path[0] != L'\0' ? log_path : NULL);
     SetEnvironmentVariableW(L"WEL_NOTAP_DIAGNOSTIC_LOG", log_path[0] != L'\0' ? L"true" : L"false");
     SetEnvironmentVariableW(L"WEL_NOTAP_READY_EVENT", ready_name);
@@ -273,48 +239,10 @@ int wmain(int argc, wchar_t **argv) {
         HeapFree(GetProcessHeap(), 0, command_line);
         free(working_directory);
         CloseHandle(ready_event);
-        if (host_ready_event != NULL) CloseHandle(host_ready_event);
         return 6;
     }
     HeapFree(GetProcessHeap(), 0, command_line);
     free(working_directory);
-
-    if (host_enabled) {
-        wchar_t host_command[2 * MAX_PATH + 64];
-        _snwprintf_s(host_command, ARRAYSIZE(host_command), _TRUNCATE, L"\"%ls\" --game-pid %lu",
-            host, (unsigned long)process.dwProcessId);
-        ZeroMemory(&startup, sizeof(startup));
-        startup.cb = sizeof(startup);
-        if (!CreateProcessW(host, host_command, NULL, NULL, FALSE, CREATE_DEFAULT_ERROR_MODE,
-            NULL, NULL, &startup, &host_process)) {
-            fprintf(stderr, "Host transport start failed, falling back to legacy Hook: Windows error %lu\n", (unsigned long)GetLastError());
-            SetEnvironmentVariableW(L"WEL_NOTAP_HOST_PORT", NULL);
-            SetEnvironmentVariableW(L"WEL_NOTAP_HOST_READY_EVENT", NULL);
-            CloseHandle(host_ready_event);
-            host_ready_event = NULL;
-            host_enabled = 0;
-        }
-        if (host_enabled) {
-            host_started = 1;
-            if (WaitForSingleObject(host_ready_event, 10000) != WAIT_OBJECT_0) {
-                fprintf(stderr, "Host transport did not become ready, falling back to legacy Hook\n");
-                TerminateProcess(host_process.hProcess, 7);
-                CloseHandle(host_process.hThread);
-                CloseHandle(host_process.hProcess);
-                SetEnvironmentVariableW(L"WEL_NOTAP_HOST_PORT", NULL);
-                SetEnvironmentVariableW(L"WEL_NOTAP_HOST_READY_EVENT", NULL);
-                CloseHandle(host_ready_event);
-                host_ready_event = NULL;
-                host_enabled = 0;
-            }
-        }
-        if (host_enabled) {
-            CloseHandle(host_process.hThread);
-            CloseHandle(host_process.hProcess);
-            host_process.hThread = NULL;
-            host_process.hProcess = NULL;
-        }
-    }
 
     if (!inject_hook(process.hProcess, process.hThread, hook, &injection_error, &injection_stage, &apc_remote_path)) {
         fprintf(stderr, "Hook module injection failed at %s: Windows error %lu\n",
@@ -323,8 +251,6 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(ready_event);
-        if (host_started && host_process.hProcess != NULL) TerminateProcess(host_process.hProcess, 7);
-        if (host_ready_event != NULL) CloseHandle(host_ready_event);
         return 7;
     }
     if (apc_remote_path != NULL) {
@@ -347,7 +273,6 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(ready_event);
-        if (host_ready_event != NULL) CloseHandle(host_ready_event);
         return 10;
     }
     if (ready_wait != WAIT_OBJECT_0) {
@@ -358,12 +283,10 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(ready_event);
-        if (host_ready_event != NULL) CloseHandle(host_ready_event);
         return 8;
     }
     if (apc_remote_path != NULL) VirtualFreeEx(process.hProcess, apc_remote_path, 0, MEM_RELEASE);
     CloseHandle(ready_event);
-    if (host_ready_event != NULL) CloseHandle(host_ready_event);
     if (!resumed_for_apc && ResumeThread(process.hThread) == (DWORD)-1) {
         fprintf(stderr, "ResumeThread failed: Windows error %lu\n", GetLastError());
         TerminateProcess(process.hProcess, 9);

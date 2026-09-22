@@ -223,10 +223,6 @@ ipcMain.handle('platform-complete-quit', finishQuit)
 notap.onGamePeer((logicalIp) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-game-peer', logicalIp)
 })
-notap.onTransportChange((status) => {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-transport-change', status)
-})
-
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1180, height: 760, minWidth: 900, minHeight: 620,

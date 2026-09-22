@@ -13,6 +13,7 @@
 #include <juice/juice.h>
 
 #include "welnpt_protocol.h"
+#include "welnpt_auth_windows.h"
 
 #define WEL_ICE_BUFFER_SIZE 8192
 #define WEL_ICE_CONTROL_PREFIX "WELICESTATE:"
@@ -28,8 +29,8 @@ static SOCKET g_local_socket = INVALID_SOCKET;
 static SOCKET g_relay_socket = INVALID_SOCKET;
 static struct sockaddr_in g_relay_address;
 static uint32_t g_logical_ip;
-static volatile LONG g_generation;
 static char g_room[WELNPT_ROOM_LENGTH];
+static welnpt_auth_context g_auth;
 static struct sockaddr_in g_hook_address;
 static volatile LONG g_stopping;
 static volatile LONG g_connected;
@@ -65,38 +66,32 @@ static void output_line(const char *format, ...) {
 }
 
 static void notify_hook(const char *state) {
- char message[128];
- int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu|%s", WEL_ICE_CONTROL_PREFIX,
-  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), state);
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_CONTROL_PREFIX, state);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_peer(const char *logical_ip) {
- char message[128];
- int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu|%s", WEL_ICE_PEER_PREFIX,
-  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), logical_ip);
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%s", WEL_ICE_PEER_PREFIX, logical_ip);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_agent(unsigned short port) {
- char message[128];
- int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%lu|%u",
-  (unsigned long)InterlockedCompareExchange(&g_generation, 0, 0), (unsigned)port);
+	char message[96];
+	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "WELICEAGENT:%u", (unsigned)port);
 	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
 		sendto(g_local_socket, message, length, 0, (const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
 
 static void notify_hook_remote_set(void) {
-	char message[96];
-	int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%lu", WEL_ICE_REMOTE_SET_PREFIX,
-		(unsigned long)InterlockedCompareExchange(&g_generation, 0, 0));
-	if (length > 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
-		sendto(g_local_socket, message, length, 0,
+	if (g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+		sendto(g_local_socket, WEL_ICE_REMOTE_SET_PREFIX, (int)strlen(WEL_ICE_REMOTE_SET_PREFIX), 0,
 			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
 	}
 }
@@ -155,14 +150,6 @@ static void on_gathering_done(juice_agent_t *agent, void *user_ptr) {
 
 static void on_receive(juice_agent_t *agent, const char *data, size_t size, void *user_ptr) {
 	(void)user_ptr;
-	/* Preserve the WNP3 envelope across ICE so the Host can apply the locked
-	 * direct/relay path and restore the original datagram. */
-	if (size >= sizeof(welnpt_packet_header) &&
-		memcmp(data, "WNP3", 4) == 0 && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
-		sendto(g_local_socket, data, (int)size, 0,
-			(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
-		return;
-	}
 	if (size > strlen(WEL_ICE_PING_PREFIX) && memcmp(data, WEL_ICE_PING_PREFIX, strlen(WEL_ICE_PING_PREFIX)) == 0) {
 		char response[128];
 		int length = _snprintf_s(response, sizeof(response), _TRUNCATE, "%s%.*s", WEL_ICE_PONG_PREFIX,
@@ -208,19 +195,7 @@ static DWORD WINAPI local_transport_thread(LPVOID unused) {
 			if (ip_length > 0 && ip_length < (int)sizeof(peer)) {
 				memcpy(peer, payload, (size_t)ip_length);
 				peer[ip_length] = '\0';
-				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) {
-					const char *generation_separator = separator == NULL ? NULL : strrchr(payload, '|');
-					if (generation_separator != NULL) {
-						char generation_text[24];
-						size_t generation_length = (size_t)((payload + peer_length) - (generation_separator + 1));
-						if (generation_length > 0 && generation_length < sizeof(generation_text)) {
-							memcpy(generation_text, generation_separator + 1, generation_length);
-							generation_text[generation_length] = '\0';
-							InterlockedExchange(&g_generation, (LONG)strtoul(generation_text, NULL, 10));
-						}
-					}
-					output_line("GAME_PEER %.*s", peer_length, payload);
-				}
+				if (InetPtonA(AF_INET, peer, &peer_ip) == 1) output_line("GAME_PEER %.*s", peer_length, payload);
 			}
 		} else if (received > (int)strlen(WEL_TRANSPORT_STATE_PREFIX) &&
 			memcmp(buffer, WEL_TRANSPORT_STATE_PREFIX, strlen(WEL_TRANSPORT_STATE_PREFIX)) == 0) {
@@ -248,7 +223,8 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 		}
 		if (received < (int)sizeof(welnpt_packet_header)) continue;
 		header = (welnpt_packet_header *)packet;
-		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0) continue;
+		if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
+			!welnpt_auth_verify(&g_auth, packet, received)) continue;
 		if (header->type == WELNPT_PACKET_PING) {
 			/* 中继转发的 PING：目标是自己则回 PONG，发回中继由其转发给发起方 */
 			if (header->target_ip == g_logical_ip && g_relay_socket != INVALID_SOCKET) {
@@ -258,7 +234,8 @@ static DWORD WINAPI relay_receive_thread(LPVOID unused) {
 				pong_header->type = WELNPT_PACKET_PONG;
 				pong_header->source_ip = g_logical_ip;
 				pong_header->target_ip = header->source_ip;
-				if (sendto(g_relay_socket, pong, (size_t)received, 0,
+				if (welnpt_auth_sign(&g_auth, pong, (size_t)received) &&
+					sendto(g_relay_socket, pong, (size_t)received, 0,
 						(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == received) {
 					/* 转发式 PING 已应答 */
 				}
@@ -328,7 +305,7 @@ static void send_relay_ping(const char *nonce) {
 	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
 	header->source_ip = g_logical_ip;
 	header->sequence = htonl((u_long)strtoul(nonce, NULL, 10));
-	if (sendto(g_relay_socket, packet, sizeof(packet), 0,
+	if (!welnpt_auth_sign(&g_auth, packet, sizeof(packet)) || sendto(g_relay_socket, packet, sizeof(packet), 0,
 		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
 		g_relay_ping_nonce[0] = '\0';
 		output_line("RELAY_PING_UNAVAILABLE %s", nonce);
@@ -351,7 +328,7 @@ static void send_relay_peer_ping(const char *nonce, uint32_t target_ip) {
 	header->source_ip = g_logical_ip;
 	header->target_ip = target_ip;
 	header->sequence = htonl((u_long)strtoul(nonce, NULL, 10));
-	if (sendto(g_relay_socket, packet, sizeof(packet), 0,
+	if (!welnpt_auth_sign(&g_auth, packet, sizeof(packet)) || sendto(g_relay_socket, packet, sizeof(packet), 0,
 		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
 		g_relay_peer_ping_nonce[0] = '\0';
 		output_line("RELAY_PEER_PING_UNAVAILABLE %s", nonce);
@@ -367,8 +344,10 @@ static void send_relay_presence(void) {
 	CopyMemory(header->room, g_room, WELNPT_ROOM_LENGTH);
 	header->source_ip = g_logical_ip;
 	header->sequence = 0;
-	sendto(g_relay_socket, packet, sizeof(packet), 0,
-		(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+	if (welnpt_auth_sign(&g_auth, packet, sizeof(packet))) {
+		sendto(g_relay_socket, packet, sizeof(packet), 0,
+			(const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+	}
 }
 
 static int parse_port(const char *value, unsigned short *port) {
@@ -382,6 +361,7 @@ static int parse_port(const char *value, unsigned short *port) {
 static int initialize_relay(void) {
 	char relay[256];
 	char logical_ip[64];
+	char token[WELNPT_AUTH_SECRET_MAX];
 	char service[16];
 	char *separator;
 	struct addrinfo hints;
@@ -389,12 +369,14 @@ static int initialize_relay(void) {
 	DWORD timeout = 250;
 	if (GetEnvironmentVariableA("WEL_NOTAP_RELAY", relay, sizeof(relay)) == 0 ||
 		GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0 ||
-		GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room)) == 0) return 0;
+		GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room)) == 0 ||
+		GetEnvironmentVariableA("WEL_NOTAP_TOKEN", token, sizeof(token)) == 0) return 0;
 	separator = strrchr(relay, ':');
 	if (separator == NULL || separator == relay || separator[1] == '\0') return 0;
 	strcpy_s(service, sizeof(service), separator + 1);
 	*separator = '\0';
-	if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
+	if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1 || !welnpt_auth_initialize(&g_auth, token)) return 0;
+	SecureZeroMemory(token, sizeof(token));
 	ZeroMemory(&hints, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_DGRAM;
@@ -540,10 +522,7 @@ int main(int argc, char **argv) {
 			send_relay_ping(command + 11);
 		} else if (strcmp(command, "EXIT") == 0) {
 			break;
-		} else if (strncmp(command, "ACTIVATE", 8) == 0 && !no_hook) {
-			const char *generation_text = command + 8;
-			while (*generation_text == ' ') generation_text++;
-			if (*generation_text != '\0') InterlockedExchange(&g_generation, (LONG)strtoul(generation_text, NULL, 10));
+		} else if (strcmp(command, "ACTIVATE") == 0 && !no_hook) {
 			InterlockedExchange(&g_hook_active, 1);
 			notify_hook_agent(ntohs(local_address.sin_port));
 			notify_hook("connecting");
