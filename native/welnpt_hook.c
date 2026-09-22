@@ -11,7 +11,6 @@
 #include <string.h>
 
 #include "welnpt_protocol.h"
-#include "welnpt_auth_windows.h"
 
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
@@ -84,7 +83,6 @@ static ULONGLONG g_ice_decision_started;
 static ULONGLONG g_ice_session_deadline;
 static uint32_t g_logical_ip;
 static char g_room[WELNPT_ROOM_LENGTH];
-static welnpt_auth_context g_auth;
 static wchar_t g_log_path[MAX_PATH];
 static wel_socket_fn g_real_socket;
 static wel_wsasocketa_fn g_real_wsa_socket_a;
@@ -173,49 +171,6 @@ static int is_game_join_payload(const char *payload, int length) {
 static int is_game_accept_payload(const char *payload, int length) {
     static const unsigned char prefix[] = { 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00 };
     return length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH && payload_has_prefix(payload, length, prefix, sizeof(prefix));
-}
-
-static int is_search_payload(const char *payload, int length) {
-    static const unsigned char prefix[] = { 0xe7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    return length == 24 && payload_has_prefix(payload, length, prefix, sizeof(prefix));
-}
-
-static int is_game_payload(const char *payload, int length) {
-    static const unsigned char prefix[] = { 0xe7, 0x03, 0x02, 0x00 };
-    return payload_has_prefix(payload, length, prefix, sizeof(prefix));
-}
-
-static const char *packet_kind(const char *payload, int length) {
-    if (is_game_join_payload(payload, length)) return "join";
-    if (is_game_accept_payload(payload, length)) return "accept";
-    if (is_game_payload(payload, length)) return "game-data";
-    if (length == WELNPT_GAME_JOIN_PAYLOAD_LENGTH) return "data-64";
-    if (length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH) return "data-84";
-    if (is_search_payload(payload, length)) return "search";
-    return "data";
-}
-
-static void payload_fingerprint(const char *payload, int length, char *head, size_t head_size,
-    unsigned long *hash) {
-    static const char hex[] = "0123456789abcdef";
-    unsigned long value = 2166136261UL;
-    size_t count = 0;
-    int index;
-    if (head_size > 0) head[0] = '\0';
-    if (payload == NULL || length <= 0 || head_size < 3) {
-        if (hash != NULL) *hash = value;
-        return;
-    }
-    count = (size_t)length;
-    if (count > 24) count = 24;
-    if (count > (head_size - 1) / 2) count = (head_size - 1) / 2;
-    for (index = 0; index < length; ++index) value = (value ^ (unsigned char)payload[index]) * 16777619UL;
-    for (index = 0; index < (int)count; ++index) {
-        head[index * 2] = hex[((unsigned char)payload[index] >> 4) & 0x0f];
-        head[index * 2 + 1] = hex[(unsigned char)payload[index] & 0x0f];
-    }
-    head[count * 2] = '\0';
-    if (hash != NULL) *hash = value;
 }
 
 static void log_line(const char *format, ...) {
@@ -377,23 +332,17 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 	int is_join;
 	int is_accept;
 	int new_session = 0;
-	char payload_head[49];
-	char peer_ip[INET_ADDRSTRLEN];
-	unsigned long payload_hash;
 	if (received < (int)sizeof(welnpt_packet_header)) return 0;
 	header = (welnpt_packet_header *)packet;
 	payload_length = (int)ntohs(header->payload_length);
 	if (!welnpt_valid_header(header) || header->type != WELNPT_PACKET_DATA ||
 		memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0 ||
 		(((header->flags & WELNPT_FLAG_BROADCAST) == 0) && header->target_ip != g_logical_ip) ||
-		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length ||
-		!welnpt_auth_verify(&g_auth, packet, received)) return 0;
+		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length) return 0;
 	is_join = is_game_join_payload(packet + sizeof(*header), payload_length);
 	is_accept = is_game_accept_payload(packet + sizeof(*header), payload_length);
-	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_search_payload(packet + sizeof(*header), payload_length) &&
-		header->source_ip == g_direct_transaction_peer_ip) {
-		reset_game_session("peer-search-broadcast");
-	}
+	/* Search broadcasts can continue while WE8 is on the menu. They do not
+	   invalidate an already established peer session. */
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		(is_join || is_accept);
 	if (session_signal) {
@@ -401,11 +350,7 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		unsigned short target_port = ntohs(header->target_port);
 		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->source_ip, join_port, source_port, target_port);
-		payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
-		if (InetNtopA(AF_INET, &header->source_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
-		log_line("\"api\":\"session-signal\",\"direction\":\"receive\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(packet + sizeof(*header), payload_length), (unsigned long)ntohl(header->sequence), payload_length, new_session ? "true" : "false",
-			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		(void)new_session;
 	}
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip) {
 		LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
@@ -420,11 +365,7 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 			path, (unsigned)ntohs(header->target_port), payload_length);
 		return 0;
 	}
-	payload_fingerprint(packet + sizeof(*header), payload_length, payload_head, sizeof(payload_head), &payload_hash);
-	log_line("\"api\":\"transport-recv\",\"path\":\"%s\",\"broadcast\":%s,\"sequence\":%lu,\"sourcePort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-		path, (header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
-		(unsigned long)ntohl(header->sequence), (unsigned)ntohs(header->source_port), payload_length,
-		packet_kind(packet + sizeof(*header), payload_length), payload_head, payload_hash);
+	(void)path;
 	return 1;
 }
 
@@ -433,7 +374,6 @@ static int send_register_packet(void) {
     welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
     CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
     header.source_ip = g_logical_ip;
-    if (!welnpt_auth_sign(&g_auth, (char *)&header, sizeof(header))) return SOCKET_ERROR;
     return g_real_sendto(g_transport, (const char *)&header, sizeof(header), 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
 }
@@ -493,9 +433,6 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
 	int is_join;
 	int is_accept;
 	int new_session = 0;
-	char payload_head[49];
-	char peer_ip[INET_ADDRSTRLEN];
-	unsigned long payload_hash;
 
     if (destination == NULL || destination_length < (int)sizeof(struct sockaddr_in) ||
         destination->sa_family != AF_INET || length < 0 || length > WELNPT_MAX_PAYLOAD) {
@@ -517,26 +454,15 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     header->sequence = htonl((u_long)InterlockedIncrement(&g_sequence));
     if (target->sin_addr.S_un.S_addr == INADDR_BROADCAST) header->flags |= WELNPT_FLAG_BROADCAST;
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
-	if (!welnpt_auth_sign(&g_auth, packet, (int)sizeof(*header) + length)) {
-		WSASetLastError(WSAEACCES);
-		return SOCKET_ERROR;
-	}
 	is_join = is_game_join_payload(payload, length);
 	is_accept = is_game_accept_payload(payload, length);
-	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_search_payload(payload, length)) {
-		reset_game_session("search-broadcast");
-	}
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		(is_join || is_accept);
 	if (session_signal) {
 		unsigned short target_port = ntohs(target->sin_port);
 		unsigned short join_port = is_join ? source_port : target_port;
 		new_session = report_game_peer(header->target_ip, join_port, source_port, target_port);
-		payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-		if (InetNtopA(AF_INET, &header->target_ip, peer_ip, sizeof(peer_ip)) == NULL) strcpy_s(peer_ip, sizeof(peer_ip), "unknown");
-		log_line("\"api\":\"session-signal\",\"direction\":\"send\",\"kind\":\"%s\",\"sequence\":%lu,\"length\":%d,\"newSession\":%s,\"peerIp\":\"%s\",\"sourcePort\":%u,\"targetPort\":%u,\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-			packet_kind(payload, length), (unsigned long)ntohl(header->sequence), length, new_session ? "true" : "false",
-			peer_ip, (unsigned)source_port, (unsigned)target_port, payload_head, payload_hash);
+		(void)new_session;
 	}
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
         g_direct_transport != INVALID_SOCKET && header->target_ip == g_direct_peer_ip &&
@@ -545,28 +471,15 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
         sent = g_real_sendto(g_direct_transport, packet, (int)sizeof(*header) + length, 0,
             (const struct sockaddr *)&g_direct_agent_address, sizeof(g_direct_agent_address));
         if (sent != SOCKET_ERROR) {
-            payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-			log_line("\"api\":\"sendto\",\"path\":\"direct\",\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-				(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port, (unsigned)ntohs(target->sin_port), length,
-				packet_kind(payload, length), payload_head, payload_hash);
             WSASetLastError(0);
             return length;
         }
-        InterlockedExchange(&g_direct_connected, 0);
-        InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
-        notify_agent_transport_state("relay");
-        log_line("\"api\":\"direct-fallback\",\"reason\":\"local-send-failed\"");
-        log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"direct-send-failed\"");
+        /* A transient local send error must not rewrite the session path. ICE
+           owns path failure and will report a new session decision explicitly. */
     }
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
     if (sent == SOCKET_ERROR) return SOCKET_ERROR;
-    payload_fingerprint(payload, length, payload_head, sizeof(payload_head), &payload_hash);
-	log_line("\"api\":\"sendto\",\"path\":\"relay\",\"broadcast\":%s,\"socket\":%llu,\"sequence\":%lu,\"sourcePort\":%u,\"targetPort\":%u,\"length\":%d,\"packetKind\":\"%s\",\"payloadHead\":\"%s\",\"payloadHash\":\"%08lx\"",
-		(header->flags & WELNPT_FLAG_BROADCAST) != 0 ? "true" : "false",
-		(unsigned __int64)handle, (unsigned long)ntohl(header->sequence), (unsigned)source_port,
-		(unsigned)ntohs(target->sin_port), length,
-		packet_kind(payload, length), payload_head, payload_hash);
     WSASetLastError(0);
     return length;
 }
@@ -960,21 +873,10 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             } else if (failed && selected == WELNPT_GAME_PATH_PENDING) {
                 lock_relay_for_decision("ice-failed");
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
-            } else if (failed && selected == WELNPT_GAME_PATH_DIRECT) {
-                log_line("\"api\":\"direct-fallback\",\"reason\":\"peer-ice-failed\"");
-                InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
-                selected = WELNPT_GAME_PATH_RELAY;
-                notify_agent_transport_state("relay");
-                log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"peer-ice-failed\"");
-                log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"peer-ice-failed\"",
-                    (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
-            } else if (disconnected && selected == WELNPT_GAME_PATH_DIRECT) {
-                InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
-                selected = WELNPT_GAME_PATH_RELAY;
-                notify_agent_transport_state("relay");
-                log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"direct-disconnected\"");
-                log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"direct-disconnected\"",
-                    (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
+            } else if ((failed || disconnected) && selected == WELNPT_GAME_PATH_DIRECT) {
+                /* Once this match has reached direct, ICE status changes during
+                   menu/halftime must not demote the game's established path. */
+                selected = WELNPT_GAME_PATH_DIRECT;
             }
             InterlockedExchange(&g_direct_connected, connected && selected == WELNPT_GAME_PATH_DIRECT);
             log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"", received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
@@ -1015,7 +917,6 @@ static void signal_ready(void) {
 static int load_configuration(void) {
     char relay[256];
     char logical_ip[64];
-    char token[WELNPT_AUTH_SECRET_MAX];
     char direct_peer_ip[64];
     char direct_agent_port[16];
     char direct_hook_port[16];
@@ -1026,8 +927,7 @@ static int load_configuration(void) {
     DWORD room_length;
 
     if (GetEnvironmentVariableA("WEL_NOTAP_RELAY", relay, sizeof(relay)) == 0 ||
-        GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0 ||
-        GetEnvironmentVariableA("WEL_NOTAP_TOKEN", token, sizeof(token)) == 0) return 0;
+        GetEnvironmentVariableA("WEL_NOTAP_LOGICAL_IP", logical_ip, sizeof(logical_ip)) == 0) return 0;
     room_length = GetEnvironmentVariableA("WEL_NOTAP_ROOM", g_room, sizeof(g_room));
     if (room_length == 0 || room_length >= sizeof(g_room)) return 0;
     separator = strrchr(relay, ':');
@@ -1035,8 +935,6 @@ static int load_configuration(void) {
     strcpy_s(port, sizeof(port), separator + 1);
     *separator = '\0';
     if (InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) return 0;
-    if (!welnpt_auth_initialize(&g_auth, token)) return 0;
-    SecureZeroMemory(token, sizeof(token));
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;

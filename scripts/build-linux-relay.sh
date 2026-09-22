@@ -8,6 +8,6 @@ mkdir -p "${output}"
 gcc -std=c11 -O2 -Wall -Wextra -Werror \
   "${root}/server/welnpt_relay_linux.c" \
   -o "${output}/welnpt-relay" \
-  -lcrypto -lrt
+  -lrt
 "${output}/welnpt-relay" --self-test
 echo "Built ${output}/welnpt-relay"

@@ -27,12 +27,12 @@ if ($LASTEXITCODE -ne 0) { throw 'welnpttrace.dll 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
   /LD (Join-Path $source 'welnpt_hook.c') /Fe:(Join-Path $output 'welnpt.dll') `
-  /link Ws2_32.lib Psapi.lib Bcrypt.lib
+  /link Ws2_32.lib Psapi.lib
 if ($LASTEXITCODE -ne 0) { throw 'welnpt.dll 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
   (Join-Path $source 'welnpt_relay.c') /Fe:(Join-Path $output 'welnptrelay.exe') `
-  /link Ws2_32.lib Bcrypt.lib
+  /link Ws2_32.lib
 if ($LASTEXITCODE -ne 0) { throw 'welnptrelay.exe 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 `
@@ -41,7 +41,7 @@ if ($LASTEXITCODE -ne 0) { throw 'welnptgame.exe 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 /I (Join-Path $root 'third_party\libjuice\include') `
   (Join-Path $source 'welnpt_ice.c') /Fe:(Join-Path $output 'welnptice.exe') `
-  /link Ws2_32.lib Iphlpapi.lib Bcrypt.lib (Join-Path $output 'juice-static.lib')
+  /link Ws2_32.lib Iphlpapi.lib (Join-Path $output 'juice-static.lib')
 if ($LASTEXITCODE -ne 0) { throw 'welnptice.exe 编译失败。' }
 
 & cl.exe /nologo /W4 /O2 /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0601 `

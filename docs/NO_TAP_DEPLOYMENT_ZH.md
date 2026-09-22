@@ -95,7 +95,7 @@ SOCCER_AUTH_URL=https://api.example.com/api/v1/auth/platform-login
 
 WEL_NOTAP_RELAY_HOST=relay.example.com
 WEL_NOTAP_RELAY_PORT=22333
-WEL_NOTAP_RELAY_TOKEN=Go 控制面租约使用的随机值（由客户端用于 WNP2 数据包认证）
+WEL_NOTAP_RELAY_TOKEN=Go 控制面租约值（数据面不做逐包 HMAC）
 
 WEL_NOTAP_ICE_STUN_HOST=stun.example.com
 WEL_NOTAP_ICE_STUN_PORT=3478

@@ -40,9 +40,10 @@ The Hook virtualizes `socket`, `bind`, `getsockname`, `sendto`, `recvfrom`,
 socket queue and performs the lightweight WNP2 framing itself. Empty
 nonblocking reads return `WSAEWOULDBLOCK (10035)`.
 
-Protocol v2 uses the compact WNP2 header and the existing truncated HMAC-SHA256
-check. Search broadcast fan-out, ICE path selection, session reset, and relay
-fallback stay in the single Hook data path.
+Protocol v2 uses the compact WNP2 header. Search broadcast fan-out, ICE path
+selection, session reset, and relay fallback stay in the single Hook data path;
+the game packet path performs structural and room routing checks without a
+per-packet HMAC.
 
 ## Build on Windows
 
