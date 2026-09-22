@@ -42,6 +42,13 @@ static char g_relay_ping_nonce[64];
 static LARGE_INTEGER g_relay_ping_started;
 static char g_relay_peer_ping_nonce[64];
 static LARGE_INTEGER g_relay_peer_ping_started;
+static unsigned long g_candidate_total;
+static unsigned long g_candidate_host;
+static unsigned long g_candidate_srflx;
+static unsigned long g_candidate_relay;
+static unsigned long g_candidate_prflx;
+static unsigned long g_candidate_v4;
+static unsigned long g_candidate_v6;
 
 static void send_relay_presence(void);
 
@@ -106,6 +113,31 @@ static void log_selected_candidates(juice_agent_t *agent) {
 	}
 }
 
+static void reset_candidate_stats(void) {
+	g_candidate_total = 0;
+	g_candidate_host = 0;
+	g_candidate_srflx = 0;
+	g_candidate_relay = 0;
+	g_candidate_prflx = 0;
+	g_candidate_v4 = 0;
+	g_candidate_v6 = 0;
+}
+
+static void count_candidate_line(const char *sdp) {
+	char address[128];
+	if (sdp == NULL) return;
+	++g_candidate_total;
+	if (strstr(sdp, " typ host") != NULL) ++g_candidate_host;
+	else if (strstr(sdp, " typ srflx") != NULL) ++g_candidate_srflx;
+	else if (strstr(sdp, " typ relay") != NULL) ++g_candidate_relay;
+	else if (strstr(sdp, " typ prflx") != NULL) ++g_candidate_prflx;
+	address[0] = '\0';
+	if (sscanf_s(sdp, "a=candidate:%*s %*u %*s %*u %127s", address, (unsigned)sizeof(address)) == 1) {
+		if (strchr(address, ':') != NULL) ++g_candidate_v6;
+		else ++g_candidate_v4;
+	}
+}
+
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
 	const char *name = juice_state_to_string(state);
 	(void)agent;
@@ -123,6 +155,7 @@ static void on_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr) 
 	(void)agent;
 	(void)user_ptr;
 	if (sdp != NULL) {
+		count_candidate_line(sdp);
 		if (strstr(sdp, " typ host") != NULL) type = "host";
 		else if (strstr(sdp, " typ srflx") != NULL) type = "srflx";
 		else if (strstr(sdp, " typ relay") != NULL) type = "relay";
@@ -132,11 +165,17 @@ static void on_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr) 
 
 static void on_gathering_done(juice_agent_t *agent, void *user_ptr) {
 	char description[JUICE_MAX_SDP_STRING_LEN];
+	size_t description_size;
 	(void)user_ptr;
 	if (juice_get_local_description(agent, description, sizeof(description)) != JUICE_ERR_SUCCESS) {
 		output_line("ERROR local-description");
 		return;
 	}
+	description_size = strlen(description);
+	output_line("CANDIDATE_STATS total=%lu host=%lu srflx=%lu relay=%lu prflx=%lu ipv4=%lu ipv6=%lu sdpBytes=%lu capacityRisk=%d",
+		g_candidate_total, g_candidate_host, g_candidate_srflx, g_candidate_relay,
+		g_candidate_prflx, g_candidate_v4, g_candidate_v6, (unsigned long)description_size,
+		g_candidate_total >= 63 || description_size >= (JUICE_MAX_SDP_STRING_LEN - 256));
 	EnterCriticalSection(&g_output_lock);
 	fputs("LOCAL_SDP_BEGIN\n", stdout);
 	fputs(description, stdout);
@@ -461,6 +500,7 @@ int main(int argc, char **argv) {
 	config.cb_recv = on_receive;
 	g_agent = juice_create(&config);
 	if (g_agent == NULL) return 7;
+	reset_candidate_stats();
 	output_line("LOCAL_PORT %u", (unsigned)ntohs(local_address.sin_port));
 	output_line("GATHERING_STARTED %s %u", stun_host, (unsigned)stun_port);
 	transport_thread = CreateThread(NULL, 0, local_transport_thread, NULL, 0, NULL);

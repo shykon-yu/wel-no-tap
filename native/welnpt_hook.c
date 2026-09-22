@@ -15,8 +15,9 @@
 #define WELNPT_MAX_SOCKETS 64
 #define WELNPT_MAX_QUEUED_DATAGRAMS 4096
 #define WELNPT_HEARTBEAT_MS 2000
-#define WELNPT_ICE_DECISION_WINDOW_MS 5000
-#define WELNPT_ICE_SESSION_TIMEOUT_MS 12000
+/* Do not lock relay merely because a short decision window elapsed. ICE may
+   still complete while WE8 is in the team/kit menus. */
+#define WELNPT_ICE_SESSION_TIMEOUT_MS 15000
 #define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
 #define WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH 84
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
@@ -63,6 +64,7 @@ static volatile LONG g_stopping;
 static volatile LONG g_next_port;
 static volatile LONG g_sequence;
 static CRITICAL_SECTION g_state_lock;
+static CRITICAL_SECTION g_queue_lock;
 static CRITICAL_SECTION g_log_lock;
 static int g_locks_initialized;
 static int g_diagnostic_log_enabled;
@@ -137,8 +139,8 @@ static void lock_relay_for_decision(const char *reason) {
         WELNPT_GAME_PATH_PENDING) == WELNPT_GAME_PATH_PENDING) {
         g_ice_decision_deadline = 0;
         g_ice_session_deadline = 0;
-        log_line("\"api\":\"ice-decision\",\"result\":\"relay\",\"reason\":\"%s\",\"elapsedMs\":%llu,\"windowMs\":%d,\"generation\":%lu",
-            reason, (unsigned __int64)elapsed, WELNPT_ICE_DECISION_WINDOW_MS,
+        log_line("\"api\":\"ice-decision\",\"result\":\"relay\",\"reason\":\"%s\",\"elapsedMs\":%llu,\"windowMs\":0,\"generation\":%lu",
+            reason, (unsigned __int64)elapsed,
             (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
         log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"%s\"", reason);
         notify_agent_transport_state("relay");
@@ -150,10 +152,7 @@ static void lock_relay_for_decision(const char *reason) {
 static void check_ice_decision_deadline(void) {
     ULONGLONG now = GetTickCount64();
     if (InterlockedCompareExchange(&g_game_path, 0, 0) != WELNPT_GAME_PATH_PENDING) return;
-    if (g_ice_decision_deadline != 0 && now >= g_ice_decision_deadline) {
-        lock_relay_for_decision("decision-timeout");
-        g_ice_decision_deadline = 0;
-    } else if (g_ice_session_deadline != 0 && now >= g_ice_session_deadline) {
+    if (g_ice_session_deadline != 0 && now >= g_ice_session_deadline) {
         lock_relay_for_decision("remote-sdp-timeout");
         g_ice_session_deadline = 0;
     }
@@ -276,6 +275,7 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
     virtual_socket *state;
     int found = 0;
     if (logical_port != NULL) *logical_port = 0;
+    EnterCriticalSection(&g_queue_lock);
     EnterCriticalSection(&g_state_lock);
     state = find_socket_locked(handle);
     if (state != NULL) {
@@ -285,6 +285,7 @@ static int remove_socket(SOCKET handle, unsigned short *logical_port) {
         found = 1;
     }
     LeaveCriticalSection(&g_state_lock);
+    LeaveCriticalSection(&g_queue_lock);
     return found;
 }
 
@@ -305,6 +306,7 @@ static int enqueue_datagram(const welnpt_packet_header *header, const char *payl
     item->length = length;
     if (length > 0) CopyMemory(item->payload, payload, (size_t)length);
 
+    EnterCriticalSection(&g_queue_lock);
     EnterCriticalSection(&g_state_lock);
     for (index = 0; index < ARRAYSIZE(g_sockets); ++index) {
         if (g_sockets[index].active && g_sockets[index].logical_port == target_port) {
@@ -314,6 +316,7 @@ static int enqueue_datagram(const welnpt_packet_header *header, const char *payl
     }
     if (state == NULL || state->queued >= WELNPT_MAX_QUEUED_DATAGRAMS) {
         LeaveCriticalSection(&g_state_lock);
+        LeaveCriticalSection(&g_queue_lock);
         HeapFree(GetProcessHeap(), 0, item);
         return 0;
     }
@@ -322,6 +325,7 @@ static int enqueue_datagram(const welnpt_packet_header *header, const char *payl
     state->tail = item;
     ++state->queued;
     LeaveCriticalSection(&g_state_lock);
+    LeaveCriticalSection(&g_queue_lock);
     return 1;
 }
 
@@ -417,8 +421,8 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 		(unsigned)observed_source_port, (unsigned)observed_target_port);
 	log_line("\"api\":\"session-state\",\"state\":\"SESSION_NEGOTIATING\",\"generation\":%lu,\"reason\":\"peer-or-join-port-changed\"",
 		(unsigned long)generation);
-	log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"session-start\",\"windowMs\":%d,\"sessionTimeoutMs\":%d,\"generation\":%lu",
-		WELNPT_ICE_DECISION_WINDOW_MS, WELNPT_ICE_SESSION_TIMEOUT_MS, (unsigned long)generation);
+    log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"session-start\",\"windowMs\":0,\"sessionTimeoutMs\":%d,\"generation\":%lu",
+        WELNPT_ICE_SESSION_TIMEOUT_MS, (unsigned long)generation);
     return 1;
 }
 
@@ -490,17 +494,21 @@ static int receive_virtual_datagram(SOCKET handle, char *buffer, int length, int
     virtual_datagram *item;
     int result;
     int item_length;
+    unsigned short source_port = 0;
     int peek = (flags & MSG_PEEK) != 0;
 
+    EnterCriticalSection(&g_queue_lock);
     EnterCriticalSection(&g_state_lock);
     state = find_socket_locked(handle);
     if (state == NULL) {
         LeaveCriticalSection(&g_state_lock);
+        LeaveCriticalSection(&g_queue_lock);
         return -2;
     }
     item = state->head;
     if (item == NULL) {
         LeaveCriticalSection(&g_state_lock);
+        LeaveCriticalSection(&g_queue_lock);
         WSASetLastError(WSAEWOULDBLOCK);
         return SOCKET_ERROR;
     }
@@ -508,25 +516,46 @@ static int receive_virtual_datagram(SOCKET handle, char *buffer, int length, int
         state->head = item->next;
         if (state->head == NULL) state->tail = NULL;
         --state->queued;
+        /* The queue owns the item until this point. After detaching it,
+           no other thread can observe or free it. */
     }
     item_length = item->length;
+    source_port = ntohs(item->source.sin_port);
     result = item_length;
-    if (length < result) result = length;
-    if (result > 0 && buffer != NULL) CopyMemory(buffer, item->payload, (size_t)result);
     if (source != NULL && source_length != NULL) {
         if (*source_length < (int)sizeof(struct sockaddr_in)) {
-            if (!peek) HeapFree(GetProcessHeap(), 0, item);
             LeaveCriticalSection(&g_state_lock);
+            LeaveCriticalSection(&g_queue_lock);
+            if (!peek) HeapFree(GetProcessHeap(), 0, item);
             WSASetLastError(WSAEFAULT);
             return SOCKET_ERROR;
         }
-        CopyMemory(source, &item->source, sizeof(item->source));
-        *source_length = sizeof(item->source);
+    }
+    if (length < result) result = length;
+    if (peek) {
+        /* Keep the queue lock while copying a peeked item: it remains linked
+           in the queue and remove_socket() may free it concurrently. */
+        if (source != NULL && source_length != NULL) {
+            CopyMemory(source, &item->source, sizeof(item->source));
+            *source_length = sizeof(item->source);
+        }
+        if (result > 0 && buffer != NULL) CopyMemory(buffer, item->payload, (size_t)result);
+        LeaveCriticalSection(&g_state_lock);
+        LeaveCriticalSection(&g_queue_lock);
+    } else {
+        /* Detached items are owned by this call, so the hot-path copies and
+           logging no longer hold either queue or socket state lock. */
+        LeaveCriticalSection(&g_state_lock);
+        LeaveCriticalSection(&g_queue_lock);
+        if (source != NULL && source_length != NULL) {
+            CopyMemory(source, &item->source, sizeof(item->source));
+            *source_length = sizeof(item->source);
+        }
+        if (result > 0 && buffer != NULL) CopyMemory(buffer, item->payload, (size_t)result);
     }
     log_line("\"api\":\"recvfrom\",\"socket\":%llu,\"sourcePort\":%u,\"length\":%d",
-        (unsigned __int64)handle, (unsigned)ntohs(item->source.sin_port), item_length);
+        (unsigned __int64)handle, (unsigned)source_port, item_length);
     if (!peek) HeapFree(GetProcessHeap(), 0, item);
-    LeaveCriticalSection(&g_state_lock);
     if (length < item_length) {
         WSASetLastError(WSAEMSGSIZE);
         return SOCKET_ERROR;
@@ -836,11 +865,12 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
         if (received == (int)strlen(WELNPT_ICE_REMOTE_SET_PREFIX) &&
             memcmp(packet, WELNPT_ICE_REMOTE_SET_PREFIX, strlen(WELNPT_ICE_REMOTE_SET_PREFIX)) == 0) {
             if (InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_PENDING) {
-                g_ice_decision_started = GetTickCount64();
-                g_ice_decision_deadline = g_ice_decision_started + WELNPT_ICE_DECISION_WINDOW_MS;
-                g_ice_session_deadline = 0;
-                log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"remote-set\",\"windowMs\":%d,\"generation\":%lu",
-                    WELNPT_ICE_DECISION_WINDOW_MS,
+                if (g_ice_decision_started == 0) g_ice_decision_started = GetTickCount64();
+                g_ice_decision_deadline = 0;
+                if (g_ice_session_deadline == 0) {
+                    g_ice_session_deadline = g_ice_decision_started + WELNPT_ICE_SESSION_TIMEOUT_MS;
+                }
+                log_line("\"api\":\"ice-decision\",\"result\":\"pending\",\"reason\":\"remote-set\",\"windowMs\":0,\"generation\":%lu",
                     (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0));
             }
             continue;
@@ -860,8 +890,8 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                         ? now - g_ice_decision_started : 0;
                     g_ice_decision_deadline = 0;
                     g_ice_session_deadline = 0;
-                    log_line("\"api\":\"ice-decision\",\"result\":\"direct\",\"reason\":\"ice-connected\",\"elapsedMs\":%llu,\"windowMs\":%d,\"generation\":%lu,\"directState\":\"%.*s\"",
-                        (unsigned __int64)elapsed, WELNPT_ICE_DECISION_WINDOW_MS,
+                    log_line("\"api\":\"ice-decision\",\"result\":\"direct\",\"reason\":\"ice-connected\",\"elapsedMs\":%llu,\"windowMs\":0,\"generation\":%lu,\"directState\":\"%.*s\"",
+                        (unsigned __int64)elapsed,
                         (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0),
                         received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);
                     log_line("\"api\":\"transport-lock\",\"path\":\"direct\",\"reason\":\"ice-connected\"");
@@ -972,6 +1002,7 @@ static int initialize_hook(void) {
     HANDLE worker;
 
     InitializeCriticalSection(&g_state_lock);
+    InitializeCriticalSection(&g_queue_lock);
     InitializeCriticalSection(&g_log_lock);
     g_locks_initialized = 1;
     {

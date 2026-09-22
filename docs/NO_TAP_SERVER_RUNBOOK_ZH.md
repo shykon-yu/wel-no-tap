@@ -302,7 +302,8 @@ UPnP、NAT-PMP 或 PCP 为 ICE 建立临时 UDP 映射，失败或路由器不�
 5. 如需检查双方 `%LOCALAPPDATA%\WELPlatform\logs\room-session-*.jsonl`，先将
    `WEL_NOTAP_DIAGNOSTIC_LOG=true` 写入客户端 env 并重启；然后：
    - 直连成功：`ice-decision result:"direct"`，随后有真实比赛单播 `path:"direct"`。
-   - 直连失败：`ice-decision reason:"ice-failed"` 或 `"decision-timeout"`，比赛仍有
+   - 直连失败：`ice-decision reason:"ice-failed"` 或较长的
+     `remote-sdp-timeout`，比赛仍有
      `path:"relay"` 的持续双向数据。
 6. 至少完成一场 10 分钟比赛，检查没有持续队列丢包、频繁切换或服务端 route drop 异常。
 7. 使用一名已知无法直连的网络复测，确认会立即可靠回退中继而不是无法联机。

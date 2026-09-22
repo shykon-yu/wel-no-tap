@@ -172,6 +172,19 @@ static int is_virtual_windows_ipv6(const struct sockaddr *address,
 	return 0;
 }
 
+static int is_transition_windows_ipv6(const struct sockaddr *address) {
+	const struct in6_addr *candidate;
+	const uint8_t *bytes;
+	if (!address || address->sa_family != AF_INET6) return 0;
+	candidate = &((const struct sockaddr_in6 *)address)->sin6_addr;
+	bytes = (const uint8_t *)candidate;
+	/* Teredo (2001:0000::/32) and 6to4 (2002::/16) depend on an
+	 * additional tunnel and are commonly unusable for peer ICE. They also
+	 * create long failed checks on Windows. Keep native global IPv6 and ULA. */
+	return (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && bytes[3] == 0x00) ||
+	       (bytes[0] == 0x20 && bytes[1] == 0x02);
+}
+
 #endif
 
 static socket_t create_socket_for_addrinfo(const udp_socket_config_t *config,
@@ -626,10 +639,31 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 		sizeof(virtual_addresses) / sizeof(virtual_addresses[0]));
 	size_t virtual_ipv6_address_count = get_virtual_windows_ipv6_addresses(virtual_ipv6_addresses,
 		sizeof(virtual_ipv6_addresses) / sizeof(virtual_ipv6_addresses[0]));
-	char buf[4096];
+	char *buf = NULL;
+	DWORD buffer_size = 4096;
 	DWORD len = 0;
-	if (WSAIoctl(sock, SIO_ADDRESS_LIST_QUERY, NULL, 0, buf, sizeof(buf), &len, NULL, NULL)) {
-		JLOG_ERROR("WSAIoctl with SIO_ADDRESS_LIST_QUERY failed, errno=%d", WSAGetLastError());
+	int address_list_ready = 0;
+	for (int attempt = 0; attempt < 4; ++attempt) {
+		DWORD error;
+		buf = (char *)HeapAlloc(GetProcessHeap(), 0, buffer_size);
+		if (!buf) return -1;
+		if (!WSAIoctl(sock, SIO_ADDRESS_LIST_QUERY, NULL, 0, buf, buffer_size, &len, NULL, NULL)) {
+			address_list_ready = 1;
+			break;
+		}
+		error = WSAGetLastError();
+		HeapFree(GetProcessHeap(), 0, buf);
+		buf = NULL;
+		if (error != WSAEFAULT && error != WSAEINVAL) {
+			JLOG_ERROR("WSAIoctl with SIO_ADDRESS_LIST_QUERY failed, errno=%lu", (unsigned long)error);
+			return -1;
+		}
+		if (len > buffer_size) buffer_size = len;
+		else buffer_size *= 2;
+	}
+	if (!address_list_ready || buf == NULL) {
+		JLOG_ERROR("WSAIoctl with SIO_ADDRESS_LIST_QUERY exceeded buffer limit");
+		if (buf) HeapFree(GetProcessHeap(), 0, buf);
 		return -1;
 	}
 
@@ -649,6 +683,12 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 				JLOG_INFO("Skipping virtual adapter IPv6 host candidate %s", address);
 			continue;
 		}
+		if (is_transition_windows_ipv6(sa)) {
+			char address[ADDR_MAX_NUMERICHOST_LEN];
+			if (addr_to_string(sa, address, sizeof(address)) >= 0)
+				JLOG_INFO("Skipping transition IPv6 host candidate %s", address);
+			continue;
+		}
 		if ((sa->sa_family == AF_INET ||
 		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
 		    !addr_is_local(sa)) {
@@ -665,6 +705,7 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 			}
 		}
 	}
+	HeapFree(GetProcessHeap(), 0, buf);
 #else // POSIX
 #ifndef NO_IFADDRS
 	struct ifaddrs *ifas;

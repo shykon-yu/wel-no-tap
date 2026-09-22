@@ -252,8 +252,6 @@ unsigned long addr_hash(const struct sockaddr *sa, bool with_port) {
 
 int addr_resolve(const char *hostname, const char *service, int socktype, addr_record_t *records,
                  size_t count) {
-	addr_record_t *end = records + count;
-
 	struct addrinfo hints;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -268,21 +266,30 @@ int addr_resolve(const char *hostname, const char *service, int socktype, addr_r
 		return -1;
 	}
 
-	int ret = 0;
-	for (struct addrinfo *ai = ai_list; ai; ai = ai->ai_next) {
-		if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
-			++ret;
-			if (records != end) {
-				memcpy(&records->addr, ai->ai_addr, ai->ai_addrlen);
-				records->len = (socklen_t)ai->ai_addrlen;
-				records->socktype = socktype;
-				++records;
-			}
+	/* Prefer IPv6 when the STUN name has both families, but always keep an
+	 * IPv4 fallback when the caller has room for both. Return the number of
+	 * records actually written; callers must never walk uninitialized slots
+	 * when DNS returns more addresses than the supplied buffer can hold. */
+	size_t stored = 0;
+	int has_ipv4 = 0;
+	for (struct addrinfo *ai = ai_list; ai; ai = ai->ai_next)
+		if (ai->ai_family == AF_INET) { has_ipv4 = 1; break; }
+	for (int pass = 0; pass < 2; ++pass) {
+		int family = pass == 1 ? AF_INET : AF_INET6;
+		for (struct addrinfo *ai = ai_list; ai; ai = ai->ai_next) {
+			if (ai->ai_family != family) continue;
+			if (stored >= count) break;
+			/* Reserve the final slot for IPv4 only while gathering IPv6. */
+			if (family == AF_INET6 && has_ipv4 && stored + 1 >= count) break;
+			memcpy(&(records + stored)->addr, ai->ai_addr, ai->ai_addrlen);
+			(records + stored)->len = (socklen_t)ai->ai_addrlen;
+			(records + stored)->socktype = socktype;
+			++stored;
 		}
 	}
 
 	freeaddrinfo(ai_list);
-	return ret;
+	return (int)stored;
 }
 
 bool addr_is_numeric_hostname(const char *hostname) {

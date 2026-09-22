@@ -490,6 +490,18 @@ function handleIceLine(rawLine) {
     rememberAgentLine('active', line)
     return
   }
+  if (line.startsWith('CANDIDATE_STATS ')) {
+    const stats = {}
+    for (const part of line.slice('CANDIDATE_STATS '.length).trim().split(/\s+/)) {
+      const separator = part.indexOf('=')
+      if (separator <= 0) continue
+      const key = part.slice(0, separator)
+      const value = part.slice(separator + 1)
+      stats[key] = key === 'capacityRisk' ? value === '1' : (Number(value) || 0)
+    }
+    appendAgentEvent('active', 'candidate-stats', stats)
+    return
+  }
   if (line.startsWith('GAME_PEER ')) {
     const payload = line.slice(10).trim()
     const [logicalIp, sourcePort = '', targetPort = '', generation = '0'] = payload.split('|')
