@@ -18,6 +18,7 @@ const defaults = {
   WEL_API_ROOM_PEER_PROBES_PATH: '/notap/rooms/{roomId}/peer-probes',
   WEL_NOTAP_DIAGNOSTIC_LOG: 'false',
   WEL_NOTAP_UPNP: 'true',
+  WEL_NOTAP_LIBNICE_PATH: '',
   WEL_GAME_NAME: 'WE8',
 }
 
@@ -82,6 +83,7 @@ function publicConfig() {
     apiRoomPeerProbesPath: values.WEL_API_ROOM_PEER_PROBES_PATH,
     diagnosticLog: values.WEL_NOTAP_DIAGNOSTIC_LOG,
     upnp: values.WEL_NOTAP_UPNP,
+    libnicePath: values.WEL_NOTAP_LIBNICE_PATH,
     configFile: filePath,
   }
 }

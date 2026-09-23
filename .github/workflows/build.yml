@@ -114,6 +114,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper argument validation failed' }
           & "$output/welnptice.exe" --stun-host 127.0.0.1 --stun-port 3478 --no-hook --validate-args
           if ($LASTEXITCODE -ne 0) { throw 'libjuice ICE helper no-hook validation failed' }
+          # libnice is built from the official vcpkg port and its GLib runtime
+          # is copied beside the helper so rooms 07/08 remain self-contained.
+          if (Test-Path Env:VCPKG_INSTALLATION_ROOT) {
+            vcpkg install libnice:x86-windows --triplet x86-windows --disable-metrics
+            $niceInclude = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x86-windows/include'
+            $niceLib = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x86-windows/lib'
+            $niceBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x86-windows/bin'
+            $niceGlibConfig = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x86-windows/lib/glib-2.0/include'
+            if (-not (Test-Path (Join-Path $niceInclude 'nice/agent.h'))) { throw 'libnice headers were not installed' }
+            if (-not (Test-Path (Join-Path $niceLib 'nice.lib'))) { throw 'libnice library was not installed' }
+            if (Test-Path (Join-Path $niceInclude 'nice/agent.h')) {
+              $niceLibraries = @('nice','gio-2.0','gmodule-2.0','gobject-2.0','glib-2.0','intl','pcre2-8','ffi','ssl','crypto') |
+                ForEach-Object { $library = Join-Path $niceLib ($_ + '.lib'); if (Test-Path $library) { $library } }
+              $niceCompilerArgs = @(
+                '/nologo', '/W4', '/O2', '/MD', '/D_CRT_SECURE_NO_WARNINGS', '/D_WIN32_WINNT=0x0601',
+                "/I$niceInclude", "/I$(Join-Path $niceInclude 'glib-2.0')", "/I$niceGlibConfig",
+                'native/welnpt_nice.c', "/Fe:$output/welnptnice.exe", '/link', 'Ws2_32.lib', 'Iphlpapi.lib'
+              ) + $niceLibraries
+              Invoke-Compiler 'libnice ICE helper' $niceCompilerArgs
+              Copy-Item (Join-Path $niceBin '*.dll') 'frontend/resources/welhelper' -Force -ErrorAction SilentlyContinue
+              Copy-Item $output/welnptnice.exe 'frontend/resources/welhelper/welnptnice.exe' -Force
+            }
+          } else { throw 'VCPKG_INSTALLATION_ROOT is unavailable; libnice rooms require the libnice toolchain' }
           Compress-Archive -Path "$output/*" -DestinationPath 'build/WEL无网卡云中继-P2-x86-完整包.zip' -Force
       - name: Upload complete Windows package
         uses: actions/upload-artifact@v4

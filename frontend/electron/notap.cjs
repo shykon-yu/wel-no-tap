@@ -8,6 +8,7 @@ const { loadConfig } = require('./config.cjs')
 const appData = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'WELPlatform')
 const logDirectory = path.join(appData, 'logs')
 const localConfig = loadConfig().values
+const libnicePath = String(localConfig.WEL_NOTAP_LIBNICE_PATH || '').trim()
 const diagnosticLogEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_DIAGNOSTIC_LOG || 'false'))
 const upnpEnabled = /^(1|true|yes|on)$/i.test(String(localConfig.WEL_NOTAP_UPNP || 'true'))
 
@@ -62,6 +63,15 @@ function iceCandidates() {
     path.join(process.resourcesPath || '', 'welhelper', 'welnptice.exe'),
     path.join(__dirname, '..', 'resources', 'welhelper', 'welnptice.exe'),
     path.join(__dirname, '..', 'build', 'welnptice.exe'),
+  ].filter(Boolean)
+}
+
+function libniceCandidates() {
+  return [
+    libnicePath,
+    path.join(process.resourcesPath || '', 'welhelper', 'welnptnice.exe'),
+    path.join(__dirname, '..', 'resources', 'welhelper', 'welnptnice.exe'),
+    path.join(__dirname, '..', 'build', 'welnptnice.exe'),
   ].filter(Boolean)
 }
 
@@ -613,6 +623,52 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
   return waitForIceCandidate(child)
 }
 
+// libnice uses the same small stdin/stdout control protocol as the existing
+// helper. This keeps Hook and relay fallback unchanged while allowing rooms
+// 07/08 to use an independently shipped ICE implementation.
+async function prepareLibnice(options) {
+  const executable = locate(libniceCandidates())
+  if (!executable) throw new Error('缺少 libnice ICE 组件 welnptnice.exe')
+  const previous = iceProcess
+  if (previous && !previous.killed) await stopIceChild(previous)
+  iceProcess = null
+  iceLocalDescription = ''
+  iceAgentPort = 0
+  iceHookPort = chooseHookPort()
+  iceState = 'gathering'
+  iceOptions = { ...options, implementation: 'libnice' }
+  lastRemoteDescription = ''
+  activeGamePeerIp = ''
+  const child = spawn(executable, [
+    '--stun-host', String(options?.stunHost || ''), '--stun-port', String(options?.stunPort || 0),
+    '--hook-port', String(iceHookPort), '--room', String(options?.room || ''),
+    '--logical-ip', String(options?.logicalIp || ''), '--relay', String(options?.relay || ''),
+    '--token', String(options?.token || ''), '--session-key', String(options?.sessionKey || Date.now().toString(36)),
+  ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: process.env })
+  iceProcess = child
+  appendAgentEvent('libnice', 'started', { executable, hookPort: iceHookPort })
+  const consume = (chunk) => {
+    iceLineBuffer += chunk.toString('utf8')
+    let newline
+    while ((newline = iceLineBuffer.indexOf('\n')) >= 0) {
+      const line = iceLineBuffer.slice(0, newline + 1)
+      iceLineBuffer = iceLineBuffer.slice(newline + 1)
+      rememberIceDiagnostic(line)
+      handleIceLine(line)
+    }
+  }
+  child.stdout.on('data', consume)
+  child.stderr.on('data', (chunk) => { rememberIceDiagnostic('stderr: ' + chunk.toString('utf8')) })
+  child.once('close', (code) => {
+    if (iceProcess !== child) return
+    iceProcess = null
+    iceState = 'failed'
+    appendAgentEvent('libnice', 'stopped', { code: code ?? null })
+  })
+  await waitForIceCandidate(child, 26000)
+  return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
+}
+
 function stopIceChild(child) {
   if (!child || child.killed) return Promise.resolve()
   return new Promise((resolve) => {
@@ -645,6 +701,9 @@ async function prepareIce(options) {
 
 async function resetIce() {
   if (!iceOptions) throw new Error('直连组件尚未准备')
+  if (iceOptions.implementation === 'libnice') {
+    return prepareLibnice(iceOptions)
+  }
   await clearStandbyAgent()
   const previous = iceProcess
   iceProcess = null
@@ -697,6 +756,7 @@ function attachActiveIceProcess(child) {
 
 async function prewarmIce() {
   if (!iceOptions) return { ready: false, state: 'waiting' }
+  if (iceOptions.implementation === 'libnice') return { ready: false, state: 'not-supported' }
   if (standbyAgentKey && probeAgents.has(standbyAgentKey)) return { ready: true, state: 'ready' }
   if (standbyPromise) return standbyPromise
   const generation = standbyGeneration
@@ -1236,6 +1296,7 @@ module.exports = {
   status,
   transportStatus,
   prepareIce,
+  prepareLibnice,
   prepareGameIce,
   resetIce,
   prewarmIce,

@@ -33,7 +33,7 @@ const activeRoom = computed(() => activeLease.value ? rooms.value.find(room => r
 // label prevents stale room data from being presented as a different transport
 // (for example, a TAP lease shown as "直连01").
 const roomLabel = (roomID: number, mode?: Room['connection_mode']) =>
-  `${mode === 'tap' ? '网卡' : mode === 'direct' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
+  `${mode === 'tap' ? '网卡' : mode === 'direct' || mode === 'libnice' ? '直连' : '中继'}${String(roomID).padStart(2, '0')}`
 const displayRoomName = (room: Room) => roomLabel(room.id, room.connection_mode)
 const activeRoomName = computed(() => activeRoom.value
   ? displayRoomName(activeRoom.value)
@@ -306,13 +306,15 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
   // Search and relay transport use the outbound 22333/UDP mapping and do not
   // require a client firewall rule. ICE remains optional; skipping this
   // best-effort policy write keeps room entry quiet and lightweight.
-  if (!desktopApi.prepareIce) throw new Error('直连组件不可用：welnptice.exe 接口缺失')
+  const prepare = lease.connection_mode === 'libnice' ? desktopApi.prepareLibnice : desktopApi.prepareIce
+  if (!prepare) throw new Error('直连组件不可用：ICE 接口缺失')
 
   try {
-    const ice = await desktopApi.prepareIce({
+    const ice = await prepare({
       stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
       relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
       logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
+      sessionKey: `room-${lease.room_id}-${Date.now()}-${crypto.randomUUID()}`,
     })
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
     localIceDescription.value = ice.localDescription
@@ -348,7 +350,7 @@ async function joinRoom(room: Room) {
     lease = (await roomApi.join(room.id)).lease
     activeLease.value = lease
     const preparationEpoch = ++roomPreparationEpoch
-    const directRoom = lease.connection_mode === 'direct'
+    const directRoom = lease.connection_mode === 'direct' || lease.connection_mode === 'libnice'
     const tapRoom = lease.connection_mode === 'tap'
     directCandidateStatus.value = directRoom ? 'gathering' : 'relay-only'
     directCandidateMessage.value = tapRoom ? '网卡组件准备中' : directRoom ? '直连组件准备中' : '当前房间仅使用云中继'
@@ -485,7 +487,7 @@ async function launchGameNow() {
     directGameEnabled = false
     gamePeerEpoch += 1
     gamePeerOperation = Promise.resolve(true)
-    let useDirect = activeLease.value.connection_mode === 'direct'
+    let useDirect = activeLease.value.connection_mode === 'direct' || activeLease.value.connection_mode === 'libnice'
     if (useDirect && desktop()?.prepareGameIce) {
       try {
         const ice = await desktop()!.prepareGameIce()
@@ -506,7 +508,7 @@ async function launchGameNow() {
       mode: activeLease.value.connection_mode,
     })
     const warnings = [...(result.warnings || [])]
-    if (!useDirect && activeLease.value.connection_mode === 'direct') {
+    if (!useDirect && (activeLease.value.connection_mode === 'direct' || activeLease.value.connection_mode === 'libnice')) {
       warnings.push('直连组件未就绪，本场使用云中继')
     }
     warningMessage.value = [...new Set(warnings)].join('\n')
@@ -615,7 +617,7 @@ async function waitForIncomingGameProbe(roomID: number, requesterUserID: number,
     if (epoch !== gamePeerEpoch || !activeLease.value || activeLease.value.room_id !== roomID) return null
     try {
       const result = await roomApi.incomingPeerProbes(roomID, 'game', sessionKey)
-      const matches = result.probes.filter(item => item.requester_user_id === requesterUserID && item.session_key === sessionKey && item.requester_description)
+      const matches = result.probes.filter(item => item.requester_user_id === requesterUserID && (!sessionKey || item.session_key === sessionKey) && item.requester_description)
       // Prefer the newest unanswered probe; fall back to the newest record so
       // a stale answered probe from an earlier match is never re-used.
       const pending = matches.filter(item => !item.target_description)
@@ -645,7 +647,7 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   } catch { return false }
   if (!member || epoch !== gamePeerEpoch || activeLease.value?.room_id !== lease.room_id) return false
 
-  if (!directGameEnabled || lease.connection_mode !== 'direct' || !desktop()?.configureIce || !desktop()?.resetIce) return false
+  if (!directGameEnabled || (lease.connection_mode !== 'direct' && lease.connection_mode !== 'libnice') || !desktop()?.configureIce || !desktop()?.resetIce) return false
 
   // The lower user ID is the single offerer for this match. Both peers use
   // their current clean agent for the first match, then rotate A/B slots.
@@ -654,7 +656,9 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   // pair of logical IPs. The previous per-side key (peer IP + mirrored ports +
   // local generation) was never identical on both ends, so the probe exchange
   // could never match and direct never established.
-  const sessionKey = selfIp ? `game|${[selfIp, logicalIp].sort().join('_')}` : transactionKey
+  const sessionKey = selfIp
+    ? `game|${[selfIp, logicalIp].sort().join('_')}|${crypto.randomUUID()}`
+    : `game|${transactionKey}|${crypto.randomUUID()}`
   const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
     // Once a real game peer has been observed, this agent belongs to that
@@ -680,10 +684,10 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
             remoteDescription = answered.target_description
           }
         } else {
-          const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, sessionKey, epoch)
+          const incoming = await waitForIncomingGameProbe(lease.room_id, member.user_id, '', epoch)
           if (incoming?.requester_description) {
             remoteDescription = incoming.requester_description
-            await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value, incoming.session_key || sessionKey)
+            await roomApi.answerPeerProbe(lease.room_id, incoming.id, localIceDescription.value, incoming.session_key)
           }
         }
         if (remoteDescription && epoch === gamePeerEpoch && activeLease.value?.room_id === lease.room_id) {
@@ -712,7 +716,7 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
 }
 
 function configureGamePeer(event: { logicalIp: string; transactionKey: string }) {
-  if (activeLease.value?.connection_mode !== 'direct') return
+  if (activeLease.value?.connection_mode !== 'direct' && activeLease.value?.connection_mode !== 'libnice') return
   const normalizedIp = String(event?.logicalIp || '').trim()
   const transactionKey = String(event?.transactionKey || normalizedIp).trim()
   if (!normalizedIp || !transactionKey || gamePeerTasks.has(transactionKey) || gamePeerTransactions.has(transactionKey)) return
@@ -845,7 +849,7 @@ onBeforeUnmount(() => {
 
       <div class="room-workspace">
         <section class="room-section"><div class="section-heading"><div><h3>可用房间</h3><p class="room-mode-note">网卡房间会加载虚拟网卡组件，进入房间和启动游戏可能比其他房间稍慢。</p></div><button class="icon-button" title="刷新房间" @click="loadRooms" :disabled="loading"><RefreshCw :size="18" :class="{ spinning: loading }" /></button></div>
-          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '直连/中继' : room.connection_mode === 'direct' ? 'P2P直连/云中继' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
+          <div class="room-grid"><article v-for="room in rooms" :key="room.id" class="room-card" :class="[{ unavailable: room.status !== 'open' }, `mode-${room.connection_mode}`]"><div class="room-card-top"><span class="region">{{ room.connection_mode === 'tap' ? '直连/中继' : room.connection_mode === 'direct' || room.connection_mode === 'libnice' ? 'P2P直连/云中继' : '云中继' }}</span><span :class="['room-state', room.status]">{{ room.status === 'open' ? '可进入' : '维护中' }}</span></div><h3>{{ displayRoomName(room) }}</h3><p>{{ room.subnet_cidr }}</p><div class="room-card-footer"><span><Users :size="16" /> {{ room.members }} / {{ room.capacity }}</span><button class="join-button" :disabled="loading || room.status !== 'open' || Boolean(activeLease)" @click="joinRoom(room)">进入</button></div></article></div>
         </section>
         <aside v-if="activeLease" class="room-members-panel"><div class="section-heading"><div><p class="eyebrow">{{ roomInfoTitle }}</p><h3>房间成员</h3></div><span class="member-count">{{ roomMembers.length }} 人</span></div><div v-if="roomMembers.length" class="member-list"><div v-for="member in roomMembers" :key="member.user_id" class="member-row"><span class="member-avatar">{{ member.nickname.slice(0, 1) }}</span><span><strong>{{ member.nickname }}</strong><small>@{{ member.username }}</small></span><button class="mini-button" @click="openMemberDetail(member)">详情</button><em v-if="member.is_self">我</em></div></div><p v-else class="member-empty">正在读取房间成员...</p></aside>
       </div>

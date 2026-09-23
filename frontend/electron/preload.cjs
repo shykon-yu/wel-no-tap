@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   completeQuit: () => ipcRenderer.invoke('platform-complete-quit'),
   pingHost: (host) => ipcRenderer.invoke('notap-ping', host),
   prepareIce: (options) => ipcRenderer.invoke('notap-prepare-ice', options),
+  prepareLibnice: (options) => ipcRenderer.invoke('notap-prepare-libnice', options),
   prepareGameIce: () => ipcRenderer.invoke('notap-prepare-game-ice'),
   resetIce: () => ipcRenderer.invoke('notap-reset-ice'),
   prewarmIce: () => ipcRenderer.invoke('notap-prewarm-ice'),

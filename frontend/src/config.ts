@@ -17,11 +17,12 @@ export type RuntimeConfig = {
   apiRoomPeerProbesPath: string
   diagnosticLog?: string
   upnp?: string
+  libnicePath?: string
   configFile?: string | null
 }
 
 const fallback: RuntimeConfig = {
-  appVersion: '0.0.66',
+  appVersion: '0.0.67',
   platformName: 'WEL对战平台',
   platformShortName: 'WEL',
   gameName: 'WE8',
