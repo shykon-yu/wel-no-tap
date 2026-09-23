@@ -17,7 +17,10 @@ concurrency:
 jobs:
   build-x86:
     runs-on: windows-2022
-    timeout-minutes: 45
+    # vcpkg's first libnice/GLib install can exceed the default 45-minute
+    # limit on a cold Windows runner. Keep the build reproducible instead of
+    # cancelling before the helper and installer artifacts are uploaded.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
