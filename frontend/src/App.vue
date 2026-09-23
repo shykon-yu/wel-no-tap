@@ -312,6 +312,8 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
   try {
     const ice = await prepare({
       stunHost: lease.ice_stun_host, stunPort: lease.ice_stun_port,
+      turnHost: lease.ice_turn_host, turnPort: lease.ice_turn_port,
+      turnUsername: lease.ice_turn_username, turnPassword: lease.ice_turn_password,
       relay: `${lease.relay_host}:${lease.relay_port}`, room: lease.community,
       logicalIp: lease.logical_ip || lease.virtual_ip, token: lease.relay_token,
       sessionKey: `room-${lease.room_id}-${Date.now()}-${crypto.randomUUID()}`,

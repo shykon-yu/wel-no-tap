@@ -39,7 +39,7 @@ declare global {
       completeQuit: () => Promise<void>
       pingHost: (host: string) => Promise<PingResult>
       prepareIce: (options: { stunHost: string; stunPort: number; relay: string; room: string; logicalIp: string; token: string }) => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
-      prepareLibnice: (options: { stunHost: string; stunPort: number; relay: string; room: string; logicalIp: string; token: string; sessionKey?: string }) => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
+      prepareLibnice: (options: { stunHost: string; stunPort: number; turnHost?: string; turnPort?: number; turnUsername?: string; turnPassword?: string; relay: string; room: string; logicalIp: string; token: string; sessionKey?: string }) => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       prepareGameIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       resetIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       prewarmIce: () => Promise<{ ready: boolean; state: string; localDescription?: string; error?: string }>

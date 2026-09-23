@@ -641,6 +641,8 @@ async function prepareLibnice(options) {
   activeGamePeerIp = ''
   const child = spawn(executable, [
     '--stun-host', String(options?.stunHost || ''), '--stun-port', String(options?.stunPort || 0),
+    '--turn-host', String(options?.turnHost || ''), '--turn-port', String(options?.turnPort || 0),
+    '--turn-user', String(options?.turnUsername || ''), '--turn-password', String(options?.turnPassword || ''),
     '--hook-port', String(iceHookPort), '--room', String(options?.room || ''),
     '--logical-ip', String(options?.logicalIp || ''), '--relay', String(options?.relay || ''),
     '--token', String(options?.token || ''), '--session-key', String(options?.sessionKey || Date.now().toString(36)),

@@ -13,7 +13,7 @@
 | 现有 n2n supernode | `22222/UDP+TCP` | `weln2n-supernode.service` |
 | 现有平台 API/Nginx | `8082/80/443 TCP` | Docker/Nginx |
 | 无网卡中继（直连失败回退） | `22333/UDP` | `welnpt-notap-relay.service` |
-| ICE STUN | `3478/UDP` | `wel-stun.service` |
+| ICE STUN/TURN | `3478/UDP` | `wel-stun.service` |
 
 部署无网卡服务时禁止重启 Docker、Nginx、OpenVPN 或 `weln2n-supernode`。
 
@@ -52,7 +52,7 @@ sudo firewall-cmd --zone=public --add-port=22333/udp
 
 阿里云安全组还需要单独增加 `UDP 22333` 入方向规则。
 
-## 自建 STUN
+## 自建 STUN/TURN
 
 libjuice 使用 STUN 收集公网 candidate 和协助 NAT 打洞。STUN 只参与探测，比赛
 数据在 ICE 成功后直接走两台玩家之间；直连失败仍由 `22333/UDP` 云中继兜底。
@@ -76,8 +76,26 @@ WEL_NOTAP_ICE_STUN_HOST=8.155.145.132
 WEL_NOTAP_ICE_STUN_PORT=3478
 ```
 
-阿里云安全组增加 `UDP 3478` 入方向规则，来源可以先设为 `0.0.0.0/0`。仅运行
-`stun-only` 时不需要开放 TURN 中继端口段。
+阿里云安全组增加 `UDP 3478` 入方向规则，来源可以先设为 `0.0.0.0/0`。
+
+启用 07/08 的 TURN relay 兜底时，在线配置中去掉 `stun-only`，增加：
+
+```ini
+lt-cred-mech
+realm=welgame.example
+user=wel:<strong-secret>
+min-port=49152
+max-port=65535
+```
+
+并开放 `3478/UDP`、建议 `3478/TCP` 和 `49152-65535/UDP`。不要把真实密码提交到 Git。Go API 通过以下环境变量将凭据下发给 libnice：
+
+```env
+WEL_NOTAP_TURN_HOST=8.155.145.132
+WEL_NOTAP_TURN_PORT=3478
+WEL_NOTAP_TURN_USERNAME=wel
+WEL_NOTAP_TURN_PASSWORD=<same-strong-secret>
+```
 
 ## 验证
 

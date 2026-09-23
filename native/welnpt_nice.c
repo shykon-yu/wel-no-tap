@@ -151,7 +151,8 @@ static DWORD WINAPI command_thread(LPVOID unused) {
 
 int main(int argc, char **argv) {
     const char *stun_host = NULL;
-    unsigned short stun_port = 0, hook_port = 0, ice_port = 0;
+    const char *turn_host = NULL, *turn_user = NULL, *turn_password = NULL;
+    unsigned short stun_port = 0, turn_port = 0, hook_port = 0, ice_port = 0;
     WSADATA winsock;
     struct sockaddr_in local;
     HANDLE receiver = NULL, commands = NULL;
@@ -160,6 +161,10 @@ int main(int argc, char **argv) {
     for (index = 1; index < argc; ++index) {
         if (!strcmp(argv[index], "--stun-host") && index + 1 < argc) stun_host = argv[++index];
         else if (!strcmp(argv[index], "--stun-port") && index + 1 < argc) { if (!parse_port(argv[++index], &stun_port)) return 2; }
+        else if (!strcmp(argv[index], "--turn-host") && index + 1 < argc) turn_host = argv[++index];
+        else if (!strcmp(argv[index], "--turn-port") && index + 1 < argc) { if (!parse_port(argv[++index], &turn_port)) return 2; }
+        else if (!strcmp(argv[index], "--turn-user") && index + 1 < argc) turn_user = argv[++index];
+        else if (!strcmp(argv[index], "--turn-password") && index + 1 < argc) turn_password = argv[++index];
         else if (!strcmp(argv[index], "--hook-port") && index + 1 < argc) { if (!parse_port(argv[++index], &hook_port)) return 2; }
         else if (!strcmp(argv[index], "--ice-port") && index + 1 < argc) { if (!parse_port(argv[++index], &ice_port)) return 2; }
         else if (!strcmp(argv[index], "--validate-args")) return stun_host && stun_port && hook_port ? 0 : 2;
@@ -190,6 +195,10 @@ int main(int argc, char **argv) {
     g_agent = nice_agent_new(NULL, NICE_COMPATIBILITY_RFC5245);
     if (!g_agent) return 6;
     g_object_set(g_agent, "stun-server", stun_host, "stun-server-port", (guint)stun_port, NULL);
+    if (turn_host && turn_port && turn_user && turn_password) {
+        nice_agent_set_relay_info(g_agent, 1, NICE_COMPONENT_TYPE_RTP, turn_host, turn_port,
+                                  turn_user, turn_password, NICE_RELAY_TYPE_TURN_UDP);
+    }
     g_stream = nice_agent_add_stream(g_agent, 1);
     if (!g_stream) return 7;
     nice_agent_set_stream_name(g_agent, g_stream, "we8");
