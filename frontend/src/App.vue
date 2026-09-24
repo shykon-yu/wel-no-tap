@@ -660,9 +660,11 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   // pair of logical IPs. The previous per-side key (peer IP + mirrored ports +
   // local generation) was never identical on both ends, so the probe exchange
   // could never match and direct never established.
+  // The key must be deterministic for both peers. A random value generated
+  // independently on each client makes the answer invisible to the caller.
   const sessionKey = selfIp
-    ? `game|${[selfIp, logicalIp].sort().join('_')}|${crypto.randomUUID()}`
-    : `game|${transactionKey}|${crypto.randomUUID()}`
+    ? `game|${[selfIp, logicalIp].sort().join('_')}|${transactionKey.split('|').slice(-1)[0]}`
+    : `game|${transactionKey}`
   const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
     // Once a real game peer has been observed, this agent belongs to that

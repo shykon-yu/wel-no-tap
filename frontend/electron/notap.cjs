@@ -865,6 +865,13 @@ function setRemoteIce(remoteDescription, remoteIp = '') {
 }
 
 function resetGameSession() {
+  // A new match must not inherit the previous remote SDP or peer binding.
+  // Clear the controller state before notifying the Hook so a stale ICE
+  // result cannot be applied to the next match.
+  lastRemoteDescription = ''
+  activeGamePeerIp = ''
+  transportPath = 'pending'
+  iceState = iceProcess && !iceProcess.killed ? iceState : 'waiting'
   if (!iceProcess || iceProcess.killed) return false
   try {
     iceProcess.stdin.write('RESET_SESSION\n')
