@@ -17,6 +17,7 @@
 #define PEER_PREFIX "WELICEPEER:"
 #define AGENT_PREFIX "WELICEAGENT:"
 #define REMOTE_SET "WELICEREMOTESET"
+#define SESSION_RESET "WELICESESSIONRESET"
 #define TRANSPORT_PREFIX "WELTRANSPORT:"
 #define GAME_PEER_PREFIX "WELGAMEPEER:"
 #define BUFFER_SIZE 8192
@@ -28,6 +29,8 @@ static struct sockaddr_in g_hook;
 static unsigned short g_local_port;
 static volatile LONG g_stopping;
 static volatile LONG g_connected;
+static volatile LONG g_hook_active;
+static volatile LONG g_standby;
 static CRITICAL_SECTION g_output_lock;
 
 static void output(const char *format, ...) {
@@ -55,10 +58,13 @@ static void on_component_state_changed(NiceAgent *agent, guint stream_id, guint 
     output("STATE %s", name ? name : "unknown");
     if (state == NICE_COMPONENT_STATE_CONNECTED || state == NICE_COMPONENT_STATE_READY) {
         InterlockedExchange(&g_connected, 1);
-        hook_message(CONTROL_PREFIX, "connected");
+        if (InterlockedCompareExchange(&g_hook_active, 0, 0)) hook_message(CONTROL_PREFIX, "connected");
+    } else if (state == NICE_COMPONENT_STATE_DISCONNECTED) {
+        InterlockedExchange(&g_connected, 0);
+        if (InterlockedCompareExchange(&g_hook_active, 0, 0)) hook_message(CONTROL_PREFIX, "disconnected");
     } else if (state == NICE_COMPONENT_STATE_FAILED) {
         InterlockedExchange(&g_connected, 0);
-        hook_message(CONTROL_PREFIX, "failed");
+        if (InterlockedCompareExchange(&g_hook_active, 0, 0)) hook_message(CONTROL_PREFIX, "failed");
     }
 }
 
@@ -143,6 +149,15 @@ static DWORD WINAPI command_thread(LPVOID unused) {
         } else if (!strncmp(command, "TARGET ", 7)) {
             hook_message(PEER_PREFIX, command + 7);
             output("TARGET_SET %s", command + 7);
+        } else if (!strcmp(command, "RESET_SESSION")) {
+            if (InterlockedCompareExchange(&g_hook_active, 0, 0)) {
+                hook_message(SESSION_RESET, "");
+            }
+        } else if (!strcmp(command, "ACTIVATE")) {
+            InterlockedExchange(&g_standby, 0);
+            InterlockedExchange(&g_hook_active, 1);
+            notify_hook_agent(g_local_port);
+            hook_message(CONTROL_PREFIX, "connecting");
         }
     }
     InterlockedExchange(&g_stopping, 1);
@@ -158,6 +173,7 @@ int main(int argc, char **argv) {
     HANDLE receiver = NULL, commands = NULL;
     guint state_handler, gathering_handler;
     int index;
+    int standby = 0;
     for (index = 1; index < argc; ++index) {
         if (!strcmp(argv[index], "--stun-host") && index + 1 < argc) stun_host = argv[++index];
         else if (!strcmp(argv[index], "--stun-port") && index + 1 < argc) { if (!parse_port(argv[++index], &stun_port)) return 2; }
@@ -167,6 +183,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[index], "--turn-password") && index + 1 < argc) turn_password = argv[++index];
         else if (!strcmp(argv[index], "--hook-port") && index + 1 < argc) { if (!parse_port(argv[++index], &hook_port)) return 2; }
         else if (!strcmp(argv[index], "--ice-port") && index + 1 < argc) { if (!parse_port(argv[++index], &ice_port)) return 2; }
+        else if (!strcmp(argv[index], "--standby")) standby = 1;
         else if (!strcmp(argv[index], "--validate-args")) return stun_host && stun_port && hook_port ? 0 : 2;
         else if (!strcmp(argv[index], "--self-test")) return 0;
         else if (!strcmp(argv[index], "--room") || !strcmp(argv[index], "--logical-ip") || !strcmp(argv[index], "--relay") || !strcmp(argv[index], "--token") || !strcmp(argv[index], "--session-key")) { if (index + 1 < argc) ++index; }
@@ -184,24 +201,30 @@ int main(int argc, char **argv) {
     ZeroMemory(&g_hook, sizeof(g_hook)); g_hook.sin_family = AF_INET; g_hook.sin_addr.s_addr = htonl(INADDR_LOOPBACK); g_hook.sin_port = htons(hook_port);
     g_local_port = ntohs(local.sin_port);
     output("LOCAL_PORT %u", (unsigned)g_local_port);
+    InterlockedExchange(&g_standby, standby ? 1 : 0);
+    InterlockedExchange(&g_hook_active, standby ? 0 : 1);
     {
         char port_text[16];
         _snprintf_s(port_text, sizeof(port_text), _TRUNCATE, "%u", (unsigned)g_local_port);
-        hook_message(AGENT_PREFIX, port_text);
-        hook_message(CONTROL_PREFIX, "connecting");
+        if (!standby) {
+            hook_message(AGENT_PREFIX, port_text);
+            hook_message(CONTROL_PREFIX, "connecting");
+        }
     }
     output("GATHERING_STARTED %s %u", stun_host, (unsigned)stun_port);
 
     g_agent = nice_agent_new(NULL, NICE_COMPATIBILITY_RFC5245);
     if (!g_agent) return 6;
     g_object_set(g_agent, "stun-server", stun_host, "stun-server-port", (guint)stun_port, NULL);
-    if (turn_host && turn_port && turn_user && turn_password) {
-        nice_agent_set_relay_info(g_agent, 1, NICE_COMPONENT_TYPE_RTP, turn_host, turn_port,
-                                  turn_user, turn_password, NICE_RELAY_TYPE_TURN_UDP);
-    }
     g_stream = nice_agent_add_stream(g_agent, 1);
     if (!g_stream) return 7;
     nice_agent_set_stream_name(g_agent, g_stream, "we8");
+    if (turn_host && turn_port && turn_user && turn_password) {
+        if (!nice_agent_set_relay_info(g_agent, g_stream, NICE_COMPONENT_TYPE_RTP, turn_host, turn_port,
+                                       turn_user, turn_password, NICE_RELAY_TYPE_TURN_UDP)) {
+            output("ERROR relay-config");
+        }
+    }
     if (ice_port) nice_agent_set_port_range(g_agent, g_stream, NICE_COMPONENT_TYPE_RTP, ice_port, ice_port);
     state_handler = g_signal_connect(g_agent, "component-state-changed", G_CALLBACK(on_component_state_changed), NULL);
     gathering_handler = g_signal_connect(g_agent, "candidate-gathering-done", G_CALLBACK(on_candidate_gathering_done), NULL);

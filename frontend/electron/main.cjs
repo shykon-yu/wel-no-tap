@@ -213,6 +213,7 @@ ipcMain.handle('notap-prepare-ice', (_event, options) => notap.prepareIce(option
 ipcMain.handle('notap-prepare-libnice', (_event, options) => notap.prepareLibnice(options))
 ipcMain.handle('notap-prepare-game-ice', () => notap.prepareGameIce())
 ipcMain.handle('notap-reset-ice', () => notap.resetIce())
+ipcMain.handle('notap-reset-game-session', () => notap.resetGameSession())
 ipcMain.handle('notap-prewarm-ice', () => notap.prewarmIce())
 ipcMain.handle('notap-activate-ice', () => notap.activateIce())
 ipcMain.handle('notap-configure-ice', (_event, options) => notap.configureIce(options?.remoteDescription, options?.remoteIp))

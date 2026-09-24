@@ -42,6 +42,7 @@ declare global {
       prepareLibnice: (options: { stunHost: string; stunPort: number; turnHost?: string; turnPort?: number; turnUsername?: string; turnPassword?: string; relay: string; room: string; logicalIp: string; token: string; sessionKey?: string }) => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       prepareGameIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
       resetIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number }>
+      resetGameSession: () => Promise<boolean>
       prewarmIce: () => Promise<{ ready: boolean; state: string; localDescription?: string; error?: string }>
       activateIce: () => Promise<{ localDescription: string; directState: string; agentPort: number; hookPort: number } | null>
       configureIce: (options: { remoteDescription: string; remoteIp: string }) => Promise<boolean>

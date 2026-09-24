@@ -153,6 +153,7 @@ async function resetMatchTransport() {
   activeGamePeerAgentUsed = false
   gamePeerEpoch += 1
   gamePeerOperation = Promise.resolve(true)
+  try { await desktop()?.resetGameSession?.() } catch { /* a fresh Hook will reset itself */ }
 }
 
 function stopTransportStatusMonitor() {

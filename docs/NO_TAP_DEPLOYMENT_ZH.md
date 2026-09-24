@@ -264,7 +264,8 @@ systemd：deploy/systemd/wel-stun.service
 ```
 
 STUN 只用于收集公网 candidate 和 connectivity check。它不是比赛中继，也不能用
-`3478` 代替 `22333`。目前没有部署 TURN，直连失败仍依赖 `22333/UDP` 云中继。
+`3478` 代替 `22333`。直连失败仍依赖 `22333/UDP` 云中继；07/08 若配置 TURN，
+还会把 TURN candidate 作为 ICE 的额外候选，但不替代比赛云中继。
 
 启动后检查：
 

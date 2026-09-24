@@ -18,6 +18,7 @@
 #define WEL_ICE_CONTROL_PREFIX "WELICESTATE:"
 #define WEL_ICE_PEER_PREFIX "WELICEPEER:"
 #define WEL_ICE_REMOTE_SET_PREFIX "WELICEREMOTESET"
+#define WEL_ICE_SESSION_RESET_PREFIX "WELICESESSIONRESET"
 #define WEL_TRANSPORT_STATE_PREFIX "WELTRANSPORT:"
 #define WEL_GAME_PEER_PREFIX "WELGAMEPEER:"
 #define WEL_ICE_PING_PREFIX "WELICEPING:"
@@ -526,10 +527,16 @@ int main(int argc, char **argv) {
 			if (InetPtonA(AF_INET, command + 7, &peer_ip) == 1) {
 				notify_hook_peer(command + 7);
 				output_line("TARGET_SET %s", command + 7);
-			} else {
-				output_line("ERROR target");
-			}
-		} else if (strncmp(command, "PING_RELAY_PEER ", 16) == 0 && command[16] != '\0') {
+				} else {
+					output_line("ERROR target");
+				}
+			} else if (strcmp(command, "RESET_SESSION") == 0) {
+				if (g_hook_active && g_local_socket != INVALID_SOCKET && g_hook_address.sin_port != 0) {
+					sendto(g_local_socket, WEL_ICE_SESSION_RESET_PREFIX,
+						(int)strlen(WEL_ICE_SESSION_RESET_PREFIX), 0,
+						(const struct sockaddr *)&g_hook_address, sizeof(g_hook_address));
+				}
+			} else if (strncmp(command, "PING_RELAY_PEER ", 16) == 0 && command[16] != '\0') {
 			char *space = strchr(command + 16, ' ');
 			if (space != NULL && space[1] != '\0') {
 				char nonce[64];

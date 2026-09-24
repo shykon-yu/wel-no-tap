@@ -21,6 +21,7 @@
 #define WELNPT_ICE_AGENT_PREFIX "WELICEAGENT:"
 #define WELNPT_ICE_PEER_PREFIX "WELICEPEER:"
 #define WELNPT_ICE_REMOTE_SET_PREFIX "WELICEREMOTESET"
+#define WELNPT_ICE_SESSION_RESET_PREFIX "WELICESESSIONRESET"
 #define WELNPT_TRANSPORT_STATE_PREFIX "WELTRANSPORT:"
 #define WELNPT_GAME_PEER_PREFIX "WELGAMEPEER:"
 #define WELNPT_GAME_PATH_PENDING 0
@@ -141,6 +142,15 @@ static void lock_relay_for_decision(const char *reason) {
         log_line("\"api\":\"session-state\",\"state\":\"SESSION_ACTIVE\",\"generation\":%lu,\"path\":\"relay\",\"reason\":\"%s\"",
             (unsigned long)InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0), reason);
     }
+}
+
+static void demote_direct_path_to_relay(const char *reason) {
+    LONG previous = InterlockedCompareExchange(&g_game_path, 0, 0);
+    if (previous != WELNPT_GAME_PATH_DIRECT) return;
+    InterlockedExchange(&g_direct_connected, 0);
+    InterlockedExchange(&g_game_path, WELNPT_GAME_PATH_RELAY);
+    log_line("\"api\":\"transport-lock\",\"path\":\"relay\",\"reason\":\"%s\"", reason);
+    notify_agent_transport_state("relay");
 }
 
 static int payload_has_prefix(const char *payload, int length, const unsigned char *prefix, size_t prefix_length) {
@@ -462,8 +472,8 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
             WSASetLastError(0);
             return length;
         }
-        /* A transient local send error must not rewrite the session path. ICE
-           owns path failure and will report a new session decision explicitly. */
+        /* Keep the receive side consistent with this send-side failure. */
+        demote_direct_path_to_relay("direct-send-failed");
     }
     sent = g_real_sendto(g_transport, packet, (int)sizeof(*header) + length, 0,
         (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
@@ -854,6 +864,11 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
             }
             continue;
         }
+        if (received == (int)strlen(WELNPT_ICE_SESSION_RESET_PREFIX) &&
+            memcmp(packet, WELNPT_ICE_SESSION_RESET_PREFIX, strlen(WELNPT_ICE_SESSION_RESET_PREFIX)) == 0) {
+            reset_game_session("control-reset");
+            continue;
+        }
         if (received > (int)strlen(WELNPT_ICE_STATE_PREFIX) &&
             memcmp(packet, WELNPT_ICE_STATE_PREFIX, strlen(WELNPT_ICE_STATE_PREFIX)) == 0) {
             const char *state = packet + strlen(WELNPT_ICE_STATE_PREFIX);
@@ -882,9 +897,10 @@ static DWORD WINAPI direct_receive_thread(LPVOID unused) {
                 lock_relay_for_decision("ice-failed");
                 selected = InterlockedCompareExchange(&g_game_path, 0, 0);
             } else if ((failed || disconnected) && selected == WELNPT_GAME_PATH_DIRECT) {
-                /* Once this match has reached direct, ICE status changes during
-                   menu/halftime must not demote the game's established path. */
-                selected = WELNPT_GAME_PATH_DIRECT;
+                /* Keep send and receive on the same path when the established
+                   ICE pair is no longer usable. */
+                demote_direct_path_to_relay(disconnected ? "ice-disconnected" : "ice-failed");
+                selected = WELNPT_GAME_PATH_RELAY;
             }
             InterlockedExchange(&g_direct_connected, connected && selected == WELNPT_GAME_PATH_DIRECT);
             log_line("\"api\":\"direct-state\",\"state\":\"%.*s\"", received - (int)strlen(WELNPT_ICE_STATE_PREFIX), state);

@@ -207,15 +207,9 @@ function updateTransportPathFromLog() {
 
 function transportStatus() {
   updateTransportPathFromLog()
-  // The diagnostic JSONL is intentionally disabled in production.  The ICE
-  // helper still reports its state over the loopback control channel, so use
-  // that in-memory state as a fallback for the UI when the Hook state packet
-  // or the optional log has not arrived yet.
-  let pathName = transportPath
-  if (pathName === 'pending') {
-    if (iceState === 'connected' || iceState === 'completed' || iceState === 'ready') pathName = 'direct'
-    else if (iceState === 'failed') pathName = 'relay'
-  }
+  // ICE state is only a candidate/connectivity diagnostic. The Hook's
+  // transport-lock event is the source of truth for the actual game path.
+  const pathName = transportPath
   const summary = pathName === 'direct'
     ? '当前联机：P2P 直连'
     : pathName === 'relay'
@@ -679,6 +673,7 @@ async function prepareLibnice(options) {
     appendAgentEvent('libnice', 'stopped', { code: code ?? null })
   })
   await waitForIceCandidate(child, 26000)
+  void prewarmIce()
   return { localDescription: iceLocalDescription, directState: iceState, agentPort: iceAgentPort, hookPort: iceHookPort }
 }
 
@@ -715,6 +710,7 @@ async function prepareIce(options) {
 async function resetIce() {
   if (!iceOptions) throw new Error('直连组件尚未准备')
   if (iceOptions.implementation === 'libnice') {
+    await clearStandbyAgent()
     return prepareLibnice(iceOptions)
   }
   await clearStandbyAgent()
@@ -769,7 +765,6 @@ function attachActiveIceProcess(child) {
 
 async function prewarmIce() {
   if (!iceOptions) return { ready: false, state: 'waiting' }
-  if (iceOptions.implementation === 'libnice') return { ready: false, state: 'not-supported' }
   if (standbyAgentKey && probeAgents.has(standbyAgentKey)) return { ready: true, state: 'ready' }
   if (standbyPromise) return standbyPromise
   const generation = standbyGeneration
@@ -869,6 +864,16 @@ function setRemoteIce(remoteDescription, remoteIp = '') {
   return true
 }
 
+function resetGameSession() {
+  if (!iceProcess || iceProcess.killed) return false
+  try {
+    iceProcess.stdin.write('RESET_SESSION\n')
+    return true
+  } catch {
+    return false
+  }
+}
+
 function onGamePeer(listener) {
   if (typeof listener !== 'function') return () => {}
   gamePeerListeners.add(listener)
@@ -903,9 +908,9 @@ function stopProbeIce(probeKey) {
   return { stopped: true }
 }
 
-function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '', icePort = 0, upnpMapping = null }) {
-  const executable = locate(iceCandidates())
-  if (!executable) return Promise.reject(new Error('缺少 welnptice.exe，请重新解压完整客户端'))
+function createProbeIce({ implementation = 'libjuice', stunHost, stunPort, turnHost = '', turnPort = 0, turnUsername = '', turnPassword = '', standby = false, hookPort = 0, relay = '', room = '', logicalIp = '', token = '', sessionKey = '', icePort = 0, upnpMapping = null }) {
+  const executable = locate(implementation === 'libnice' ? libniceCandidates() : iceCandidates())
+  if (!executable) return Promise.reject(new Error(implementation === 'libnice' ? '缺少 libnice ICE 组件 welnptnice.exe' : '缺少 welnptice.exe，请重新解压完整客户端'))
   const key = randomProbeKey()
   const environment = { ...process.env }
   if (standby && relay && room && logicalIp && token) {
@@ -920,9 +925,18 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     delete environment.WEL_NOTAP_TOKEN
   }
   const args = ['--stun-host', String(stunHost || ''), '--stun-port', String(stunPort || 0)]
-  if (icePort) args.push('--ice-port', String(icePort))
-  if (standby) args.push('--hook-port', String(hookPort || 0), '--standby')
-  else args.push('--no-hook')
+  if (implementation === 'libnice') {
+    args.push('--turn-host', String(turnHost || ''), '--turn-port', String(turnPort || 0),
+      '--turn-user', String(turnUsername || ''), '--turn-password', String(turnPassword || ''),
+      '--hook-port', String(hookPort || 0), '--room', String(room || ''),
+      '--logical-ip', String(logicalIp || ''), '--relay', String(relay || ''),
+      '--token', String(token || ''), '--session-key', String(sessionKey || Date.now().toString(36)))
+    if (standby) args.push('--standby')
+  } else {
+    if (icePort) args.push('--ice-port', String(icePort))
+    if (standby) args.push('--hook-port', String(hookPort || 0), '--standby')
+    else args.push('--no-hook')
+  }
   const child = spawn(executable, args, {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: environment,
   })
@@ -931,7 +945,7 @@ function createProbeIce({ stunHost, stunPort, standby = false, hookPort = 0, rel
     buffer: '', sdpBuffer: '', readingSdp: false, error: '', remoteError: '',
     remoteWaiter: null, pingUnavailable: false, pendingPing: null,
     retryTimer: null, timeoutTimer: null, standby, hookPort: Number(hookPort) || 0, upnpMapping,
-    options: { stunHost, stunPort, relay, room, logicalIp, token },
+    options: { implementation, stunHost, stunPort, turnHost, turnPort, turnUsername, turnPassword, relay, room, logicalIp, token, sessionKey },
   }
   appendAgentEvent(standby ? 'standby' : 'probe', 'started', { key, stunHost, stunPort, hookPort: Number(hookPort) || 0 })
   probeAgents.set(key, probe)
@@ -1301,6 +1315,7 @@ function pingHost(host) {
 
 module.exports = {
   configureIce: setRemoteIce,
+  resetGameSession,
   onGamePeer,
   disconnect,
   launch,

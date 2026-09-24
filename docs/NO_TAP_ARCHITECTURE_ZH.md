@@ -143,8 +143,9 @@ Go API 通过 `connection_mode` 将房间分成明确流程：
 | 直连 08 | `10.123.8.0/24` | `libnice` | 同上 |
 
 中继房间的 ICE 接口由服务端拒绝，避免异常客户端混用两种模式。07/08 使用独立的
-libnice helper，失败时仍回到现有 WEL 云中继；当前服务器是 STUN-only，没有 TURN，不能
-把 WEL 云中继误称为 libnice 内置中继。直连和中继房间都保留
+libnice helper，失败时仍回到现有 WEL 云中继；07/08 在 coturn 启用并由 API 下发凭据时
+可使用 TURN candidate，否则仍使用 STUN candidate。最终游戏中继仍是独立的 WEL 云中继，
+不能把两者混称。直连和中继房间都保留
 `welnpt.dll` Hook，因为搜索广播、加入包和比赛 UDP 的虚拟 Socket 搬运仍依赖 Hook。
 网卡 05/06 不启动无网卡 Hook/ICE，而是使用独立的 TAP/n2n 客户端流程。
 

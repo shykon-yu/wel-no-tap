@@ -20,11 +20,12 @@
 | MySQL | 现有平台基础设施 | 是 | `platform_*` 和 `no_tap_*` 数据 | 仅内网/容器网络 |
 | Redis | 现有平台基础设施 | 是 | Go API 会话与在线状态 | 仅内网/容器网络 |
 | `welnpt-notap-relay` | 本仓库，systemd | 是 | 搜索、加入、直连未成功时的游戏数据中继 | `22333/UDP` |
-| coturn（STUN-only） | 本仓库配置，systemd | 是 | 给 ICE 收集公网 `srflx` candidate | `3478/UDP` |
+| coturn（STUN，TURN 可选） | 本仓库配置，systemd | 是 | 给 ICE 收集 `srflx` candidate；启用凭据后为 07/08 提供 TURN candidate | `3478/UDP` |
 | Nginx/TLS | 现有 Web 入口 | 推荐 | HTTPS、域名和 API 反向代理 | `80/443 TCP` |
 
 `welnptice.exe`、`welnpt.dll` 在玩家电脑上运行；服务器不运行 ICE agent。STUN
-只协助打洞，不能代替中继。没有 TURN：无法打洞的玩家必须能访问 `22333/UDP` 回退。
+STUN/TURN 只服务 ICE 协商，不能代替比赛云中继；无法使用 P2P 的玩家仍必须能访问
+`22333/UDP` 回退。
 
 如果新服务器还承载旧 TAP/n2n 平台，旧服务可继续运行，但必须保持独立：
 
@@ -249,8 +250,9 @@ sudo journalctl -u welnpt-notap-relay -n 100 --no-pager
 
 ## 7. 部署 STUN
 
-安装本仓库的 STUN-only coturn 配置。此配置不启用 TURN，因此只需要 `3478/UDP`，不需要
-开放 TURN relay 端口段。
+安装本仓库的 coturn 配置。默认配置为 STUN-only；启用 TURN 时使用同一 `3478/UDP`
+端口，并同步配置凭据。若改为独立 relay 端口段，必须同步开放对应 UDP 范围并更新 API
+环境变量。
 
 ```bash
 sudo install -d -o coturn -g coturn -m 0755 /var/log/coturn

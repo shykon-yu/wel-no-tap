@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('welNoTapDesktop', {
   prepareLibnice: (options) => ipcRenderer.invoke('notap-prepare-libnice', options),
   prepareGameIce: () => ipcRenderer.invoke('notap-prepare-game-ice'),
   resetIce: () => ipcRenderer.invoke('notap-reset-ice'),
+  resetGameSession: () => ipcRenderer.invoke('notap-reset-game-session'),
   prewarmIce: () => ipcRenderer.invoke('notap-prewarm-ice'),
   activateIce: () => ipcRenderer.invoke('notap-activate-ice'),
   configureIce: (options) => ipcRenderer.invoke('notap-configure-ice', options),
