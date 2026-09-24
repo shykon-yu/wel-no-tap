@@ -207,7 +207,15 @@ function updateTransportPathFromLog() {
 
 function transportStatus() {
   updateTransportPathFromLog()
-  const pathName = transportPath
+  // The diagnostic JSONL is intentionally disabled in production.  The ICE
+  // helper still reports its state over the loopback control channel, so use
+  // that in-memory state as a fallback for the UI when the Hook state packet
+  // or the optional log has not arrived yet.
+  let pathName = transportPath
+  if (pathName === 'pending') {
+    if (iceState === 'connected' || iceState === 'completed' || iceState === 'ready') pathName = 'direct'
+    else if (iceState === 'failed') pathName = 'relay'
+  }
   const summary = pathName === 'direct'
     ? '当前联机：P2P 直连'
     : pathName === 'relay'
@@ -483,11 +491,14 @@ function handleIceLine(rawLine) {
   }
   if (line.startsWith('GATHERING_STARTED ')) { iceState = 'gathering'; rememberAgentLine('active', line); return }
   if (line.startsWith('STATE ')) {
-    iceState = line.slice(6) || 'unknown'
+    // libnice emits enum names in uppercase (for example READY), while
+    // libjuice emits lowercase names. Keep one normalized state for the UI
+    // and readiness checks.
+    iceState = (line.slice(6) || 'unknown').trim().toLowerCase()
     rememberAgentLine('active', line)
     // The next slot is prepared as soon as the active agent has a peer. This
     // keeps a quick game exit from leaving the next launch cold.
-    if ((iceState === 'connected' || iceState === 'completed') && lastRemoteDescription) void prewarmIce()
+    if ((iceState === 'connected' || iceState === 'completed' || iceState === 'ready') && lastRemoteDescription) void prewarmIce()
     return
   }
   if (line.startsWith('TRANSPORT_STATE ')) {

@@ -142,10 +142,18 @@ async function ensureWindowsFirewall(event, options = {}) {
 }
 
 async function launchGameWithRecovery(event, options) {
-  if (options?.mode === 'tap') {
+  const mode = String(options?.mode || '').trim().toLowerCase()
+  const tapNetwork = tap.activeNetwork()
+  const hasTapNetwork = Boolean(tapNetwork?.connected && tapNetwork?.actualIp && tapNetwork?.subnetCidr)
+  const hasNoTapCredentials = Boolean(options?.relay && options?.room && options?.logicalIp && options?.token)
+  // Older room sessions did not persist connection_mode.  A live TAP lease
+  // has no No-TAP relay credentials, so it is safe to route that legacy call
+  // to the TAP launcher instead of showing a misleading credential error.
+  const legacyTapLaunch = hasTapNetwork && !hasNoTapCredentials && mode !== 'direct' && mode !== 'libnice'
+  if (mode === 'tap' || legacyTapLaunch) {
     try {
       const firewallResult = await ensureWe8Firewall(options.gamePath)
-      const launchResult = await tapGame.launchGameBound(options.gamePath, tap.activeNetwork())
+      const launchResult = await tapGame.launchGameBound(options.gamePath, tapNetwork)
       return {
         ...launchResult,
         warnings: [...(firewallResult.warnings || []), ...(launchResult.warnings || [])],

@@ -334,9 +334,10 @@ async function prepareRoomTools(lease: Lease, epoch: number): Promise<'ready' | 
   } catch (error) {
     if (!isCurrentRoomPreparation(lease, epoch)) return 'relay-only'
     directCandidateStatus.value = 'relay-only'
-    directCandidateMessage.value = '直连候选暂未就绪，当前使用中继'
+    const detail = messageOf(error)
+    directCandidateMessage.value = detail ? `直连候选未就绪，当前使用中继（${detail}）` : '直连候选未就绪，当前使用中继'
     notice.value = `已进入房间，${directCandidateMessage.value}`
-    console.warn('直连组件准备失败', messageOf(error))
+    console.warn('直连组件准备失败', detail)
     // ICE is an optimization. Keep the lease and allow the game to use the
     // already available relay path when candidate collection is unavailable.
     return 'relay-only'
