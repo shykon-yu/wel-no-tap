@@ -51,6 +51,13 @@ static void hook_message(const char *prefix, const char *value) {
         sendto(g_loopback, packet, length, 0, (const struct sockaddr *)&g_hook, sizeof(g_hook));
 }
 
+static void notify_hook_agent(unsigned short port) {
+    char message[96];
+    int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%u", AGENT_PREFIX, (unsigned)port);
+    if (length > 0 && g_loopback != INVALID_SOCKET && g_hook.sin_port != 0)
+        sendto(g_loopback, message, length, 0, (const struct sockaddr *)&g_hook, sizeof(g_hook));
+}
+
 static void on_component_state_changed(NiceAgent *agent, guint stream_id, guint component_id,
                                        guint state, gpointer user_data) {
     const char *name = nice_component_state_to_string((NiceComponentState)state);
