@@ -663,8 +663,8 @@ async function configureGamePeerOnce(logicalIp: string, transactionKey: string, 
   // The key must be deterministic for both peers. A random value generated
   // independently on each client makes the answer invisible to the caller.
   const sessionKey = selfIp
-    ? `game|${[selfIp, logicalIp].sort().join('_')}|${transactionKey.split('|').slice(-1)[0]}`
-    : `game|${transactionKey}`
+    ? `game|${[selfIp, logicalIp].sort().join('_')}`
+    : `game|${transactionKey.split('|')[0] || logicalIp}`
   const needsFreshAgent = activeGamePeerAgentUsed || activeGamePeerIp !== '' || activeGamePeerTransaction !== ''
   try {
     // Once a real game peer has been observed, this agent belongs to that
