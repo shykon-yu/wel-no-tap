@@ -36,11 +36,14 @@ let transportPath = 'pending'
 let activeGamePeerIp = ''
 let iceOptions = null
 const gamePeerListeners = new Set()
+const transportListeners = new Set()
 const probeAgents = new Map()
 let standbyAgentKey = ''
 let standbyPromise = null
 let standbyGeneration = 0
 let iceUpnpMapping = null
+let iceAgentNeedsRotation = false
+let relayPresence = null
 
 function helperCandidates() {
   return [
@@ -216,6 +219,19 @@ function transportStatus() {
       ? '当前联机：云中继'
       : '游戏已启动，正在选择本场连接'
   return { path: pathName, directState: iceState, summary }
+}
+
+function notifyTransportListeners() {
+  const status = transportStatus()
+  for (const listener of transportListeners) {
+    try { listener(status) } catch {}
+  }
+}
+
+function onTransportChange(listener) {
+  if (typeof listener !== 'function') return () => {}
+  transportListeners.add(listener)
+  return () => transportListeners.delete(listener)
 }
 
 function chooseHookPort() {
@@ -400,6 +416,123 @@ function nextRelayPingNonce() {
   return String(relayPingSequence)
 }
 
+function parseRelayAddress(value) {
+  const text = String(value || '').trim()
+  const separator = text.lastIndexOf(':')
+  if (separator <= 0 || separator === text.length - 1) return null
+  const port = Number(text.slice(separator + 1))
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+  return { host: text.slice(0, separator), port }
+}
+
+function ipv4Bytes(value) {
+  const parts = String(value || '').trim().split('.').map(Number)
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null
+  return Buffer.from(parts)
+}
+
+function relayPacket(type, room, logicalIp, targetIp = '', sequence = 0) {
+  const source = ipv4Bytes(logicalIp)
+  const target = targetIp ? ipv4Bytes(targetIp) : Buffer.alloc(4)
+  if (!source || !target) return null
+  const packet = Buffer.alloc(74)
+  packet.write('WNP2', 0, 4, 'ascii')
+  packet[4] = 2
+  packet[5] = type
+  Buffer.from(String(room || '').slice(0, 32), 'utf8').copy(packet, 8)
+  source.copy(packet, 40)
+  target.copy(packet, 46)
+  packet.writeUInt32BE(Number(sequence) >>> 0, 54)
+  return packet
+}
+
+function sendRelayPresencePacket(state) {
+  const packet = relayPacket(1, state.room, state.logicalIp)
+  if (!packet || !state.socket) return
+  state.socket.send(packet, state.address.port, state.address.host)
+}
+
+async function startRelayPresence(options = {}) {
+  const address = parseRelayAddress(options.relay)
+  const logicalIp = String(options.logicalIp || '').trim()
+  const room = String(options.room || '')
+  if (!address || !ipv4Bytes(logicalIp) || !room) throw new Error('中继探测参数不完整')
+  await stopRelayPresence()
+  const socket = dgram.createSocket('udp4')
+  const state = { socket, address, room, logicalIp, pending: null, timer: null }
+  relayPresence = state
+  socket.on('message', (message) => {
+    if (!relayPresence || relayPresence !== state || message.length < 74 || message.toString('ascii', 0, 4) !== 'WNP2' || message[4] !== 2) return
+    if (message.toString('utf8', 8, 40).replace(/\0+$/g, '') !== room.slice(0, 32)) return
+    const type = message[5]
+    const target = message.subarray(46, 50)
+    const own = ipv4Bytes(logicalIp)
+    if (!own) return
+    if (type === 3 && target.equals(own)) {
+      const pong = Buffer.from(message)
+      pong[5] = 4
+      message.subarray(40, 44).copy(pong, 46)
+      own.copy(pong, 40)
+      socket.send(pong, address.port, address.host)
+      return
+    }
+    if (type !== 4 || !state.pending) return
+    const sequence = message.readUInt32BE(54)
+    if (sequence !== state.pending.sequence) return
+    const pending = state.pending
+    state.pending = null
+    if (pending.timer) clearTimeout(pending.timer)
+    pending.resolve(Number(process.hrtime.bigint() - pending.started) / 1e6)
+  })
+  await new Promise((resolve, reject) => {
+    socket.once('error', reject)
+    socket.bind(0, '0.0.0.0', () => {
+      socket.removeListener('error', reject)
+      resolve()
+    })
+  })
+  sendRelayPresencePacket(state)
+  state.timer = setInterval(() => sendRelayPresencePacket(state), 2000)
+  return { started: true }
+}
+
+async function stopRelayPresence() {
+  const state = relayPresence
+  relayPresence = null
+  if (!state) return
+  if (state.timer) clearInterval(state.timer)
+  if (state.pending) {
+    if (state.pending.timer) clearTimeout(state.pending.timer)
+    state.pending.reject(new Error('已退出房间，中继探测已取消'))
+    state.pending = null
+  }
+  try { state.socket.close() } catch {}
+}
+
+function pingRelayPresence(targetIp = '') {
+  const state = relayPresence
+  if (!state) return Promise.reject(new Error('中继探测未准备'))
+  if (state.pending) return Promise.reject(new Error('中继探测进行中'))
+  const sequence = Number(nextRelayPingNonce()) >>> 0
+  const packet = relayPacket(3, state.room, state.logicalIp, targetIp, sequence)
+  if (!packet) return Promise.reject(new Error('中继玩家逻辑 IP 无效'))
+  return new Promise((resolve, reject) => {
+    const pending = { sequence, started: process.hrtime.bigint(), resolve, reject, timer: null }
+    state.pending = pending
+    pending.timer = setTimeout(() => {
+      if (state.pending !== pending) return
+      state.pending = null
+      reject(new Error(targetIp ? '中继玩家探测超时' : '中继探测超时'))
+    }, targetIp ? 8000 : 5000)
+    state.socket.send(packet, state.address.port, state.address.host, (error) => {
+      if (!error || state.pending !== pending) return
+      state.pending = null
+      clearTimeout(pending.timer)
+      reject(new Error('中继探测不可用'))
+    })
+  })
+}
+
 function rememberIceDiagnostic(rawLine) {
   const line = String(rawLine || '').replace(/[\r\n]+/g, ' ').trim()
   if (!line || line === 'LOCAL_SDP_BEGIN' || line === 'LOCAL_SDP_END' || line.startsWith('a=')) return
@@ -451,7 +584,7 @@ function activeIceAgentIsReadyAndClean() {
   return Boolean(
     iceProcess && !iceProcess.killed && iceAgentPort && iceHookPort &&
     hasUsableIceCandidate(iceLocalDescription) &&
-    !lastRemoteDescription && !activeGamePeerIp && iceState !== 'failed',
+    !lastRemoteDescription && !activeGamePeerIp && !iceAgentNeedsRotation && iceState !== 'failed',
   )
 }
 
@@ -499,6 +632,7 @@ function handleIceLine(rawLine) {
     const state = line.slice(16).trim()
     if (state === 'pending' || state === 'direct' || state === 'relay') transportPath = state
     appendAgentEvent('active', 'transport-state', { state })
+    notifyTransportListeners()
     return
   }
   if (line.startsWith('CANDIDATE ') || line.startsWith('SELECTED_CANDIDATES ') || line.startsWith('SELECTED_ADDRESSES ')) {
@@ -587,6 +721,7 @@ async function startIceAgent({ stunHost, stunPort, relay, room, logicalIp, token
   iceSdpBuffer = ''
   readingIceSdp = false
   iceExitError = ''
+  iceAgentNeedsRotation = false
   iceDiagnostics = []
   lastRemoteDescription = ''
   activeGamePeerIp = ''
@@ -644,6 +779,7 @@ async function prepareLibnice(options) {
   iceOptions = { ...options, implementation: 'libnice' }
   lastRemoteDescription = ''
   activeGamePeerIp = ''
+  iceAgentNeedsRotation = false
   const child = spawn(executable, [
     '--stun-host', String(options?.stunHost || ''), '--stun-port', String(options?.stunPort || 0),
     '--turn-host', String(options?.turnHost || ''), '--turn-port', String(options?.turnPort || 0),
@@ -827,6 +963,7 @@ async function activateIce() {
   standby.upnpMapping = null
   iceState = 'gathering'
   iceExitError = ''
+  iceAgentNeedsRotation = false
   iceDiagnostics = []
   iceLineBuffer = ''
   iceSdpBuffer = ''
@@ -868,6 +1005,7 @@ function resetGameSession() {
   // A new match must not inherit the previous remote SDP or peer binding.
   // Clear the controller state before notifying the Hook so a stale ICE
   // result cannot be applied to the next match.
+  iceAgentNeedsRotation = Boolean(lastRemoteDescription || activeGamePeerIp)
   lastRemoteDescription = ''
   activeGamePeerIp = ''
   transportPath = 'pending'
@@ -1099,7 +1237,7 @@ function pingProbeIce(probeKey) {
 }
 
 function pingRelay() {
-  if (!iceProcess) return Promise.reject(new Error('中继探测未准备'))
+  if (!iceProcess) return pingRelayPresence()
   if (pendingRelayPing) return pendingRelayPing.promise
   const nonce = nextRelayPingNonce()
   let pending
@@ -1143,8 +1281,8 @@ function startNextRelayPeerPing() {
 }
 
 function pingRelayPeer(remoteIp) {
-  if (!iceProcess) return Promise.reject(new Error('中继玩家探测未准备'))
   if (!remoteIp) return Promise.reject(new Error('对方逻辑 IP 未知'))
+  if (!iceProcess) return pingRelayPresence(String(remoteIp).trim())
   return new Promise((resolve, reject) => {
     relayPeerPingQueue.push({ nonce: '', resolve, reject, retryTimer: null, timeoutTimer: null, remoteIp: String(remoteIp).trim() })
     startNextRelayPeerPing()
@@ -1281,6 +1419,7 @@ async function disconnect() {
     try { iceProcess.kill() } catch {}
   }
   iceProcess = null
+  await stopRelayPresence()
   releaseUpnpMapping(iceUpnpMapping)
   iceUpnpMapping = null
   await clearStandbyAgent()
@@ -1307,6 +1446,7 @@ async function disconnect() {
   resetTransportTracking()
   sessionLogPath = ''
   iceExitError = ''
+  iceAgentNeedsRotation = false
   iceDiagnostics = []
   for (const probeKey of [...probeAgents.keys()]) stopProbeIce(probeKey)
   return { stopped: true }
@@ -1338,4 +1478,6 @@ module.exports = {
   activateIce,
   pingRelay,
   pingRelayPeer,
+  startRelayPresence,
+  onTransportChange,
 }

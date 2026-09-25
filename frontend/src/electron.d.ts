@@ -50,6 +50,7 @@ declare global {
       onTransportChange: (callback: (status: { path: 'pending' | 'relay' | 'direct'; directState: string; summary: string }) => void) => () => void
       pingRelay: () => Promise<number>
       pingRelayPeer: (remoteIp: string) => Promise<number>
+      startRelayPresence: (options: { relay: string; room: string; logicalIp: string }) => Promise<{ started: boolean }>
       tapPingPeer: (remoteIp: string) => Promise<PingResult>
       tapStatus: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>
       tapPrepare: () => Promise<DesktopLeaseStatus & { adapterReady?: boolean; tapNode?: string }>

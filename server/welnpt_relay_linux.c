@@ -250,7 +250,10 @@ int main(int argc, char **argv) {
                 continue;
             }
         } else if (header->type == WELNPT_PACKET_PING || header->type == WELNPT_PACKET_PONG) {
-            peer = upsert_peer_in(g_diagnostic_peers, header, &source, now);
+            /* Diagnostics use the same registered room endpoint as game data.
+               This is important for clients that send REGISTER heartbeats but
+               only issue PING when the user presses the room Ping button. */
+            peer = upsert_peer_in(g_peers, header, &source, now);
             if (peer == NULL) {
                 ++g_stats.route_drops;
                 continue;
@@ -261,8 +264,7 @@ int main(int argc, char **argv) {
             if (delivered == 0) ++g_stats.route_drops;
         } else if (header->type == WELNPT_PACKET_PING) {
             if (header->target_ip != 0 && header->target_ip != htonl(INADDR_BROADCAST)) {
-                /* Diagnostic endpoints are isolated from game routing endpoints. */
-                delivered = forward_packet_in(g_diagnostic_peers, socket_handle,
+                delivered = forward_packet_in(g_peers, socket_handle,
                     packet, (size_t)received, header, now);
                 if (delivered == 0) ++g_stats.route_drops;
             } else {
@@ -279,7 +281,7 @@ int main(int argc, char **argv) {
             }
         } else if (header->type == WELNPT_PACKET_PONG) {
             /* 转发式 PING 的回包：按 target_ip 转发回发起方 */
-            delivered = forward_packet_in(g_diagnostic_peers, socket_handle,
+            delivered = forward_packet_in(g_peers, socket_handle,
                 packet, (size_t)received, header, now);
             if (delivered == 0) ++g_stats.route_drops;
         }

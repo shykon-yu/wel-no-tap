@@ -219,6 +219,7 @@ ipcMain.handle('notap-activate-ice', () => notap.activateIce())
 ipcMain.handle('notap-configure-ice', (_event, options) => notap.configureIce(options?.remoteDescription, options?.remoteIp))
 ipcMain.handle('notap-ping-relay', () => notap.pingRelay())
 ipcMain.handle('notap-ping-relay-peer', (_event, remoteIp) => notap.pingRelayPeer(remoteIp))
+ipcMain.handle('notap-start-relay-presence', (_event, options) => notap.startRelayPresence(options))
 ipcMain.handle('tap-ping-peer', (_event, remoteIp) => tap.pingHost(remoteIp))
 ipcMain.handle('notap-choose-game', chooseGame)
 ipcMain.handle('notap-launch-game', launchGameWithRecovery)
@@ -229,6 +230,10 @@ ipcMain.handle('tap-transport-status', () => tap.transportStatus())
 ipcMain.handle('tap-disconnect', () => tap.stopConnection())
 ipcMain.handle('tap-inspect', () => tap.activeNetwork())
 ipcMain.handle('platform-complete-quit', finishQuit)
+
+notap.onTransportChange((status) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-transport-change', status)
+})
 
 notap.onGamePeer((logicalIp) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notap-game-peer', logicalIp)

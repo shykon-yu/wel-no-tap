@@ -169,8 +169,18 @@ int wmain(int argc, wchar_t **argv) {
         } else if (header->type == WELNPT_PACKET_DATA) {
             forward_data(socket_handle, packet, received, header);
         } else if (header->type == WELNPT_PACKET_PING) {
-            header->type = WELNPT_PACKET_PONG;
-            sendto(socket_handle, packet, received, 0, (const struct sockaddr *)&source, sizeof(source));
+            /* target_ip == 0 is the relay health check. A non-zero target is
+               a peer ping and must make a round trip through that player. */
+            if (header->target_ip == 0 || header->target_ip == INADDR_BROADCAST) {
+                header->type = WELNPT_PACKET_PONG;
+                sendto(socket_handle, packet, received, 0, (const struct sockaddr *)&source, sizeof(source));
+            } else {
+                forward_data(socket_handle, packet, received, header);
+            }
+        } else if (header->type == WELNPT_PACKET_PONG) {
+            /* The target player changes the PING to PONG and addresses it
+               back to the original logical source. */
+            forward_data(socket_handle, packet, received, header);
         }
     }
 }

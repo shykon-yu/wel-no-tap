@@ -21,17 +21,28 @@
 #define TRANSPORT_PREFIX "WELTRANSPORT:"
 #define GAME_PEER_PREFIX "WELGAMEPEER:"
 #define BUFFER_SIZE 8192
+#define RELAY_HEARTBEAT_MS 2000
 
 static NiceAgent *g_agent;
 static guint g_stream;
 static SOCKET g_loopback = INVALID_SOCKET;
+static SOCKET g_relay_socket = INVALID_SOCKET;
 static struct sockaddr_in g_hook;
+static struct sockaddr_in g_relay_address;
 static unsigned short g_local_port;
+static char g_room[WELNPT_ROOM_LENGTH];
+static uint32_t g_logical_ip;
 static volatile LONG g_stopping;
 static volatile LONG g_connected;
 static volatile LONG g_hook_active;
 static volatile LONG g_standby;
 static CRITICAL_SECTION g_output_lock;
+static CRITICAL_SECTION g_ping_lock;
+static char g_relay_ping_nonce[64];
+static char g_relay_peer_ping_nonce[64];
+static LARGE_INTEGER g_relay_ping_started;
+static LARGE_INTEGER g_relay_peer_ping_started;
+static LARGE_INTEGER g_perf_frequency;
 
 static void output(const char *format, ...) {
     va_list args;
@@ -56,6 +67,94 @@ static void notify_hook_agent(unsigned short port) {
     int length = _snprintf_s(message, sizeof(message), _TRUNCATE, "%s%u", AGENT_PREFIX, (unsigned)port);
     if (length > 0 && g_loopback != INVALID_SOCKET && g_hook.sin_port != 0)
         sendto(g_loopback, message, length, 0, (const struct sockaddr *)&g_hook, sizeof(g_hook));
+}
+
+static double elapsed_milliseconds(LARGE_INTEGER started) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - started.QuadPart) * 1000.0 / (double)g_perf_frequency.QuadPart;
+}
+
+static void send_relay_presence(void) {
+    welnpt_packet_header header;
+    if (g_relay_socket == INVALID_SOCKET || g_logical_ip == 0) return;
+    welnpt_initialize_header(&header, WELNPT_PACKET_REGISTER);
+    CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
+    header.source_ip = g_logical_ip;
+    sendto(g_relay_socket, (const char *)&header, sizeof(header), 0,
+        (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+}
+
+static void send_relay_ping(const char *nonce, uint32_t target_ip) {
+    welnpt_packet_header header;
+    if (g_relay_socket == INVALID_SOCKET || g_logical_ip == 0) {
+        output(target_ip == 0 ? "RELAY_PING_UNAVAILABLE %s" : "RELAY_PEER_PING_UNAVAILABLE %s", nonce);
+        return;
+    }
+    EnterCriticalSection(&g_ping_lock);
+    if (target_ip == 0) {
+        strncpy_s(g_relay_ping_nonce, sizeof(g_relay_ping_nonce), nonce, _TRUNCATE);
+        QueryPerformanceCounter(&g_relay_ping_started);
+    } else {
+        strncpy_s(g_relay_peer_ping_nonce, sizeof(g_relay_peer_ping_nonce), nonce, _TRUNCATE);
+        QueryPerformanceCounter(&g_relay_peer_ping_started);
+    }
+    welnpt_initialize_header(&header, WELNPT_PACKET_PING);
+    CopyMemory(header.room, g_room, WELNPT_ROOM_LENGTH);
+    header.source_ip = g_logical_ip;
+    header.target_ip = target_ip;
+    header.sequence = htonl((uint32_t)strtoul(nonce, NULL, 10));
+    if (sendto(g_relay_socket, (const char *)&header, sizeof(header), 0,
+        (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address)) == SOCKET_ERROR) {
+        if (target_ip == 0) g_relay_ping_nonce[0] = '\0';
+        else g_relay_peer_ping_nonce[0] = '\0';
+        output(target_ip == 0 ? "RELAY_PING_UNAVAILABLE %s" : "RELAY_PEER_PING_UNAVAILABLE %s", nonce);
+    }
+    LeaveCriticalSection(&g_ping_lock);
+}
+
+static DWORD WINAPI relay_thread(LPVOID unused) {
+    char packet[sizeof(welnpt_packet_header) + WELNPT_MAX_PAYLOAD];
+    ULONGLONG next_presence = 0;
+    (void)unused;
+    while (!InterlockedCompareExchange(&g_stopping, 0, 0)) {
+        struct sockaddr_in source;
+        int source_length = sizeof(source);
+        int received;
+        if (GetTickCount64() >= next_presence) {
+            send_relay_presence();
+            next_presence = GetTickCount64() + RELAY_HEARTBEAT_MS;
+        }
+        received = recvfrom(g_relay_socket, packet, sizeof(packet), 0,
+            (struct sockaddr *)&source, &source_length);
+        if (received == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            if (error == WSAETIMEDOUT || error == WSAEWOULDBLOCK) continue;
+            break;
+        }
+        if (received < (int)sizeof(welnpt_packet_header)) continue;
+        welnpt_packet_header *header = (welnpt_packet_header *)packet;
+        if (!welnpt_valid_header(header) || memcmp(header->room, g_room, WELNPT_ROOM_LENGTH) != 0) continue;
+        if (header->type == WELNPT_PACKET_PING && header->target_ip == g_logical_ip) {
+            header->type = WELNPT_PACKET_PONG;
+            header->target_ip = header->source_ip;
+            header->source_ip = g_logical_ip;
+            sendto(g_relay_socket, packet, received, 0,
+                (const struct sockaddr *)&g_relay_address, sizeof(g_relay_address));
+            continue;
+        }
+        if (header->type != WELNPT_PACKET_PONG) continue;
+        EnterCriticalSection(&g_ping_lock);
+        if (g_relay_ping_nonce[0] != '\0' && ntohl(header->sequence) == (uint32_t)strtoul(g_relay_ping_nonce, NULL, 10)) {
+            output("RELAY_PING_RESULT %s %.1f", g_relay_ping_nonce, elapsed_milliseconds(g_relay_ping_started));
+            g_relay_ping_nonce[0] = '\0';
+        } else if (g_relay_peer_ping_nonce[0] != '\0' && ntohl(header->sequence) == (uint32_t)strtoul(g_relay_peer_ping_nonce, NULL, 10)) {
+            output("RELAY_PEER_PING_RESULT %s %.1f", g_relay_peer_ping_nonce, elapsed_milliseconds(g_relay_peer_ping_started));
+            g_relay_peer_ping_nonce[0] = '\0';
+        }
+        LeaveCriticalSection(&g_ping_lock);
+    }
+    return 0;
 }
 
 static void on_component_state_changed(NiceAgent *agent, guint stream_id, guint component_id,
@@ -165,6 +264,17 @@ static DWORD WINAPI command_thread(LPVOID unused) {
             InterlockedExchange(&g_hook_active, 1);
             notify_hook_agent(g_local_port);
             hook_message(CONTROL_PREFIX, "connecting");
+        } else if (!strncmp(command, "PING_RELAY_PEER ", 17) && command[17] != '\0') {
+            char *space = strchr(command + 17, ' ');
+            uint32_t target_ip;
+            if (space != NULL && space[1] != '\0' && InetPtonA(AF_INET, space + 1, &target_ip) == 1) {
+                *space = '\0';
+                send_relay_ping(command + 17, target_ip);
+            } else {
+                output("RELAY_PEER_PING_UNAVAILABLE %s", command + 17);
+            }
+        } else if (!strncmp(command, "PING_RELAY ", 12) && command[12] != '\0') {
+            send_relay_ping(command + 12, 0);
         }
     }
     InterlockedExchange(&g_stopping, 1);
@@ -174,10 +284,11 @@ static DWORD WINAPI command_thread(LPVOID unused) {
 int main(int argc, char **argv) {
     const char *stun_host = NULL;
     const char *turn_host = NULL, *turn_user = NULL, *turn_password = NULL;
+    const char *relay = NULL, *room_name = NULL, *logical_ip = NULL;
     unsigned short stun_port = 0, turn_port = 0, hook_port = 0, ice_port = 0;
     WSADATA winsock;
     struct sockaddr_in local;
-    HANDLE receiver = NULL, commands = NULL;
+    HANDLE receiver = NULL, commands = NULL, relay_worker = NULL;
     guint state_handler, gathering_handler;
     int index;
     int standby = 0;
@@ -193,12 +304,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[index], "--standby")) standby = 1;
         else if (!strcmp(argv[index], "--validate-args")) return stun_host && stun_port && hook_port ? 0 : 2;
         else if (!strcmp(argv[index], "--self-test")) return 0;
-        else if (!strcmp(argv[index], "--room") || !strcmp(argv[index], "--logical-ip") || !strcmp(argv[index], "--relay") || !strcmp(argv[index], "--token") || !strcmp(argv[index], "--session-key")) { if (index + 1 < argc) ++index; }
+        else if (!strcmp(argv[index], "--room") && index + 1 < argc) room_name = argv[++index];
+        else if (!strcmp(argv[index], "--logical-ip") && index + 1 < argc) logical_ip = argv[++index];
+        else if (!strcmp(argv[index], "--relay") && index + 1 < argc) relay = argv[++index];
+        else if ((!strcmp(argv[index], "--token") || !strcmp(argv[index], "--session-key")) && index + 1 < argc) ++index;
         else return 2;
     }
     if (!stun_host || !stun_port || !hook_port) return 2;
     setvbuf(stdout, NULL, _IONBF, 0);
     InitializeCriticalSection(&g_output_lock);
+    InitializeCriticalSection(&g_ping_lock);
+    QueryPerformanceFrequency(&g_perf_frequency);
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 3;
     g_loopback = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_loopback == INVALID_SOCKET) return 4;
@@ -207,6 +323,35 @@ int main(int argc, char **argv) {
     int local_length = sizeof(local); getsockname(g_loopback, (struct sockaddr *)&local, &local_length);
     ZeroMemory(&g_hook, sizeof(g_hook)); g_hook.sin_family = AF_INET; g_hook.sin_addr.s_addr = htonl(INADDR_LOOPBACK); g_hook.sin_port = htons(hook_port);
     g_local_port = ntohs(local.sin_port);
+    if (room_name) strncpy_s(g_room, sizeof(g_room), room_name, _TRUNCATE);
+    if (!logical_ip || InetPtonA(AF_INET, logical_ip, &g_logical_ip) != 1) g_logical_ip = 0;
+    if (relay != NULL && g_logical_ip != 0 && room_name != NULL) {
+        char relay_host[256];
+        char relay_port[16];
+        struct addrinfo hints;
+        struct addrinfo *addresses = NULL;
+        const char *separator = strrchr(relay, ':');
+        if (separator != NULL && separator != relay && separator[1] != '\0') {
+            size_t host_length = (size_t)(separator - relay);
+            if (host_length < sizeof(relay_host)) {
+                memcpy(relay_host, relay, host_length);
+                relay_host[host_length] = '\0';
+                strncpy_s(relay_port, sizeof(relay_port), separator + 1, _TRUNCATE);
+                ZeroMemory(&hints, sizeof(hints));
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_DGRAM;
+                if (getaddrinfo(relay_host, relay_port, &hints, &addresses) == 0 && addresses != NULL) {
+                    CopyMemory(&g_relay_address, addresses->ai_addr, sizeof(g_relay_address));
+                    g_relay_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                    if (g_relay_socket != INVALID_SOCKET) {
+                        DWORD timeout = 500;
+                        setsockopt(g_relay_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+                    }
+                    freeaddrinfo(addresses);
+                }
+            }
+        }
+    }
     output("LOCAL_PORT %u", (unsigned)g_local_port);
     InterlockedExchange(&g_standby, standby ? 1 : 0);
     InterlockedExchange(&g_hook_active, standby ? 0 : 1);
@@ -240,9 +385,12 @@ int main(int argc, char **argv) {
     if (!nice_agent_gather_candidates(g_agent, g_stream)) return 8;
     receiver = CreateThread(NULL, 0, loopback_thread, NULL, 0, NULL);
     commands = CreateThread(NULL, 0, command_thread, NULL, 0, NULL);
+    if (g_relay_socket != INVALID_SOCKET) relay_worker = CreateThread(NULL, 0, relay_thread, NULL, 0, NULL);
     while (!InterlockedCompareExchange(&g_stopping, 0, 0)) g_main_context_iteration(NULL, TRUE);
     if (receiver) { WaitForSingleObject(receiver, 1000); CloseHandle(receiver); }
     if (commands) { WaitForSingleObject(commands, 1000); CloseHandle(commands); }
-    g_object_unref(g_agent); closesocket(g_loopback); WSACleanup(); DeleteCriticalSection(&g_output_lock);
+    if (relay_worker) { WaitForSingleObject(relay_worker, 1000); CloseHandle(relay_worker); }
+    if (g_relay_socket != INVALID_SOCKET) closesocket(g_relay_socket);
+    g_object_unref(g_agent); closesocket(g_loopback); WSACleanup(); DeleteCriticalSection(&g_ping_lock); DeleteCriticalSection(&g_output_lock);
     return 0;
 }

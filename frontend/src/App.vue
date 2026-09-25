@@ -383,6 +383,18 @@ async function joinRoom(room: Room) {
         directCandidateStatus.value = 'relay-only'
         directCandidateMessage.value = '直连候选未就绪，当前使用中继'
       }
+    } else if (lease.connection_mode === 'relay') {
+      // Keep a small relay-only diagnostic socket alive so Ping works before
+      // the game Hook is launched; it does not carry game traffic.
+      try {
+        await desktopApi?.startRelayPresence?.({
+          relay: `${lease.relay_host}:${lease.relay_port}`,
+          room: lease.community,
+          logicalIp: lease.logical_ip || lease.virtual_ip,
+        })
+      } catch {
+        // A relay-only room remains usable; Ping will report unavailable.
+      }
     }
     startLeaseHeartbeat()
     startRoomMembersMonitor()
