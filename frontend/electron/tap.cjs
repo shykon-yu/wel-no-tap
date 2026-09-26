@@ -387,7 +387,11 @@ if ($enabled -eq $false) {
 }
 [Console]::Out.WriteLine('READY')
 `, 6000)
-    return /(^|\r?\n)READY(\r?\n|$)/.test(state) ? adapter : null
+    /* tapctl/registry already proved that this GUID is a TAP device. WMI
+       reports MISSING/ERROR transiently on Win7 and while PnP is enabling a
+       device; let n2n perform the authoritative open and use the retry path
+       if that open really fails. */
+    return adapter
   } catch {
     // tapctl already identified this GUID as a TAP device. Older Windows
     // installations may deny WMI access or omit ConfigManagerErrorCode; that
@@ -1050,7 +1054,7 @@ async function connect({ host, port, roomID, username, subnetCidr, virtualIP, co
     } catch (error) {
       lastError = error
       if (attempt >= CONNECT_MAX_ATTEMPTS || !isRetryableConnectError(error)) throw error
-      if (/Cannot find tap device/i.test(String(error?.message || error || ''))) {
+      if (/(?:Cannot find tap device|could not open.*tap|open.*adapter|CreateFile|DeviceIoControl|TAP|adapter|网卡)/i.test(String(error?.message || error || ''))) {
         const failedGuid = parseTapGuid(tapNode)
         if (failedGuid) failedTapGuids.add(failedGuid)
         preparedTap = null

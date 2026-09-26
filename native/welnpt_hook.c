@@ -17,6 +17,8 @@
 #define WELNPT_HEARTBEAT_MS 2000
 #define WELNPT_GAME_JOIN_PAYLOAD_LENGTH 64
 #define WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH 84
+#define WELNPT_GAME_SEARCH_PAYLOAD_LENGTH 24
+#define WELNPT_SESSION_IDLE_MS 8000
 #define WELNPT_ICE_STATE_PREFIX "WELICESTATE:"
 #define WELNPT_ICE_AGENT_PREFIX "WELICEAGENT:"
 #define WELNPT_ICE_PEER_PREFIX "WELICEPEER:"
@@ -75,6 +77,9 @@ static uint32_t g_direct_peer_ip;
 static uint32_t g_direct_transaction_peer_ip;
 static unsigned short g_direct_transaction_join_port;
 static volatile LONG g_direct_transaction_generation;
+static ULONGLONG g_direct_last_peer_activity;
+static uint32_t g_direct_search_peer_ip;
+static ULONGLONG g_direct_search_seen;
 static unsigned short g_direct_hook_port;
 static volatile LONG g_direct_connected;
 static volatile LONG g_game_path;
@@ -116,6 +121,9 @@ static void reset_game_session(const char *reason) {
     g_direct_peer_ip = 0;
     g_direct_transaction_peer_ip = 0;
     g_direct_transaction_join_port = 0;
+    g_direct_last_peer_activity = 0;
+    g_direct_search_peer_ip = 0;
+    g_direct_search_seen = 0;
     g_ice_decision_deadline = 0;
     g_ice_decision_started = 0;
     LeaveCriticalSection(&g_state_lock);
@@ -165,6 +173,33 @@ static int is_game_join_payload(const char *payload, int length) {
 static int is_game_accept_payload(const char *payload, int length) {
     static const unsigned char prefix[] = { 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00 };
     return length == WELNPT_GAME_ACCEPT_PAYLOAD_LENGTH && payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static int is_game_search_payload(const char *payload, int length) {
+    /* WE8's 24-byte LAN search has the same leading opcode as the join
+       request, but is broadcast and therefore cannot be mistaken for a
+       peer-to-peer handshake. */
+    static const unsigned char prefix[] = { 0xe7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    return length == WELNPT_GAME_SEARCH_PAYLOAD_LENGTH && payload_has_prefix(payload, length, prefix, sizeof(prefix));
+}
+
+static void remember_search(uint32_t peer_ip) {
+    ULONGLONG now;
+    if (peer_ip == 0) return;
+    now = GetTickCount64();
+    /* Menu/selection can emit a search-shaped datagram while the current
+       match is still active. Require a quiet interval before arming the next
+       64/84 handshake, avoiding a false ICE restart in that same match. */
+    if (g_direct_transaction_peer_ip == peer_ip && g_direct_last_peer_activity != 0 &&
+        now >= g_direct_last_peer_activity && now - g_direct_last_peer_activity < WELNPT_SESSION_IDLE_MS)
+        return;
+    g_direct_search_peer_ip = peer_ip;
+    g_direct_search_seen = now;
+}
+
+static int search_starts_new_session(uint32_t peer_ip) {
+    if (peer_ip == 0 || g_direct_transaction_peer_ip != peer_ip) return 0;
+    return g_direct_search_peer_ip == peer_ip && g_direct_search_seen != 0;
 }
 
 static void log_line(const char *format, ...) {
@@ -340,6 +375,14 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		payload_length > WELNPT_MAX_PAYLOAD || received != (int)sizeof(*header) + payload_length) return 0;
 	is_join = is_game_join_payload(packet + sizeof(*header), payload_length);
 	is_accept = is_game_accept_payload(packet + sizeof(*header), payload_length);
+	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 &&
+		is_game_search_payload(packet + sizeof(*header), payload_length)) {
+		/* A search is the explicit menu/new-match boundary. Keep it out of
+		   the current session, but remember it so the next 64/84-byte packet
+		   from the same opponent starts a fresh ICE transaction. */
+		if (g_direct_transaction_peer_ip == 0 || header->source_ip == g_direct_transaction_peer_ip)
+			remember_search(header->source_ip);
+	}
 	/* Search broadcasts can continue while WE8 is on the menu. They do not
 	   invalidate an already established peer session. */
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
@@ -348,9 +391,14 @@ static int handle_transport_packet(char *packet, int received, const char *path)
 		unsigned short source_port = ntohs(header->source_port);
 		unsigned short target_port = ntohs(header->target_port);
 		unsigned short join_port = is_join ? source_port : target_port;
+		if (search_starts_new_session(header->source_ip)) {
+			reset_game_session("new-match-search");
+		}
 		new_session = report_game_peer(header->source_ip, join_port, source_port, target_port);
 		(void)new_session;
 	}
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip)
+		g_direct_last_peer_activity = GetTickCount64();
 	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->source_ip == g_direct_transaction_peer_ip) {
 		LONG selected = InterlockedCompareExchange(&g_game_path, 0, 0);
 		if ((strcmp(path, "relay") == 0 && selected == WELNPT_GAME_PATH_DIRECT) ||
@@ -392,6 +440,8 @@ static int report_game_peer(uint32_t target_ip, unsigned short join_port,
 	if (is_new_transaction) {
 		g_direct_transaction_peer_ip = target_ip;
 		g_direct_transaction_join_port = join_port;
+		g_direct_search_peer_ip = 0;
+		g_direct_search_seen = 0;
 		InterlockedIncrement(&g_direct_transaction_generation);
 	}
     generation = InterlockedCompareExchange(&g_direct_transaction_generation, 0, 0);
@@ -454,14 +504,25 @@ static int send_virtual_datagram(SOCKET handle, const char *payload, int length,
     if (length > 0) CopyMemory(packet + sizeof(*header), payload, (size_t)length);
 	is_join = is_game_join_payload(payload, length);
 	is_accept = is_game_accept_payload(payload, length);
+	if ((header->flags & WELNPT_FLAG_BROADCAST) != 0 && is_game_search_payload(payload, length)) {
+		/* A locally generated broadcast has no peer target. If a previous
+		   session exists, arm that peer; otherwise the first incoming search
+		   will arm it on the receive path. */
+		if (g_direct_transaction_peer_ip != 0) remember_search(g_direct_transaction_peer_ip);
+	}
 	session_signal = (header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
 		(is_join || is_accept);
 	if (session_signal) {
 		unsigned short target_port = ntohs(target->sin_port);
 		unsigned short join_port = is_join ? source_port : target_port;
+		if (search_starts_new_session(header->target_ip)) {
+			reset_game_session("new-match-search");
+		}
 		new_session = report_game_peer(header->target_ip, join_port, source_port, target_port);
 		(void)new_session;
 	}
+	if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 && header->target_ip == g_direct_transaction_peer_ip)
+		g_direct_last_peer_activity = GetTickCount64();
     if ((header->flags & WELNPT_FLAG_BROADCAST) == 0 &&
         g_direct_transport != INVALID_SOCKET && header->target_ip == g_direct_peer_ip &&
         InterlockedCompareExchange(&g_game_path, 0, 0) == WELNPT_GAME_PATH_DIRECT &&

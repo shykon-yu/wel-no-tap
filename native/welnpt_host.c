@@ -42,6 +42,8 @@ static ULONGLONG g_decision_started;
 static ULONGLONG g_decision_deadline;
 static ULONGLONG g_session_deadline;
 static ULONGLONG g_last_peer_activity;
+static uint32_t g_search_peer_ip;
+static int g_search_armed;
 
 typedef struct wel_host_socket_map {
     int active;
@@ -192,9 +194,17 @@ static void reset_session(void) {
     g_decision_deadline = 0;
     g_session_deadline = 0;
     g_last_peer_activity = 0;
+    g_search_peer_ip = 0;
+    g_search_armed = 0;
     InterlockedExchange(&g_direct_connected, 0);
     InterlockedExchange(&g_path, WEL_HOST_PATH_PENDING);
     notify_transport("pending");
+}
+
+static void arm_new_match_search(uint32_t peer_ip) {
+    if (peer_ip == 0) return;
+    g_search_peer_ip = peer_ip;
+    g_search_armed = 1;
 }
 
 /* A session is "active" while match traffic with the recorded peer keeps
@@ -224,6 +234,15 @@ static void report_game_peer(uint32_t peer_ip, unsigned short join_port,
     char ip[INET_ADDRSTRLEN];
     int length;
     int is_new_peer = g_peer_ip != peer_ip;
+    if (g_search_armed && g_search_peer_ip == peer_ip) {
+        /* A new search is the menu boundary. Delay the reset until the first
+           real join/accept so repeated control packets in one match remain
+           on the current generation. */
+        reset_session();
+        g_search_armed = 0;
+        g_search_peer_ip = 0;
+        is_new_peer = 1;
+    }
     if (peer_ip == 0 || InetNtopA(AF_INET, &peer_ip, ip, sizeof(ip)) == NULL) return;
     /*
      * The game reuses the same 64/84-byte control packet shapes while
@@ -348,6 +367,10 @@ static void process_game_frame(const welnpt_host_frame *frame, const char *paylo
     unsigned short join_port;
     if (frame == NULL) return;
     kind = classify_control_payload(payload, (int)ntohs(frame->payload_length));
+    if ((frame->flags & WELNPT_FLAG_BROADCAST) != 0 && kind == WEL_HOST_PAYLOAD_SEARCH &&
+        g_peer_ip != 0 && !session_active()) {
+        arm_new_match_search(g_peer_ip);
+    }
     /* Search broadcasts can be repeated during team/kit selection and do not
        end the current match session. The Hook reports socket close when WE8
        actually returns to its main screen. A join/accept shaped datagram aimed
@@ -391,7 +414,10 @@ static int process_wire_packet(char *packet, int received, int direct) {
          * relay (a locked direct path must not black-hole the search reply). */
         if (kind == WEL_HOST_PAYLOAD_SEARCH) {
             if (session_active()) return 1;
-            if (g_peer_ip != 0 && header->source_ip == g_peer_ip) reset_session();
+            if (g_peer_ip != 0 && header->source_ip == g_peer_ip) {
+                reset_session();
+                arm_new_match_search(header->source_ip);
+            }
         }
     } else if (kind == WEL_HOST_PAYLOAD_JOIN || kind == WEL_HOST_PAYLOAD_ACCEPT) {
         /* Join/accept shaped datagrams from a foreign peer must not steal or
